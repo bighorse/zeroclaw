@@ -60,7 +60,7 @@ if [[ "$HEAD_SHA" != "$MAIN_SHA" ]]; then
   exit 1
 fi
 
-# --- CI green gate (advisory) ---
+# --- CI green gate (blocks on pending/failure, warns on unavailable) ---
 echo "Checking CI status on HEAD ($HEAD_SHA)..."
 if command -v gh >/dev/null 2>&1; then
   CI_STATUS="$(gh api "repos/$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo 'zeroclaw-labs/zeroclaw')/commits/${HEAD_SHA}/check-runs" \

@@ -365,9 +365,10 @@ def main() -> int:
                             dry_run_proc = subprocess.run(
                                 [
                                     "gh", "api",
-                                    f"repos/{args.repository}/actions/workflows/pub-release.yml/runs",
+                                    f"repos/{args.repository}/actions/workflows/pub-release.yml/runs"
+                                    f"?head_sha={tag_commit}&status=completed&conclusion=success&per_page=1",
                                     "--jq",
-                                    f'[.workflow_runs[] | select(.head_sha == "{tag_commit}" and .conclusion == "success")] | length',
+                                    ".total_count",
                                 ],
                                 text=True,
                                 capture_output=True,
