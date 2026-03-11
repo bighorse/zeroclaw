@@ -1,23 +1,22 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use std::collections::HashMap;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     ruma::{
+        events::reaction::ReactionEventContent,
+        events::relation::{Annotation, InReplyTo, Thread},
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
         },
-        events::reaction::ReactionEventContent,
-        events::relation::{Annotation, InReplyTo, Thread},
         events::room::MediaSource,
-        OwnedEventId,
-        OwnedRoomId, OwnedUserId,
+        OwnedEventId, OwnedRoomId, OwnedUserId,
     },
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
@@ -754,9 +753,9 @@ impl Channel for MatrixChannel {
                 .get_room(&target_room)
                 .ok_or_else(|| anyhow::anyhow!("Matrix room not found for reaction removal"))?;
 
-            let event_id: OwnedEventId = reaction_event_id.parse().map_err(|_| {
-                anyhow::anyhow!("Invalid reaction event ID: {}", reaction_event_id)
-            })?;
+            let event_id: OwnedEventId = reaction_event_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid reaction event ID: {}", reaction_event_id))?;
 
             room.redact(&event_id, None, None).await?;
         }
