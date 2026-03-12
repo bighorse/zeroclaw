@@ -156,3 +156,16 @@ jobs:
             echo "::error::One or more upstream jobs failed or were cancelled"
             exit 1
           fi
+
+  security-gate:
+    name: Security Required Gate
+    if: always()
+    needs: [security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check security job result
+        run: |
+          if [[ "${{ needs.security.result }}" != "success" ]]; then
+            echo "::error::Security audit failed or was cancelled"
+            exit 1
+          fi
