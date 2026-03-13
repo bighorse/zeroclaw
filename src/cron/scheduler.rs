@@ -1,5 +1,6 @@
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel,
+    TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -366,6 +367,18 @@ pub(crate) async fn deliver_announcement(
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
+        #[cfg(feature = "channel-lark")]
+        "feishu" => {
+            let fs = config
+                .channels_config
+                .feishu
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
+            let channel = crate::channels::LarkChannel::from_feishu_config(fs);
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        #[cfg(not(feature = "channel-lark"))]
+        "feishu" => anyhow::bail!("feishu channel is not compiled in this build; please enable 'channel-lark' feature"),
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 
