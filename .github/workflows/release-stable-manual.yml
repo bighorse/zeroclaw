@@ -202,20 +202,25 @@ jobs:
           VERSION="${{ inputs.version }}"
           SHA256="${{ steps.checksum.outputs.macos_arm }}"
           cat > zeroclaw.rb << EOF
+          # typed: false
+          # frozen_string_literal: true
+
           class Zeroclaw < Formula
             desc "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
             homepage "https://github.com/bighorse/zeroclaw"
             version "${VERSION}"
             license "MIT OR Apache-2.0"
 
-            on_macos do
-              on_arm do
-                url "https://github.com/bighorse/zeroclaw/releases/download/${TAG}/zeroclaw-aarch64-apple-darwin.tar.gz"
-                sha256 "${SHA256}"
-              end
-            end
+            # Pre-built binary is available for Apple Silicon only.
+            # Intel Mac (x86_64) is not supported — use: cargo install zeroclaw
+            url "https://github.com/bighorse/zeroclaw/releases/download/${TAG}/zeroclaw-aarch64-apple-darwin.tar.gz"
+            sha256 "${SHA256}"
 
             def install
+              if Hardware::CPU.intel?
+                odie "zeroclaw pre-built binaries require Apple Silicon (M1/M2/M3/M4).\\n" \
+                     "Intel Mac is not supported. Build from source: cargo install zeroclaw"
+              end
               bin.install "zeroclaw"
             end
 
