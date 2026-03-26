@@ -193,7 +193,7 @@ jobs:
         run: cargo install cargo-dist --locked --version 0.28.0
 
       - name: Push Homebrew formula
-        run: cargo dist host --steps=announce
+        run: dist host --steps=announce
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
