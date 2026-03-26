@@ -183,21 +183,61 @@ jobs:
     needs: [validate, publish]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          toolchain: stable
-
-      - name: Install cargo-dist
-        run: cargo install cargo-dist --locked --version 0.28.0
-
-      - name: Push Homebrew formula
-        run: dist host --steps=announce
+      - name: Get macOS artifact checksum
+        id: checksum
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA256=$(gh release download "${{ needs.validate.outputs.tag }}" \
+            --repo bighorse/zeroclaw \
+            --pattern "SHA256SUMS" \
+            --output - \
+            | grep "zeroclaw-aarch64-apple-darwin.tar.gz" \
+            | awk '{print $1}')
+          echo "macos_arm=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Homebrew formula
+        run: |
+          TAG="${{ needs.validate.outputs.tag }}"
+          VERSION="${{ inputs.version }}"
+          SHA256="${{ steps.checksum.outputs.macos_arm }}"
+          cat > zeroclaw.rb << EOF
+          class Zeroclaw < Formula
+            desc "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
+            homepage "https://github.com/bighorse/zeroclaw"
+            version "${VERSION}"
+            license "MIT OR Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/bighorse/zeroclaw/releases/download/${TAG}/zeroclaw-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA256}"
+              end
+            end
+
+            def install
+              bin.install "zeroclaw"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/zeroclaw --version")
+            end
+          end
+          EOF
+
+      - name: Push formula to tap
+        env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          GITHUB_REF: refs/tags/${{ needs.validate.outputs.tag }}
+        run: |
+          git clone https://x-access-token:${GH_TOKEN}@github.com/bighorse/homebrew-zeroclaw.git tap
+          mkdir -p tap/Formula
+          cp zeroclaw.rb tap/Formula/zeroclaw.rb
+          cd tap
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/zeroclaw.rb
+          git commit -m "zeroclaw ${{ inputs.version }}"
+          git push
 
   docker:
     name: Push Docker Image
