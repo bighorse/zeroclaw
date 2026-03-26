@@ -7,6 +7,11 @@ on:
         description: "Stable version to release (e.g. 0.2.0)"
         required: true
         type: string
+      macos_only:
+        description: "Build macOS (aarch64-apple-darwin) only — skips Linux, Windows, Docker"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: promote-release
@@ -77,6 +82,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: [validate, web]
+    if: ${{ !inputs.macos_only || matrix.target == 'aarch64-apple-darwin' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -202,6 +208,7 @@ jobs:
   docker:
     name: Push Docker Image
     needs: [validate, build]
+    if: ${{ !inputs.macos_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
