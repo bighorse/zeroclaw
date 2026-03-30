@@ -300,9 +300,17 @@ fn extract_download_links(content: &str) -> (String, Vec<(String, String)>) {
     use std::sync::OnceLock;
 
     // Matches a signed download URL anywhere in a line (bare or inside markdown link).
+    //
+    // The exclusion set intentionally includes Markdown delimiter characters
+    // (backtick, single/double quote, `>`, `]`) so the regex never captures
+    // the closing punctuation when the LLM wraps the URL in a code-span or quotes:
+    //   `http://host/download/file?expires=...&sig=abc`
+    //   'http://host/download/file?expires=...&sig=abc'
+    // Without these exclusions the trailing ` or ' gets URL-encoded (%60 / %27)
+    // and appended to the URL, breaking the download link.
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"https?://[^\s\)]+/download/[^\s\)]+\?[^\s\)]*expires=\d+[^\s\)]*&[^\s\)]*sig=[0-9a-fA-F]+[^\s\)]*")
+        Regex::new(r#"https?://[^\s\)`'">\]]+/download/[^\s\)`'">\]]+\?[^\s\)`'">\]]*expires=\d+[^\s\)`'">\]]*&[^\s\)`'">\]]*sig=[0-9a-fA-F]+[^\s\)`'">\]]*"#)
             .expect("download URL regex is valid")
     });
 
@@ -2022,6 +2030,45 @@ mod tests {
         assert!(cleaned.contains("后记"));
         assert!(!cleaned.contains("expires="), "download line stripped");
         assert_eq!(buttons.len(), 1);
+    }
+
+    /// Regression: LLM sometimes wraps download URLs in backticks or single-quotes.
+    /// The trailing delimiter must NOT be captured as part of the URL.
+    /// Reproduces the production bug where %27%60 (`'` + `` ` ``) was appended to the sig.
+    ///
+    /// Examples seen in prod:
+    ///   `http://100.97.106.75:42617/download/sample_document.md?expires=...&sig=...abc\'\``
+    ///   http://100.97.106.75:42617/download/sample_document.md?expires=...&sig=...abc\'
+    #[test]
+    fn extract_download_links_strips_trailing_markdown_delimiters() {
+        let base_url = "http://100.97.106.75:42617/download/sample_document.md?expires=1774947311&sig=e10dfeee228ed4e06239cd247d81f16106e67735f84212458e84026aa5b02796";
+
+        // Case 1: URL wrapped in backtick code-span: `<url>`
+        let backtick = format!("`{base_url}`");
+        let (_, buttons) = extract_download_links(&backtick);
+        assert_eq!(buttons.len(), 1, "backtick case: should find 1 button");
+        assert_eq!(
+            buttons[0].1, base_url,
+            "backtick must not be captured in URL"
+        );
+
+        // Case 2: URL ends with single-quote (observed in prod: sig=...796')
+        let single_quote = format!("{base_url}'");
+        let (_, buttons) = extract_download_links(&single_quote);
+        assert_eq!(buttons.len(), 1, "single-quote case: should find 1 button");
+        assert_eq!(
+            buttons[0].1, base_url,
+            "trailing single-quote must not be captured"
+        );
+
+        // Case 3: Combined '` suffix seen in production (%27%60)
+        let combined = format!("{base_url}'`");
+        let (_, buttons) = extract_download_links(&combined);
+        assert_eq!(buttons.len(), 1, "combined case: should find 1 button");
+        assert_eq!(
+            buttons[0].1, base_url,
+            "trailing \"'`\" must not be captured"
+        );
     }
 
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
