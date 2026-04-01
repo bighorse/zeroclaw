@@ -41,3 +41,6 @@ credentials.json
 
 # Coverage artifacts
 lcov.info
+
+# Client deployment configurations (contains API keys and secrets)
+deployments/

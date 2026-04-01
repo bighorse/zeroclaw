@@ -341,6 +341,41 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                 );
             }
         }
+        "feishu" => {
+            if config.channels_config.feishu.is_none() && config.channels_config.lark.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to feishu but neither channels_config.feishu nor channels_config.lark is configured"
+                );
+            }
+        }
+        "lark" => {
+            if config.channels_config.lark.is_none() && config.channels_config.feishu.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to lark but neither channels_config.lark nor channels_config.feishu is configured"
+                );
+            }
+        }
+        "dingtalk" => {
+            if config.channels_config.dingtalk.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to dingtalk but channels_config.dingtalk is not configured"
+                );
+            }
+        }
+        "qq" => {
+            if config.channels_config.qq.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to qq but channels_config.qq is not configured"
+                );
+            }
+        }
+        "webhook" => {
+            if config.channels_config.webhook.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to webhook but channels_config.webhook is not configured"
+                );
+            }
+        }
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
 
