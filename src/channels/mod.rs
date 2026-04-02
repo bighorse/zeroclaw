@@ -1355,6 +1355,35 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+/// Scan tool result messages added during a turn and extract any signed
+/// download URLs (lines starting with "Download: http...").
+/// Used to guarantee download buttons appear in the outbound message even
+/// when the LLM omits the URL from its final text response.
+fn extract_download_urls_from_history(history: &[ChatMessage], start_index: usize) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    for msg in history.iter().skip(start_index) {
+        // Tool results appear as role=user ("[Tool results]\n<tool_result ...>")
+        // or role=tool (native JSON: {"tool_call_id":..., "content":...})
+        let content = if msg.role == "tool" {
+            serde_json::from_str::<serde_json::Value>(&msg.content)
+                .ok()
+                .and_then(|v| v.get("content").and_then(|c| c.as_str()).map(str::to_string))
+                .unwrap_or_default()
+        } else {
+            msg.content.clone()
+        };
+        for line in content.lines() {
+            if let Some(url) = line.trim().strip_prefix("Download: ") {
+                let url = url.trim().to_string();
+                if !url.is_empty() && !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+        }
+    }
+    urls
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2046,6 +2075,27 @@ async fn process_channel_message(
             } else {
                 sanitized_response
             };
+
+            // Guarantee download URLs from file_write tool results appear in the
+            // outbound message even if the LLM omitted them from its final response.
+            let delivered_response = {
+                let tool_urls =
+                    extract_download_urls_from_history(&history, history_len_before_tools);
+                let missing: Vec<&String> = tool_urls
+                    .iter()
+                    .filter(|url| !delivered_response.contains(url.as_str()))
+                    .collect();
+                if missing.is_empty() {
+                    delivered_response
+                } else {
+                    let suffix = missing
+                        .iter()
+                        .map(|u| format!("\nDownload: {u}"))
+                        .collect::<String>();
+                    format!("{delivered_response}{suffix}")
+                }
+            };
+
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -7013,5 +7063,69 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    // ── extract_download_urls_from_history ──────────────────────────────────
+
+    #[test]
+    fn extract_download_urls_from_history_prompt_mode() {
+        let url = "http://100.1.2.3:42617/download/file.md?expires=9999999999&sig=aabb";
+        let tool_result_msg = ChatMessage {
+            role: "user".to_string(),
+            content: format!("[Tool results]\n<tool_result name=\"file_write\">\nWritten 42 bytes to file.md\nDownload: {url}\n</tool_result>"),
+        };
+        let history = vec![tool_result_msg];
+        let urls = extract_download_urls_from_history(&history, 0);
+        assert_eq!(urls, vec![url]);
+    }
+
+    #[test]
+    fn extract_download_urls_from_history_native_mode() {
+        let url = "http://100.1.2.3:42617/download/file.md?expires=9999999999&sig=aabb";
+        let tool_result_msg = ChatMessage {
+            role: "tool".to_string(),
+            content: serde_json::json!({
+                "tool_call_id": "call_123",
+                "content": format!("Written 42 bytes to file.md\nDownload: {url}")
+            })
+            .to_string(),
+        };
+        let history = vec![tool_result_msg];
+        let urls = extract_download_urls_from_history(&history, 0);
+        assert_eq!(urls, vec![url]);
+    }
+
+    #[test]
+    fn extract_download_urls_from_history_deduplicates() {
+        let url = "http://100.1.2.3:42617/download/file.md?expires=9999999999&sig=aabb";
+        let make_msg = || ChatMessage {
+            role: "user".to_string(),
+            content: format!("Download: {url}"),
+        };
+        let history = vec![make_msg(), make_msg()];
+        let urls = extract_download_urls_from_history(&history, 0);
+        assert_eq!(urls.len(), 1);
+    }
+
+    #[test]
+    fn extract_download_urls_from_history_respects_start_index() {
+        let url = "http://100.1.2.3:42617/download/file.md?expires=9999999999&sig=aabb";
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: format!("Download: {url}"),
+        };
+        let history = vec![msg];
+        // start_index=1 skips the only message → empty result
+        let urls = extract_download_urls_from_history(&history, 1);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn extract_download_urls_from_history_no_urls() {
+        let history = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Written 10 bytes to file.md".to_string(),
+        }];
+        assert!(extract_download_urls_from_history(&history, 0).is_empty());
     }
 }
