@@ -218,6 +218,24 @@ const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 
+/// Maps an HTTP Content-Type value to an image file extension (with leading dot).
+/// Falls back to `".png"` for unknown or missing types.
+fn ext_from_image_content_type(content_type: &str) -> &'static str {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "image/webp" => ".webp",
+        "image/gif" => ".gif",
+        "image/bmp" => ".bmp",
+        _ => ".png",
+    }
+}
+
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
 fn should_refresh_last_recv(msg: &WsMsg) -> bool {
@@ -1127,20 +1145,13 @@ impl LarkChannel {
             .and_then(|n| n.as_str())
             .unwrap_or("");
 
-        let fallback_ext = if msg_type == "image" { ".png" } else { "" };
-        let file_name = if file_name.is_empty() {
-            format!("{}{}", resource_key, fallback_ext)
-        } else {
-            file_name.to_string()
-        };
-
         if resource_key.is_empty() {
             return None;
         }
 
         let workspace_dir = self.workspace_dir.as_ref()?;
         let token = self.get_tenant_access_token().await.ok()?;
-        
+
         let api_type = match msg_type {
             "image" => "image",
             _ => "file",
@@ -1166,6 +1177,22 @@ impl LarkChannel {
             tracing::error!("Feishu download failed for {}: HTTP {}", file_name, response.status());
             return None;
         }
+
+        let fallback_ext = if msg_type == "image" {
+            let ct = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            ext_from_image_content_type(ct)
+        } else {
+            ""
+        };
+        let file_name = if file_name.is_empty() {
+            format!("{}{}", resource_key, fallback_ext)
+        } else {
+            file_name.to_string()
+        };
 
         let bytes = response.bytes().await.ok()?;
         let save_path = workspace_dir.join(&file_name);
