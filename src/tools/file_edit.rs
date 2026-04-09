@@ -1,7 +1,9 @@
+use super::file_write::DownloadUrlConfig;
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Edit a file by replacing an exact string match with new content.
@@ -12,11 +14,22 @@ use std::sync::Arc;
 /// the matched text. Security checks mirror [`super::file_write::FileWriteTool`].
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
+    download: Option<DownloadUrlConfig>,
 }
 
 impl FileEditTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            download: None,
+        }
+    }
+
+    pub fn with_download(security: Arc<SecurityPolicy>, download: DownloadUrlConfig) -> Self {
+        Self {
+            security,
+            download: Some(download),
+        }
     }
 }
 
@@ -205,14 +218,30 @@ impl Tool for FileEditTool {
         let new_content = content.replacen(old_string, new_string, 1);
 
         match tokio::fs::write(&resolved_target, &new_content).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!(
+            Ok(()) => {
+                let mut output = format!(
                     "Edited {path}: replaced 1 occurrence ({} bytes)",
                     new_content.len()
-                ),
-                error: None,
-            }),
+                );
+                if let Some(ref dl) = self.download {
+                    let relative_path = resolved_target
+                        .strip_prefix(&self.security.workspace_dir)
+                        .unwrap_or(&resolved_target);
+                    let rel_str = relative_path.to_string_lossy();
+                    let url = crate::gateway::signed_url::sign_download_url(
+                        &dl.base_url,
+                        &rel_str,
+                        &dl.secret,
+                        crate::gateway::signed_url::DEFAULT_TTL_SECS,
+                    );
+                    let _ = write!(output, "\nDownload: {url}");
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -683,6 +712,71 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_with_download_emits_signed_url() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_download_url");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("report.md"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::with_download(
+            test_security(dir.clone()),
+            DownloadUrlConfig {
+                base_url: "https://agent.example.com".to_string(),
+                secret: b"test-secret".to_vec(),
+            },
+        );
+        let result = tool
+            .execute(json!({
+                "path": "report.md",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "edit should succeed: {:?}", result.error);
+        assert!(result.output.contains("Download:"), "output should contain Download: line");
+        let url_line = result
+            .output
+            .lines()
+            .find(|l| l.starts_with("Download: "))
+            .expect("should have Download: line");
+        let url = url_line.strip_prefix("Download: ").unwrap();
+        assert!(url.contains("?expires="), "signed URL must contain expires");
+        assert!(url.contains("&sig="), "signed URL must contain sig");
+        assert!(url.contains("/download/"), "URL must contain /download/ path");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_without_download_config_has_no_url() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_no_url");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "test.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(!result.output.contains("Download:"), "no download URL without config");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

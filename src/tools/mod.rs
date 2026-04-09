@@ -225,7 +225,19 @@ pub fn all_tools_with_runtime(
                 FileWriteTool::new(security.clone())
             },
         ),
-        Arc::new(FileEditTool::new(security.clone())),
+        Arc::new(
+            if let Some(gateway_url) = root_config.resolve_gateway_public_url() {
+                FileEditTool::with_download(
+                    security.clone(),
+                    file_write::DownloadUrlConfig {
+                        base_url: gateway_url,
+                        secret: root_config.resolve_download_secret(),
+                    },
+                )
+            } else {
+                FileEditTool::new(security.clone())
+            },
+        ),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(ContentSearchTool::new(security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
