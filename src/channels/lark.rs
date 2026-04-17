@@ -858,7 +858,10 @@ impl LarkChannel {
                         Ok(e) => e,
                         Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
                     };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                    if event.header.event_type != "im.message.receive_v1" {
+                        tracing::debug!("Lark WS: ignoring event_type={}", event.header.event_type);
+                        continue;
+                    }
 
                     let event_payload = event.event;
 
@@ -876,6 +879,18 @@ impl LarkChannel {
                     }
 
                     let lark_msg = &recv.message;
+
+                    // Diagnostic: every received message's type and raw content preview.
+                    // Helps locate "message silently dropped" bugs across all downstream branches.
+                    // Debug-level to avoid logging user content by default — enable with
+                    // `RUST_LOG=zeroclaw::channels::lark=debug` when troubleshooting.
+                    {
+                        let preview: String = lark_msg.content.chars().take(200).collect();
+                        tracing::debug!(
+                            "Lark WS: recv msg_id={} type={} chat_type={} content_preview={}",
+                            lark_msg.message_id, lark_msg.message_type, lark_msg.chat_type, preview
+                        );
+                    }
 
                     // Dedup
                     {
@@ -895,30 +910,73 @@ impl LarkChannel {
                         "text" => {
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
                                 Ok(v) => v,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Lark WS: text content JSON parse failed for {}: {e}",
+                                        lark_msg.message_id
+                                    );
+                                    continue;
+                                }
                             };
                             match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
                                 Some(t) => (t.to_string(), Vec::new()),
-                                None => continue,
+                                None => {
+                                    tracing::warn!(
+                                        "Lark WS: text field empty/missing for {}",
+                                        lark_msg.message_id
+                                    );
+                                    continue;
+                                }
                             }
                         }
                         "post" => match parse_post_content_details(&lark_msg.content) {
                             Some(details) => (details.text, details.mentioned_open_ids),
-                            None => continue,
+                            None => {
+                                tracing::warn!(
+                                    "Lark WS: post parse returned None for {}",
+                                    lark_msg.message_id
+                                );
+                                continue;
+                            }
                         },
                         "file" | "image" | "media" | "folder" => {
                             match self.download_lark_resource(&lark_msg.message_id, &lark_msg.message_type, &lark_msg.content).await {
                                 Some(text) => (text, Vec::new()),
-                                None => continue,
+                                None => {
+                                    tracing::warn!(
+                                        "Lark WS: resource download failed for {} (type={})",
+                                        lark_msg.message_id, lark_msg.message_type
+                                    );
+                                    continue;
+                                }
                             }
                         },
-                        _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
+                        _ => {
+                            // Name the msg_type at info so operators notice silently-dropped
+                            // categories; defer raw content to debug to avoid logging user data.
+                            tracing::info!(
+                                "Lark WS: skipping unsupported msg_type='{}' (msg_id={})",
+                                lark_msg.message_type, lark_msg.message_id
+                            );
+                            let preview: String = lark_msg.content.chars().take(200).collect();
+                            tracing::debug!(
+                                "Lark WS: unsupported content_preview={}",
+                                preview
+                            );
+                            continue;
+                        }
                     };
 
                     // Strip @_user_N placeholders
                     let text = strip_at_placeholders(&text);
                     let text = text.trim().to_string();
-                    if text.is_empty() { continue; }
+                    if text.is_empty() {
+                        tracing::warn!(
+                            "Lark WS: parsed text empty after trim/strip for {} (type={})",
+                            lark_msg.message_id, lark_msg.message_type
+                        );
+                        continue;
+                    }
 
                     // Group-chat: only respond when explicitly @-mentioned
                     let bot_open_id = self.resolved_bot_open_id();
@@ -1131,7 +1189,6 @@ impl LarkChannel {
     }
 
     /// Parse an event callback payload and extract text messages
-
     async fn download_lark_resource(&self, msg_id: &str, msg_type: &str, content_str: &str) -> Option<String> {
         let v: serde_json::Value = serde_json::from_str(content_str).ok()?;
         let resource_key = v.get("file_key")
@@ -1287,7 +1344,9 @@ impl LarkChannel {
                 (text, Vec::new())
             },
             _ => {
-                tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
+                tracing::info!("Lark: skipping unsupported msg_type='{msg_type}'");
+                let preview: String = content_str.chars().take(200).collect();
+                tracing::debug!("Lark: unsupported content_preview={preview}");
                 return messages;
             }
         };
@@ -1877,6 +1936,14 @@ struct ParsedPostContent {
 
 fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
     let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    // Post payloads come in two shapes:
+    //   1. With locale wrapper:   {"zh_cn": {"title": ..., "content": [...]}, ...}
+    //      (used by webhook callbacks and official send-message API docs)
+    //   2. Bare:                  {"title": ..., "content": [...]}
+    //      (observed on WebSocket pushes, e.g. when the Feishu client auto-
+    //      formats a line starting with `1. ` into a post-typed message)
+    // Prefer the locale-wrapped form; if it is absent but the payload itself
+    // has a `content` array, treat the payload as the locale object directly.
     let locale = parsed
         .get("zh_cn")
         .or_else(|| parsed.get("en_us"))
@@ -1884,6 +1951,13 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
             parsed
                 .as_object()
                 .and_then(|m| m.values().find(|v| v.is_object()))
+        })
+        .or_else(|| {
+            if parsed.get("content").map(|c| c.is_array()).unwrap_or(false) {
+                Some(&parsed)
+            } else {
+                None
+            }
         })?;
 
     let mut text = String::new();
@@ -1934,7 +2008,57 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
                                 mentioned_open_ids.push(open_id.to_string());
                             }
                         }
-                        _ => {}
+                        "md" => {
+                            if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
+                        "code_block" => {
+                            if let Some(lang) = el.get("language").and_then(|l| l.as_str()) {
+                                text.push_str("```");
+                                text.push_str(lang);
+                                text.push('\n');
+                            } else {
+                                text.push_str("```\n");
+                            }
+                            if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                            text.push_str("\n```");
+                        }
+                        "img" => {
+                            if let Some(alt) = el
+                                .get("alt")
+                                .and_then(|a| a.as_str())
+                                .filter(|s| !s.is_empty())
+                            {
+                                text.push_str("[image: ");
+                                text.push_str(alt);
+                                text.push(']');
+                            }
+                        }
+                        "emotion" => {
+                            if let Some(emoji) = el.get("emoji_type").and_then(|e| e.as_str()) {
+                                text.push('[');
+                                text.push_str(emoji);
+                                text.push(']');
+                            }
+                        }
+                        "media" => {
+                            if let Some(name) = el.get("file_name").and_then(|n| n.as_str()) {
+                                text.push_str("[media: ");
+                                text.push_str(name);
+                                text.push(']');
+                            }
+                        }
+                        "hr" => {
+                            text.push_str("\n---\n");
+                        }
+                        _ => {
+                            if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
                     }
                 }
                 text.push('\n');
@@ -1944,6 +2068,9 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
 
     let result = text.trim().to_string();
     if result.is_empty() {
+        tracing::warn!("Lark: post content parsed to empty text, dropping message");
+        let preview: String = content.chars().take(200).collect();
+        tracing::debug!("Lark: dropped post content_preview={preview}");
         None
     } else {
         Some(ParsedPostContent {
@@ -2880,5 +3007,54 @@ mod tests {
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
         assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+    }
+
+    #[test]
+    fn parse_post_content_handles_bare_payload_without_locale_wrapper() {
+        // Real WebSocket payload observed when Feishu client auto-formats
+        // a line starting with `1. ` into a post-typed message. Unlike the
+        // documented webhook shape, this comes with no `zh_cn` / `en_us`
+        // wrapper — `title` and `content` sit at the top level.
+        let content = r#"{"title":"","content":[[{"tag":"text","text":"1. ","style":[]},{"tag":"text","text":"注册商标名称：","style":[]}]]}"#;
+        let result = parse_post_content_details(content)
+            .expect("bare post payload must parse, not be silently dropped");
+        assert!(result.text.contains("1. "));
+        assert!(result.text.contains("注册商标名称："));
+    }
+
+    #[test]
+    fn parse_post_content_handles_md_tag() {
+        let content = r#"{"zh_cn":{"title":"","content":[[{"tag":"md","text":"[x] PharmaClaw\n[ ] ClinicClaw"}]]}}"#;
+        let result = parse_post_content_details(content).unwrap();
+        assert!(result.text.contains("PharmaClaw"));
+        assert!(result.text.contains("ClinicClaw"));
+        // Regression: brackets used as checkbox markers must survive parsing verbatim.
+        assert!(result.text.contains("[x] PharmaClaw"));
+        assert!(result.text.contains("[ ] ClinicClaw"));
+    }
+
+    #[test]
+    fn parse_post_content_handles_code_block() {
+        let content = r#"{"zh_cn":{"title":"","content":[[{"tag":"code_block","language":"bash","text":"echo hello"}]]}}"#;
+        let result = parse_post_content_details(content).unwrap();
+        assert!(result.text.contains("```bash"));
+        assert!(result.text.contains("echo hello"));
+    }
+
+    #[test]
+    fn parse_post_content_fallback_extracts_text_from_unknown_tag() {
+        let content = r#"{"zh_cn":{"title":"","content":[[{"tag":"future_tag","text":"some content"}]]}}"#;
+        let result = parse_post_content_details(content).unwrap();
+        assert!(result.text.contains("some content"));
+    }
+
+    #[test]
+    fn parse_post_content_mixed_tags_preserve_all_text() {
+        let content = r#"{"zh_cn":{"title":"订单确认","content":[[{"tag":"text","text":"商标注册："},{"tag":"md","text":"**PharmaClaw** 第9类"}],[{"tag":"hr"}],[{"tag":"text","text":"联系人：马广军"}]]}}"#;
+        let result = parse_post_content_details(content).unwrap();
+        assert!(result.text.contains("订单确认"));
+        assert!(result.text.contains("PharmaClaw"));
+        assert!(result.text.contains("马广军"));
+        assert!(result.text.contains("---"));
     }
 }
