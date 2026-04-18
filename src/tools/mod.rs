@@ -47,6 +47,7 @@ pub mod memory_store;
 pub mod model_routing_config;
 pub mod pdf_read;
 pub mod proxy_config;
+pub mod publish_file;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
@@ -93,6 +94,7 @@ pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
+pub use publish_file::PublishFileTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -257,6 +259,19 @@ pub fn all_tools_with_runtime(
                 )
             } else {
                 FileEditTool::new(security.clone())
+            },
+        ),
+        Arc::new(
+            if let Some(gateway_url) = root_config.resolve_gateway_public_url() {
+                PublishFileTool::with_download(
+                    security.clone(),
+                    file_write::DownloadUrlConfig {
+                        base_url: gateway_url,
+                        secret: root_config.resolve_download_secret(),
+                    },
+                )
+            } else {
+                PublishFileTool::new(security.clone())
             },
         ),
         Arc::new(GlobSearchTool::new(security.clone())),
