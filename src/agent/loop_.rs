@@ -108,6 +108,39 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+/// Maximum bytes retained per tool-result message when it is re-injected into
+/// chat history. Every later turn replays the full history to the provider,
+/// so an unbounded tool output (e.g. a 3.5 MB file read via the historical
+/// lossy path, or a shell command dumping megabytes of binary) compounds into
+/// a request body that blows past provider limits (Qwen / OpenAI-compatible
+/// endpoints reject at 6 MB). 512 KB leaves ample budget for system prompt,
+/// memory context, recent history, and the current assistant draft while
+/// still surfacing substantial content from tools that legitimately return
+/// large outputs (pdf_read, docx_read, shell command captures).
+const MAX_TOOL_RESULT_BYTES: usize = 512 * 1024;
+
+/// Byte-cap a tool result, backing off to the nearest UTF-8 boundary and
+/// appending a short, machine-readable annotation so the model knows the
+/// content was truncated rather than corrupt.
+pub(crate) fn cap_tool_result_bytes(output: String) -> String {
+    if output.len() <= MAX_TOOL_RESULT_BYTES {
+        return output;
+    }
+    let mut boundary = MAX_TOOL_RESULT_BYTES;
+    while boundary > 0 && !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let original_len = output.len();
+    let mut truncated = output;
+    truncated.truncate(boundary);
+    use std::fmt::Write as _;
+    let _ = write!(
+        truncated,
+        "\n\n[truncated: original {original_len} bytes, kept first {boundary} bytes]",
+    );
+    truncated
+}
+
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
@@ -2823,11 +2856,16 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            individual_results.push((tool_call_id, outcome.output.clone()));
+            // Cap the tool result before it enters the history replay loop.
+            // Without this, a single oversized output (binary read, large
+            // shell capture, etc.) would be re-sent on every subsequent turn
+            // and eventually exceed the provider request-body limit.
+            let capped = cap_tool_result_bytes(outcome.output);
+            individual_results.push((tool_call_id, capped.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
+                tool_name, capped
             );
         }
 
@@ -3631,6 +3669,44 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
+    }
+
+    #[test]
+    fn cap_tool_result_bytes_leaves_small_outputs_unchanged() {
+        let out = "hello world".to_string();
+        let capped = cap_tool_result_bytes(out.clone());
+        assert_eq!(capped, out);
+    }
+
+    #[test]
+    fn cap_tool_result_bytes_truncates_oversized_outputs() {
+        let oversized = "x".repeat(MAX_TOOL_RESULT_BYTES + 1024);
+        let capped = cap_tool_result_bytes(oversized.clone());
+        assert!(capped.len() < oversized.len());
+        assert!(
+            capped.len() <= MAX_TOOL_RESULT_BYTES + 128,
+            "capped size {} exceeded expected ceiling",
+            capped.len(),
+        );
+        assert!(
+            capped.contains("[truncated: original"),
+            "capped output must carry the truncation marker",
+        );
+    }
+
+    #[test]
+    fn cap_tool_result_bytes_respects_utf8_boundaries() {
+        // Fill with 3-byte UTF-8 characters so the naive byte cap is guaranteed
+        // to fall inside a code-point and force the boundary walk-back.
+        let glyph = "✓"; // 3 bytes
+        let glyph_count = (MAX_TOOL_RESULT_BYTES / glyph.len()) + 100;
+        let oversized = glyph.repeat(glyph_count);
+
+        let capped = cap_tool_result_bytes(oversized);
+        // The capped string must still parse as valid UTF-8 (String guarantees
+        // this via truncate panicking on invalid boundaries); the real check is
+        // that truncate did not panic and the annotation is present.
+        assert!(capped.contains("[truncated: original"));
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;

@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "1.3.1"
+version = "1.3.5"
 edition = "2021"
 authors = ["guangjunma"]
 license = "MIT OR Apache-2.0"
@@ -173,6 +173,11 @@ probe-rs = { version = "0.31", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
+# DOCX text extraction (optional, enable with --features rag-docx).
+# zip + quick-xml together weigh under half of pdf-extract's dep tree.
+zip = { version = "2.2", optional = true, default-features = false, features = ["deflate"] }
+quick-xml = { version = "0.36", optional = true, default-features = false }
+
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
 
@@ -217,6 +222,8 @@ landlock = ["sandbox-landlock"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
+# rag-docx = DOCX (Word) plain-text extraction via docx_read tool
+rag-docx = ["dep:zip", "dep:quick-xml"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 
