@@ -24,7 +24,9 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion."
+        "Read text file contents with line numbers. Supports partial reading via offset and limit. \
+         For DOCX use docx_read; for PDF use pdf_read; for images use image_info. \
+         file_read rejects other binary formats to avoid sending garbled content to the model."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -191,7 +193,14 @@ impl Tool for FileReadTool {
                 })
             }
             Err(_) => {
-                // Not valid UTF-8 — read raw bytes and try to extract text
+                // Not valid UTF-8 — read raw bytes so we can still salvage PDFs
+                // (historical behavior when file_read was the only PDF path),
+                // then reject anything else with a targeted hint toward the
+                // specialized tool. Previously this branch fell back to
+                // `String::from_utf8_lossy`, producing up to 10 MB of
+                // U+FFFD-studded garbage that the model could not usefully
+                // interpret and that regularly blew past provider body limits
+                // once tool results were replayed into history.
                 let bytes = tokio::fs::read(&resolved_path)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to read file: {e}"))?;
@@ -204,16 +213,50 @@ impl Tool for FileReadTool {
                     });
                 }
 
-                // Lossy fallback — replaces invalid bytes with U+FFFD
-                let lossy = String::from_utf8_lossy(&bytes).into_owned();
                 Ok(ToolResult {
-                    success: true,
-                    output: lossy,
-                    error: None,
+                    success: false,
+                    output: String::new(),
+                    error: Some(binary_not_supported_hint(path, bytes.len())),
                 })
             }
         }
     }
+}
+
+/// Produce a short, actionable error message when `file_read` is pointed at
+/// a non-UTF-8 file it cannot safely surface to the model. The hint names
+/// the specialized tool (`docx_read`, `pdf_read`, `image_info`) for known
+/// extensions so the LLM can retry with the right call.
+fn binary_not_supported_hint(path: &str, size: usize) -> String {
+    let ext = path
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(|name| name.rsplit('.').next())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+
+    let advice = match ext.as_str() {
+        "docx" | "docm" => "Use the docx_read tool to extract text from Word documents.",
+        "pdf" => {
+            "Use the pdf_read tool (requires the rag-pdf build feature) to extract text from PDFs."
+        }
+        "xlsx" | "xls" | "xlsm" => {
+            "Spreadsheet extraction is not yet supported — ask the user to export to CSV."
+        }
+        "pptx" | "ppt" => {
+            "PowerPoint extraction is not yet supported — ask the user to export to PDF."
+        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" => {
+            "Use the image_info tool for images (or screenshot for viewing)."
+        }
+        "zip" | "tar" | "gz" | "7z" | "rar" => "Archives are not expanded by file_read.",
+        _ => "file_read only handles UTF-8 text; use a format-specific tool if one exists.",
+    };
+
+    format!(
+        "{} is not valid UTF-8 text ({} bytes). {}",
+        path, size, advice
+    )
 }
 
 #[cfg(feature = "rag-pdf")]
@@ -623,6 +666,9 @@ mod tests {
     }
 
     /// PDF files should be readable via pdf-extract text extraction.
+    /// Gated on `rag-pdf`: without the feature `file_read` correctly rejects
+    /// PDFs (they are binary) and points the model at `pdf_read` instead.
+    #[cfg(feature = "rag-pdf")]
     #[tokio::test]
     async fn file_read_extracts_pdf_text() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_pdf");
@@ -652,14 +698,15 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// Non-UTF-8 binary files should be read with lossy conversion.
+    /// Non-UTF-8 binary files must be rejected (no lossy UTF-8 fallback).
+    /// The tool returns a short hint pointing the caller at the right
+    /// specialized tool when the extension is recognised.
     #[tokio::test]
-    async fn file_read_lossy_reads_binary_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_lossy");
+    async fn file_read_rejects_binary_file_with_hint() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_binary");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        // Write bytes that are not valid UTF-8 and not a PDF
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
         tokio::fs::write(dir.join("data.bin"), &binary_data)
             .await
@@ -669,20 +716,35 @@ mod tests {
         let result = tool.execute(json!({"path": "data.bin"})).await.unwrap();
 
         assert!(
-            result.success,
-            "lossy read must succeed, error: {:?}",
-            result.error
+            !result.success,
+            "binary file_read must fail rather than return lossy text, got output: {:?}",
+            result.output,
         );
-        assert!(
-            result.output.contains('\u{FFFD}'),
-            "lossy output must contain replacement character, got: {:?}",
-            result.output
-        );
-        assert!(
-            result.output.contains("hi"),
-            "lossy output must preserve valid ASCII, got: {:?}",
-            result.output
-        );
+        let msg = result.error.as_deref().unwrap_or("");
+        assert!(msg.contains("not valid UTF-8"), "error: {msg}");
+        assert!(msg.contains("file_read only handles"), "error: {msg}");
+        assert!(result.output.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A non-UTF-8 file with a DOCX extension steers the model to docx_read.
+    #[tokio::test]
+    async fn file_read_docx_hints_to_docx_read() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_docx_hint");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Not a real DOCX — just bytes that fail UTF-8 and carry the extension.
+        tokio::fs::write(dir.join("report.docx"), vec![0xFFu8; 32])
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "report.docx"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("docx_read"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -766,6 +828,9 @@ mod tests {
     /// End-to-end test: scripted provider calls `file_read` on a real PDF
     /// fixture, the tool extracts text via pdf-extract, and the extracted
     /// content reaches the provider in the tool result message.
+    /// Gated on `rag-pdf`: the PDF fallback inside `file_read` only compiles
+    /// under that feature.
+    #[cfg(feature = "rag-pdf")]
     #[tokio::test]
     async fn e2e_agent_file_read_pdf_extraction() {
         use crate::agent::agent::Agent;
@@ -861,17 +926,18 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
-    /// End-to-end test: agent calls `file_read` on a binary file, gets
-    /// lossy UTF-8 output with replacement characters in the tool result.
+    /// End-to-end test: agent calls `file_read` on a binary file and the
+    /// tool returns a structured rejection (no lossy UTF-8 garbage flooding
+    /// the prompt). The error hint is visible in the tool-result message so
+    /// the model can route the next turn to the right specialized tool.
     #[tokio::test]
-    async fn e2e_agent_file_read_lossy_binary() {
+    async fn e2e_agent_file_read_rejects_binary() {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use crate::providers::{ChatResponse, Provider, ToolCall};
         use e2e_helpers::*;
 
-        // ── Set up workspace with binary file ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_lossy");
+        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_reject_binary");
         let _ = tokio::fs::remove_dir_all(&workspace).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
@@ -899,7 +965,7 @@ mod tests {
                 reasoning_content: None,
             },
             ChatResponse {
-                text: Some("The file appears to be binary data.".into()),
+                text: Some("The file is binary; file_read cannot read it.".into()),
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
@@ -923,7 +989,8 @@ mod tests {
             "agent response must mention binary, got: {response}",
         );
 
-        // Verify tool result contains lossy output with replacement chars
+        // Verify tool result conveys the structured rejection (no U+FFFD
+        // garbage inflating the payload).
         {
             let all_requests = recorded.lock().unwrap();
             assert!(
@@ -938,13 +1005,13 @@ mod tests {
                 .expect("second request must contain a tool result message");
 
             assert!(
-                tool_result_msg.content.contains("valid"),
-                "tool result must preserve valid ASCII from binary file, got: {}",
+                tool_result_msg.content.contains("not valid UTF-8"),
+                "tool result must carry the rejection hint, got: {}",
                 tool_result_msg.content,
             );
             assert!(
-                tool_result_msg.content.contains('\u{FFFD}'),
-                "tool result must contain replacement character for invalid bytes, got: {}",
+                !tool_result_msg.content.contains('\u{FFFD}'),
+                "tool result must NOT contain lossy replacement characters, got: {}",
                 tool_result_msg.content,
             );
         }

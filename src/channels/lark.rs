@@ -242,6 +242,44 @@ fn should_refresh_last_recv(msg: &WsMsg) -> bool {
     matches!(msg, WsMsg::Binary(_) | WsMsg::Ping(_) | WsMsg::Pong(_))
 }
 
+/// Steer the LLM to the right tool when a user uploads a file via Lark.
+///
+/// Without this hint the model historically defaulted to `file_read`, which
+/// for binary formats like DOCX would previously fall back to a lossy UTF-8
+/// read and dump megabytes of garbage into the prompt. Now `file_read`
+/// rejects binaries outright — the hint here closes the UX loop by telling
+/// the model which specialised tool *is* appropriate.
+fn attachment_tool_hint(file_name: &str) -> String {
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+
+    match ext.as_str() {
+        "docx" | "docm" => "Use the docx_read tool (requires the 'rag-docx' build feature) \
+             to extract text from this Word document."
+            .to_string(),
+        "pdf" => "Use the pdf_read tool (requires the 'rag-pdf' build feature) \
+             to extract text from this PDF."
+            .to_string(),
+        "xlsx" | "xls" | "xlsm" => {
+            "Spreadsheet text extraction is not yet supported — ask the user \
+             to export to CSV if you need to read the contents."
+                .to_string()
+        }
+        "pptx" | "ppt" => "PowerPoint text extraction is not yet supported — ask the user \
+             to export to PDF if you need to read the slides."
+            .to_string(),
+        "txt" | "md" | "markdown" | "csv" | "tsv" | "json" | "yaml" | "yml" | "toml" | "xml"
+        | "html" | "htm" | "log" | "py" | "js" | "ts" | "rs" | "go" | "java" | "c" | "cpp"
+        | "h" | "hpp" => "Use file_read to read this text file.".to_string(),
+        _ => "Treat this as a binary attachment: file_read only handles UTF-8 text, \
+             and there is no specialised tool registered for this format."
+            .to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedTenantToken {
     value: String,
@@ -1406,15 +1444,22 @@ impl LarkChannel {
     }
 
     /// Parse an event callback payload and extract text messages
-    async fn download_lark_resource(&self, msg_id: &str, msg_type: &str, content_str: &str) -> Option<String> {
+    async fn download_lark_resource(
+        &self,
+        msg_id: &str,
+        msg_type: &str,
+        content_str: &str,
+    ) -> Option<String> {
         let v: serde_json::Value = serde_json::from_str(content_str).ok()?;
-        let resource_key = v.get("file_key")
+        let resource_key = v
+            .get("file_key")
             .or_else(|| v.get("image_key"))
             .or_else(|| v.get("folder_key"))
             .and_then(|k| k.as_str())
             .unwrap_or_default();
-            
-        let file_name = v.get("file_name")
+
+        let file_name = v
+            .get("file_name")
             .or_else(|| v.get("image_name"))
             .and_then(|n| n.as_str())
             .unwrap_or("");
@@ -1448,7 +1493,11 @@ impl LarkChannel {
             .ok()?;
 
         if !response.status().is_success() {
-            tracing::error!("Feishu download failed for {}: HTTP {}", file_name, response.status());
+            tracing::error!(
+                "Feishu download failed for {}: HTTP {}",
+                file_name,
+                response.status()
+            );
             return None;
         }
 
@@ -1472,9 +1521,17 @@ impl LarkChannel {
         let save_path = workspace_dir.join(&file_name);
         tokio::fs::write(&save_path, bytes).await.ok()?;
         let msg = if msg_type == "image" {
-            format!("[System: User uploaded image '{}', successfully saved to workspace]\n[IMAGE:{}]", file_name, save_path.display())
+            format!(
+                "[System: User uploaded image '{}', successfully saved to workspace]\n[IMAGE:{}]",
+                file_name,
+                save_path.display()
+            )
         } else {
-            format!("[System: User uploaded file '{}', successfully saved to workspace]", file_name)
+            let hint = attachment_tool_hint(&file_name);
+            format!(
+                "[System: User uploaded file '{}', successfully saved to workspace]\n{}",
+                file_name, hint
+            )
         };
         Some(msg)
     }
@@ -1556,10 +1613,13 @@ impl LarkChannel {
                 None => return messages,
             },
             "file" | "image" | "media" | "folder" => {
-                let msg_id = event.pointer("/message/message_id").and_then(|id| id.as_str()).unwrap_or_default();
+                let msg_id = event
+                    .pointer("/message/message_id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or_default();
                 let text = format!("[lark_download:{}:{}:{}]", msg_id, msg_type, content_str);
                 (text, Vec::new())
-            },
+            }
             _ => {
                 tracing::info!("Lark: skipping unsupported msg_type='{msg_type}'");
                 let preview: String = content_str.chars().take(200).collect();
@@ -1734,35 +1794,38 @@ impl Channel for LarkChannel {
             // Download links are appended as explicit `a href` rich-text
             // elements — JSON string fields, not markdown — so `&` is preserved.
             let mut post_paragraphs: Vec<serde_json::Value> = Vec::new();
-            
+
             // To avoid Feishu's ~10,000 character/byte truncation per single `md` node
             // in post messages, we split large texts into multiple paragraph nodes.
             let mut current_text = String::new();
             for block in cleaned_content.split("\n\n") {
                 if current_text.len() + block.len() > 8000 && !current_text.is_empty() {
-                    post_paragraphs.push(serde_json::json!([{ "tag": "md", "text": current_text }]));
+                    post_paragraphs
+                        .push(serde_json::json!([{ "tag": "md", "text": current_text }]));
                     current_text.clear();
                 }
                 if !current_text.is_empty() {
                     current_text.push_str("\n\n");
                 }
-                
+
                 // If a single block is still > 8000 chars (e.g. a giant continuous table),
                 // we forcefully chunk it, though it might occasionally break MD formatting.
                 if block.len() > 8000 {
                     let mut slice = block;
                     while !slice.is_empty() {
-                        let split_at = slice.char_indices()
+                        let split_at = slice
+                            .char_indices()
                             .map(|(idx, _)| idx)
                             .take_while(|&idx| idx <= 8000)
                             .last()
                             .unwrap_or(slice.len());
-                        
+
                         let part = &slice[..split_at];
                         slice = &slice[split_at..];
-                        
+
                         if current_text.len() + part.len() > 8000 && !current_text.is_empty() {
-                            post_paragraphs.push(serde_json::json!([{ "tag": "md", "text": current_text }]));
+                            post_paragraphs
+                                .push(serde_json::json!([{ "tag": "md", "text": current_text }]));
                             current_text.clear();
                         }
                         current_text.push_str(part);
@@ -1976,9 +2039,13 @@ impl LarkChannel {
                         // Need to remove the trailing bracket if we split naively, but wait!
                         // The trailing bracket is from splitn or format? Actually it ends with `]`.
                         // Wait, `[lark_download:{msg_id}:{msg_type}:{content_str}]` -- `content_str` contains `]`.
-                        let content_str = &content_str[..content_str.len()-1]; // drop trailing ]
-                        
-                        if let Some(text) = state.channel.download_lark_resource(msg_id, msg_type, content_str).await {
+                        let content_str = &content_str[..content_str.len() - 1]; // drop trailing ]
+
+                        if let Some(text) = state
+                            .channel
+                            .download_lark_resource(msg_id, msg_type, content_str)
+                            .await
+                        {
                             m.content = text;
                         } else {
                             m.content = "[System: Failed to download user attachment]".to_string();
@@ -2463,6 +2530,45 @@ fn should_respond_in_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── attachment_tool_hint ────────────────────────────────────
+
+    #[test]
+    fn attachment_hint_docx_routes_to_docx_read() {
+        let hint = attachment_tool_hint("report.docx");
+        assert!(hint.contains("docx_read"), "got: {hint}");
+    }
+
+    #[test]
+    fn attachment_hint_pdf_routes_to_pdf_read() {
+        let hint = attachment_tool_hint("paper.pdf");
+        assert!(hint.contains("pdf_read"), "got: {hint}");
+    }
+
+    #[test]
+    fn attachment_hint_xlsx_is_unsupported() {
+        let hint = attachment_tool_hint("data.xlsx");
+        assert!(hint.contains("not yet supported"), "got: {hint}");
+        assert!(hint.contains("CSV"), "got: {hint}");
+    }
+
+    #[test]
+    fn attachment_hint_plain_text_routes_to_file_read() {
+        let hint = attachment_tool_hint("notes.txt");
+        assert!(hint.contains("file_read"), "got: {hint}");
+    }
+
+    #[test]
+    fn attachment_hint_unknown_extension_warns_binary() {
+        let hint = attachment_tool_hint("archive.dat");
+        assert!(hint.contains("binary attachment"), "got: {hint}");
+    }
+
+    #[test]
+    fn attachment_hint_is_case_insensitive() {
+        let hint = attachment_tool_hint("REPORT.DOCX");
+        assert!(hint.contains("docx_read"), "got: {hint}");
+    }
 
     // ── extract_download_links ──────────────────────────────────
 
@@ -3363,7 +3469,8 @@ mod tests {
 
     #[test]
     fn parse_post_content_fallback_extracts_text_from_unknown_tag() {
-        let content = r#"{"zh_cn":{"title":"","content":[[{"tag":"future_tag","text":"some content"}]]}}"#;
+        let content =
+            r#"{"zh_cn":{"title":"","content":[[{"tag":"future_tag","text":"some content"}]]}}"#;
         let result = parse_post_content_details(content).unwrap();
         assert!(result.text.contains("some content"));
     }
