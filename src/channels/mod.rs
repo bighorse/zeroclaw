@@ -5143,7 +5143,11 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            // IterativeToolProvider emits identical tool_call_payload on
+            // every iteration, so without dedup exemption the loop's
+            // "consecutive all-dedup" safeguard bails before we reach the
+            // max_tool_iterations cap we actually want to exercise.
+            tool_call_dedup_exempt: Arc::new(vec!["mock_price".to_string()]),
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -5206,7 +5210,10 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            // See the above sibling test for why mock_price must be exempt:
+            // IterativeToolProvider would otherwise hit the dedup-stuck
+            // safeguard and never exercise the max_tool_iterations path.
+            tool_call_dedup_exempt: Arc::new(vec!["mock_price".to_string()]),
             model_routes: Arc::new(Vec::new()),
         });
 
