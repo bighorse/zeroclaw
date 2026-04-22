@@ -392,6 +392,11 @@ impl DelegateTool {
 
         let noop_observer = NoopObserver;
 
+        // Peek the shared cost tracker so sub-agent LLM calls spent on
+        // delegated work are counted toward the same daily/monthly budget
+        // as the caller. No-op when the singleton hasn't been initialized
+        // (standalone tests, cost tracking disabled, etc.).
+        let cost_tracker = crate::cost::shared_tracker_peek();
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
             run_tool_call_loop(
@@ -412,7 +417,7 @@ impl DelegateTool {
                 None,
                 &[],
                 &[],
-                None,
+                cost_tracker.as_ref(),
             ),
         )
         .await;

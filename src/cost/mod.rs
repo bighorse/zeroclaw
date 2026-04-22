@@ -66,6 +66,21 @@ pub fn shared_tracker(config: &CostConfig, workspace_dir: &Path) -> Option<Arc<C
         .clone()
 }
 
+/// Peek at the process-wide shared tracker WITHOUT initializing it.
+///
+/// Returns `None` if `shared_tracker` has not yet been called in this
+/// process OR if the first initialization produced `None` (cost disabled
+/// or build failed).
+///
+/// Use from call sites that don't have a `Config` handy (e.g. tool
+/// implementations invoked deep in the agent loop). By the time such
+/// a call site runs, the enclosing `agent::run` / gateway / channel
+/// worker has already called `shared_tracker`, so peek will see the
+/// initialized value.
+pub fn shared_tracker_peek() -> Option<Arc<CostTracker>> {
+    SHARED_TRACKER.get().and_then(Clone::clone)
+}
+
 /// Look up per-1M-token pricing for a `(provider, model)` pair in the cost
 /// config's `prices` table.
 ///
