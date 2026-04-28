@@ -3614,8 +3614,37 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+    let (response, _) = process_message_inner(config, message, None, None).await?;
+    Ok(response)
+}
+
+/// Like [`process_message`] but supports persistent multi-turn history and an
+/// externally supplied observer. Returns `(response, full_history)` where
+/// `full_history` includes the system prompt, prior turns, the new user
+/// message, any tool exchanges, and the final assistant reply — caller stores
+/// it back to drive the next turn.
+///
+/// - `prior_history = None`  → fresh chat (system prompt + new user message)
+/// - `prior_history = Some(h)` → append the new user message to `h` and run.
+///   The caller is responsible for ensuring `h[0]` is the system prompt.
+pub async fn process_message_with_history(
+    config: Config,
+    message: &str,
+    prior_history: Option<Vec<ChatMessage>>,
+    external_observer: Option<Arc<dyn Observer>>,
+) -> Result<(String, Vec<ChatMessage>)> {
+    process_message_inner(config, message, prior_history, external_observer).await
+}
+
+async fn process_message_inner(
+    config: Config,
+    message: &str,
+    prior_history: Option<Vec<ChatMessage>>,
+    external_observer: Option<Arc<dyn Observer>>,
+) -> Result<(String, Vec<ChatMessage>)> {
+    let observer: Arc<dyn Observer> = external_observer.unwrap_or_else(|| {
+        Arc::from(observability::create_observer(&config.observability))
+    });
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -3776,12 +3805,24 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         format!("{context}[{now}] {message}")
     };
 
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
+    // Build / extend history. The system prompt is rebuilt every turn here
+    // (prior_history's [0] is overwritten) — this is intentional so changes
+    // to USER.md / IDENTITY.md propagate to ongoing conversations without
+    // restarting the daemon. Prior_history's index 1.. is the prior turns.
+    let mut history: Vec<ChatMessage> = match prior_history {
+        Some(h) if !h.is_empty() => {
+            let mut h = h;
+            h[0] = ChatMessage::system(&system_prompt);
+            h.push(ChatMessage::user(&enriched));
+            h
+        }
+        _ => vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(&enriched),
+        ],
+    };
 
-    agent_turn(
+    let response = agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -3793,7 +3834,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.multimodal,
         config.agent.max_tool_iterations,
     )
-    .await
+    .await?;
+    Ok((response, history))
 }
 
 #[cfg(test)]

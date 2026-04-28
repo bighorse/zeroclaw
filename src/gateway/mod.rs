@@ -313,6 +313,11 @@ pub struct AppState {
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Persistent conversation history for the `/api/chat` REST endpoint.
+    /// One daemon serves at most one user (by design), so a single global
+    /// history vector is sufficient — no session id needed.
+    pub api_chat_history:
+        Arc<Mutex<Vec<crate::providers::ChatMessage>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -644,6 +649,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         cost_tracker,
         event_tx,
         shutdown_tx,
+        api_chat_history: Arc::new(Mutex::new(Vec::new())),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1264,34 +1270,44 @@ async fn handle_api_chat(
     let model_label = state.model.clone();
     let started_at = Instant::now();
 
-    state
-        .observer
-        .record_event(&crate::observability::ObserverEvent::AgentStart {
-            provider: provider_label.clone(),
-            model: model_label.clone(),
-        });
+    // Persistent multi-turn history: clone out, call agent, store back.
+    // One daemon = one user, no session id needed.
+    let prior_history = {
+        let guard = state.api_chat_history.lock();
+        if guard.is_empty() {
+            None
+        } else {
+            Some(guard.clone())
+        }
+    };
 
-    // ── KEY DIFFERENCE FROM /webhook ──
-    // run_gateway_chat_with_tools -> process_message -> full agent loop
-    // (tool calls executed, multi-turn LLM, observer emits tool_call events)
-    let result = run_gateway_chat_with_tools(&state, message).await;
+    let config = state.config.lock().clone();
+    // process_message_with_history emits AgentStart/AgentEnd, LlmRequest/Response,
+    // ToolCall/ToolCallStart events through the supplied observer (which is the
+    // SSE broadcast observer in production), so we don't need to emit AgentStart
+    // here ourselves.
+    let result = crate::agent::process_message_with_history(
+        config,
+        message,
+        prior_history,
+        Some(state.observer.clone()),
+    )
+    .await;
 
     let duration = started_at.elapsed();
     match result {
-        Ok(response) => {
+        Ok((response, new_history)) => {
+            // Persist updated history (now includes user msg + assistant reply
+            // + any tool exchanges in between) for the next turn.
+            {
+                let mut guard = state.api_chat_history.lock();
+                *guard = new_history;
+            }
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
             );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
-
+            // process_message_with_history emits its own AgentEnd; we don't.
+            let _ = (provider_label, model_label);
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
@@ -1306,15 +1322,7 @@ async fn handle_api_chat(
                     component: "gateway".to_string(),
                     message: sanitized.clone(),
                 });
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
+            let _ = (provider_label, model_label);
             tracing::error!("/api/chat agent error: {}", sanitized);
             let err = serde_json::json!({"error": "Chat failed", "detail": sanitized});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
