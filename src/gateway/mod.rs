@@ -46,8 +46,13 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request timeout. 30s is the legacy slow-loris guard, but it kills any
+/// LLM-driven path (/webhook, /api/chat, channel webhooks) in the middle
+/// of an agent loop — multi-turn tool calls easily run 30-120s. Slow-loris
+/// is normally handled at the reverse proxy (nginx client_body_timeout
+/// + read_timeout); 300s here lets agent loops complete while still
+/// bounding pathological hangs.
+pub const REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
