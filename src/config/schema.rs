@@ -2171,6 +2171,14 @@ pub struct BuiltinHooksConfig {
     /// that matches one of `tool_patterns`.
     #[serde(default)]
     pub webhook_audit: WebhookAuditConfig,
+    /// Configuration for the zero-principle-audit hook (PharmaClaw 第零原则).
+    ///
+    /// When enabled inside a medical SOP turn, blocks `file_write` / `shell`
+    /// invocations that occur before the agent has read the canonical
+    /// `SKILL.md` for the current step. Currently a skeleton — enforcement
+    /// lands in a follow-up PR.
+    #[serde(default)]
+    pub zero_principle_audit: ZeroPrincipleAuditConfig,
 }
 
 /// Configuration for the webhook-audit builtin hook.
@@ -2214,6 +2222,49 @@ impl Default for WebhookAuditConfig {
             tool_patterns: Vec::new(),
             include_args: false,
             max_args_bytes: default_max_args_bytes(),
+        }
+    }
+}
+
+/// Configuration for the zero-principle-audit builtin hook.
+///
+/// Enforces PharmaClaw's "zero principle" inside medical SOP turns:
+/// before any tool in `gated_tools` (default `file_write`, `shell`)
+/// can be invoked, the agent must have called `file_read` on a path
+/// containing `SKILL.md`. Without this discipline an LLM can synthesise
+/// medical scripts from pre-trained memory rather than the canonical
+/// SKILL.md recipe — a violation of the project safety contract.
+///
+/// Only applies to agent turns started by `sop_execute` whose SOP
+/// declares `medical = true`. Non-medical turns pass through with
+/// zero overhead.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ZeroPrincipleAuditConfig {
+    /// Enable the zero-principle-audit hook. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Tool names to gate. A `file_read` of a `SKILL.md` path must
+    /// have occurred earlier in the same turn before any of these
+    /// tools may run. Default: `["file_write", "shell"]`.
+    #[serde(default = "default_zero_principle_gated_tools")]
+    pub gated_tools: Vec<String>,
+    /// Glob patterns for `file_write` paths that bypass the gate
+    /// (e.g. log files the agent should be free to write without
+    /// reading a SKILL). Default: empty (no exemptions).
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+}
+
+fn default_zero_principle_gated_tools() -> Vec<String> {
+    vec!["file_write".to_string(), "shell".to_string()]
+}
+
+impl Default for ZeroPrincipleAuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gated_tools: default_zero_principle_gated_tools(),
+            allowed_paths: Vec::new(),
         }
     }
 }
