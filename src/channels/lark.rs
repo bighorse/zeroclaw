@@ -16,6 +16,23 @@ static SOP_APPROVE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 /// Counterpart to [`SOP_APPROVE_REGEX`] for rejection.
 static SOP_REJECT_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
+/// Outcome of a SOP control-command parse against an inbound Lark
+/// message. Carries enough information for the WS handler to
+/// (a) reply to the operator, and (b) optionally synthesise a wake
+/// message that resumes the LLM agent loop on the SOP's next step.
+enum SopCommandOutcome {
+    /// Not a SOP command — fall through to the LLM agent loop unchanged.
+    NotHandled,
+    /// Recognised, but only a reply to the operator is needed (rejection
+    /// placeholder, error, lock poisoning). The LLM is **not** woken.
+    Reply(String),
+    /// Recognised approval that successfully advanced the engine. Reply
+    /// goes to the operator's chat; `wake` is fed back into the same
+    /// channel's mpsc so the LLM agent loop picks it up and calls
+    /// `sop_advance` to continue SOP execution.
+    Approved { reply: String, wake: String },
+}
+
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
@@ -1176,24 +1193,75 @@ impl LarkChannel {
                     // SOP control command intercept — when the daemon
                     // wired a shared SopEngine, parse the inbound text
                     // for `批准/approve/拒绝/reject run-xxx` and act
-                    // on it directly. Matched commands skip the LLM
-                    // agent loop entirely; unmatched fall through.
-                    if let Some(reply) = self.try_handle_sop_command(&text) {
-                        let send_channel = self.clone();
-                        let send_target = lark_msg.chat_id.clone();
-                        tokio::spawn(async move {
-                            let msg = crate::channels::traits::SendMessage::new(
-                                reply, send_target,
+                    // on it directly.
+                    //
+                    //  - `Reply`    → reply to the operator only; do
+                    //                 NOT forward to the LLM (rejection,
+                    //                 error placeholders).
+                    //  - `Approved` → reply + synthesise a wake
+                    //                 ChannelMessage and push it on
+                    //                 `tx` so the LLM agent loop
+                    //                 auto-resumes via `sop_advance`.
+                    //  - `NotHandled` → fall through to the regular
+                    //                 LLM forwarding path below.
+                    match self.try_handle_sop_command(&text) {
+                        SopCommandOutcome::NotHandled => {}
+                        SopCommandOutcome::Reply(reply) => {
+                            let send_channel = self.clone();
+                            let send_target = lark_msg.chat_id.clone();
+                            tokio::spawn(async move {
+                                let msg = crate::channels::traits::SendMessage::new(
+                                    reply,
+                                    send_target,
+                                );
+                                if let Err(e) = send_channel.send(&msg).await {
+                                    tracing::warn!("Lark: SOP command reply failed: {e}");
+                                }
+                            });
+                            tracing::info!(
+                                "Lark WS: SOP control command handled (reply only) for {}",
+                                lark_msg.chat_id
                             );
-                            if let Err(e) = send_channel.send(&msg).await {
-                                tracing::warn!("Lark: SOP command reply failed: {e}");
+                            continue;
+                        }
+                        SopCommandOutcome::Approved { reply, wake } => {
+                            let send_channel = self.clone();
+                            let send_target = lark_msg.chat_id.clone();
+                            tokio::spawn(async move {
+                                let msg = crate::channels::traits::SendMessage::new(
+                                    reply,
+                                    send_target,
+                                );
+                                if let Err(e) = send_channel.send(&msg).await {
+                                    tracing::warn!("Lark: SOP command reply failed: {e}");
+                                }
+                            });
+                            // Synthesise an inbound ChannelMessage that
+                            // the LLM agent loop will treat as if the
+                            // operator typed it. Sender / reply_target
+                            // mirror the original chat so any LLM tool
+                            // output lands back in the same Feishu chat.
+                            let wake_msg = ChannelMessage {
+                                id: Uuid::new_v4().to_string(),
+                                sender: lark_msg.chat_id.clone(),
+                                reply_target: lark_msg.chat_id.clone(),
+                                content: wake,
+                                channel: self.channel_name().to_string(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                thread_ts: None,
+                            };
+                            tracing::info!(
+                                "Lark WS: SOP approved — waking LLM for {}",
+                                lark_msg.chat_id
+                            );
+                            if tx.send(wake_msg).await.is_err() {
+                                break;
                             }
-                        });
-                        tracing::info!(
-                            "Lark WS: SOP control command handled in-channel for {}",
-                            lark_msg.chat_id
-                        );
-                        continue;
+                            continue;
+                        }
                     }
 
                     let channel_msg = ChannelMessage {
@@ -1223,8 +1291,7 @@ impl LarkChannel {
     }
 
     /// Try to handle a SOP control command embedded in an inbound chat
-    /// message. Returns `Some(reply_text)` when the message was handled
-    /// (caller should NOT forward to the LLM); `None` otherwise.
+    /// message.
     ///
     /// Recognised forms (case-insensitive on the keyword, run id is
     /// case-sensitive because SopEngine uses it as an exact map key):
@@ -1232,11 +1299,13 @@ impl LarkChannel {
     ///   `批准 run-xxx`   `approve run-xxx`     → SopEngine.approve_step
     ///   `拒绝 run-xxx`   `reject run-xxx`      → 501 placeholder reply
     ///
-    /// Anything else returns `None` and falls through to the LLM agent
-    /// loop. We deliberately keep the surface tiny — operators do
+    /// Anything else returns `NotHandled` and falls through to the LLM
+    /// agent loop. We deliberately keep the surface tiny — operators do
     /// *commands*, conversation goes to the LLM.
-    fn try_handle_sop_command(&self, text: &str) -> Option<String> {
-        let engine = self.sop_engine.as_ref()?;
+    fn try_handle_sop_command(&self, text: &str) -> SopCommandOutcome {
+        let Some(engine) = self.sop_engine.as_ref() else {
+            return SopCommandOutcome::NotHandled;
+        };
 
         // Strip the leading bot mention if present (e.g. "@PharmaClaw 批准 run-xxx").
         // We don't try to be clever: just look for the command keyword
@@ -1254,20 +1323,23 @@ impl LarkChannel {
         });
 
         if let Some(caps) = approve_re.captures(head) {
-            let run_id = caps.get(1)?.as_str().to_string();
+            let Some(m) = caps.get(1) else {
+                return SopCommandOutcome::NotHandled;
+            };
+            let run_id = m.as_str().to_string();
             let result = {
                 let mut eng = match engine.lock() {
                     Ok(e) => e,
                     Err(e) => {
                         tracing::error!("Lark SOP cmd: engine lock poisoned: {e}");
-                        return Some(format!(
+                        return SopCommandOutcome::Reply(format!(
                             "❌ SOP 引擎锁中毒,无法处理批准请求(`{run_id}`)。请检查 daemon 日志。"
                         ));
                     }
                 };
                 eng.approve_step(&run_id)
             };
-            return Some(match result {
+            return match result {
                 Ok(action) => {
                     let next = match &action {
                         crate::sop::SopRunAction::ExecuteStep { step, .. } => {
@@ -1290,22 +1362,35 @@ impl LarkChannel {
                             format!("Failed: {reason}")
                         }
                     };
-                    format!(
-                        "✅ 已批准 `{run_id}`,SOP 推进。下一动作:`{next}`\n\n继续在飞书发消息让我推进剩余步骤。"
-                    )
+                    let reply = format!(
+                        "✅ 已批准 `{run_id}`,SOP 推进。下一动作:`{next}`\n\n正在自动唤醒 LLM 推进剩余步骤..."
+                    );
+                    // Synthesize a wake message that the LLM agent loop
+                    // will treat as inbound chat. The message is phrased
+                    // as a system instruction so the LLM picks the
+                    // `sop_advance` tool deterministically. Keep it
+                    // short — IDENTITY.md already teaches the LLM what
+                    // `sop_advance` does.
+                    let wake = format!(
+                        "[SYSTEM] PM 已批准 SOP run `{run_id}` 的当前 WaitApproval 检查点。请立即调用 `sop_advance` 工具(参数 `run_id={run_id}`)推进 SOP 到下一步,然后按 SOP.md 继续执行剩余步骤,直到下一个 `requires_confirmation:true` 检查点或运行完成。"
+                    );
+                    SopCommandOutcome::Approved { reply, wake }
                 }
-                Err(e) => format!("❌ 批准 `{run_id}` 失败:{e}"),
-            });
+                Err(e) => SopCommandOutcome::Reply(format!("❌ 批准 `{run_id}` 失败:{e}")),
+            };
         }
 
         if let Some(caps) = reject_re.captures(head) {
-            let run_id = caps.get(1)?.as_str();
-            return Some(format!(
+            let Some(m) = caps.get(1) else {
+                return SopCommandOutcome::NotHandled;
+            };
+            let run_id = m.as_str();
+            return SopCommandOutcome::Reply(format!(
                 "⚠️ 拒绝功能尚未在 SOP 引擎实现(run `{run_id}` 仍处于 WaitingApproval)。\n如需终止该 SOP,请在 daemon 重启或手动清理。",
             ));
         }
 
-        None
+        SopCommandOutcome::NotHandled
     }
 
     /// Get or refresh tenant access token
