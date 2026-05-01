@@ -330,8 +330,21 @@ pub struct AppState {
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+///
+/// `external_sop_engine`: when `Some`, the gateway shares this engine
+/// with the daemon's other components (notably channels' agent loop).
+/// This is the daemon-singleton pattern that ensures runs started via
+/// `POST /sop/*` are visible to in-agent `sop_status`/`sop_advance`
+/// calls — and that `POST /sop/approve/{run_id}` can find runs created
+/// by an in-agent `sop_execute`. Pass `None` only when running the
+/// gateway in isolation (tests, standalone webhook server).
 #[allow(clippy::too_many_lines)]
-pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+) -> Result<()> {
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
@@ -396,14 +409,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    // Shared SOP engine: lives in AppState and is shared with the agent
-    // loop's tool list, so runs started via `POST /sop/*` are visible to
-    // in-agent `sop_status` / `sop_advance` calls.
-    let sop_engine = {
+    // Shared SOP engine. Prefer the daemon-supplied engine so all
+    // components (gateway + channels' agent loop) see the same
+    // `active_runs`. Fall back to a fresh local engine in standalone
+    // mode (tests, isolated gateway).
+    let sop_engine = external_sop_engine.unwrap_or_else(|| {
         let mut engine = crate::sop::SopEngine::new(config.sop.clone());
         engine.reload(&config.workspace_dir);
         Arc::new(std::sync::Mutex::new(engine))
-    };
+    });
 
     let tools_registry_raw = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
@@ -689,6 +703,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
+        .route("/sop/approve/{run_id}", post(handle_sop_approve))
+        .route("/sop/reject/{run_id}", post(handle_sop_reject))
         .route("/sop/{*rest}", post(handle_sop_webhook))
         .route("/api/chat", post(handle_api_chat))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -1204,6 +1220,120 @@ async fn handle_webhook(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
+}
+
+/// POST /sop/approve/{run_id} — Channel-only SOP step approval.
+///
+/// Approves a run currently in `WaitingApproval` status and returns the
+/// next action. Reachable only by callers that hold a paired bearer
+/// token — typically a channel adapter (LarkChannel command parser
+/// for `@bot 批准 run-xxx`) or an external operator with a curl/CLI.
+///
+/// Note: this endpoint exists because `SopApproveTool` is intentionally
+/// NOT exposed to the LLM — the dual-sign quality gate would be
+/// trivially defeated if the LLM could self-approve.
+async fn handle_sop_approve(
+    State(state): State<AppState>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        let err = serde_json::json!({"error":"rate limit exceeded"});
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            let err = serde_json::json!({
+                "error":"Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    let result = {
+        let mut engine = match state.sop_engine.lock() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("SOP approve: engine lock poisoned: {e}");
+                let err = serde_json::json!({"error":"engine lock poisoned"});
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+            }
+        };
+        engine.approve_step(&run_id)
+    };
+
+    match result {
+        Ok(action) => {
+            tracing::info!(run_id = %run_id, "SOP approve: run advanced");
+            let body = serde_json::json!({
+                "status": "approved",
+                "run_id": run_id,
+                "next_action": format!("{action:?}"),
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            tracing::warn!(run_id = %run_id, error = %e, "SOP approve failed");
+            let msg = e.to_string();
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::CONFLICT
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": msg, "run_id": run_id})),
+            )
+        }
+    }
+}
+
+/// POST /sop/reject/{run_id} — Channel-only SOP step rejection.
+///
+/// Counterpart to `/sop/approve/{run_id}`. The current `SopEngine` does
+/// not yet have a first-class reject API, so this implementation simply
+/// returns 501 with a clear message until that lands. Wired now so the
+/// LarkChannel parser has a stable URL to point at.
+async fn handle_sop_reject(
+    State(state): State<AppState>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        let err = serde_json::json!({"error":"rate limit exceeded"});
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            let err = serde_json::json!({"error":"Unauthorized"});
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    tracing::warn!(run_id = %run_id, "SOP reject called but not yet implemented in engine");
+    let body = serde_json::json!({
+        "error": "SopEngine does not yet support rejection. The run remains in WaitingApproval. Restart the SOP or wait for a future engine update.",
+        "run_id": run_id,
+    });
+    (StatusCode::NOT_IMPLEMENTED, Json(body))
 }
 
 /// POST /sop/{*rest} — SOP-only event endpoint.
