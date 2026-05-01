@@ -3074,6 +3074,7 @@ struct ConfiguredChannel {
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
+    external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
 ) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
@@ -3306,7 +3307,8 @@ fn collect_configured_channels(
                     display_name: "Feishu",
                     channel: Arc::new(
                         LarkChannel::from_config(lk)
-                            .with_workspace_dir(config.workspace_dir.clone()),
+                            .with_workspace_dir(config.workspace_dir.clone())
+                            .with_sop_engine_opt(external_sop_engine.clone()),
                     ),
                 });
             }
@@ -3315,7 +3317,8 @@ fn collect_configured_channels(
                 display_name: "Lark",
                 channel: Arc::new(
                     LarkChannel::from_lark_config(lk)
-                        .with_workspace_dir(config.workspace_dir.clone()),
+                        .with_workspace_dir(config.workspace_dir.clone())
+                        .with_sop_engine_opt(external_sop_engine.clone()),
                 ),
             });
         }
@@ -3327,7 +3330,8 @@ fn collect_configured_channels(
             display_name: "Feishu",
             channel: Arc::new(
                 LarkChannel::from_feishu_config(fs)
-                    .with_workspace_dir(config.workspace_dir.clone()),
+                    .with_workspace_dir(config.workspace_dir.clone())
+                    .with_sop_engine_opt(external_sop_engine.clone()),
             ),
         });
     }
@@ -3374,7 +3378,7 @@ fn collect_configured_channels(
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check", None);
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels_config.nostr {
@@ -3523,7 +3527,7 @@ pub async fn start_channels(
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        external_sop_engine,
+        external_sop_engine.clone(),
     ));
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
@@ -3624,7 +3628,7 @@ pub async fn start_channels(
     // Collect active channels from a shared builder to keep startup and doctor parity.
     #[allow(unused_mut)]
     let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
+        collect_configured_channels(&config, "runtime startup", external_sop_engine.clone())
             .into_iter()
             .map(|configured| configured.channel)
             .collect();
@@ -6850,7 +6854,7 @@ This is an example JSON object for profile settings."#;
             mention_only: Some(false),
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test", None);
 
         assert!(channels
             .iter()
