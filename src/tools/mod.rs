@@ -47,6 +47,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod pdf_read;
+pub mod pmid_dedup_check;
 pub mod proxy_config;
 pub mod publish_file;
 pub mod pushover;
@@ -100,6 +101,7 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
+pub use pmid_dedup_check::PmidDedupCheckTool;
 pub use proxy_config::ProxyConfigTool;
 pub use publish_file::PublishFileTool;
 pub use pushover::PushoverTool;
@@ -419,6 +421,13 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
         // SopApproveTool deliberately omitted — see comment above.
         tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+
+        // PMID dedup checker — surfaced when SOP is wired so step 7 PM
+        // 审核 can run structural reuse detection on the assembled
+        // report. No engine dependency; we use the same conditional
+        // simply because PharmaClaw-style supervised SOP flows are
+        // where this check is most useful.
+        tool_arcs.push(Arc::new(PmidDedupCheckTool::new(workspace_dir.to_path_buf())));
     }
 
     if let Some(key) = composio_key {
