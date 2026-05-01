@@ -117,10 +117,17 @@ impl PmidDedupCheckTool {
                 };
                 let pmid = pmid_match.as_str().to_string();
                 let trimmed = line.trim();
-                let context = if trimmed.len() <= 140 {
+                // Truncate by *character* count, not byte count. CJK
+                // characters are 3 bytes each in UTF-8; a naïve
+                // `&trimmed[..140]` slice panics with "byte index N is
+                // not a char boundary" when the cut lands inside a
+                // multi-byte sequence — common in PharmaClaw reports.
+                let char_count = trimmed.chars().count();
+                let context = if char_count <= 140 {
                     trimmed.to_string()
                 } else {
-                    format!("{}…", &trimmed[..140])
+                    let truncated: String = trimmed.chars().take(140).collect();
+                    format!("{truncated}…")
                 };
                 by_pmid
                     .entry(pmid)
@@ -366,6 +373,24 @@ Unique to B is PMID: 22222222.
         assert!(report.contains("PMID:11111111"));
         assert!(report.contains("假说 1"));
         assert!(report.contains("假说 3"));
+    }
+
+    #[test]
+    fn scan_text_handles_long_cjk_lines_without_panicking() {
+        // Regression: a naïve `&line[..140]` byte slice panics on CJK
+        // lines because each Chinese character is 3 bytes in UTF-8 and
+        // 140 bytes almost never lands on a char boundary. Real
+        // PharmaClaw 立项报告 lines are densely Chinese — the panic was
+        // observed live during a step 7 PM 审核 run.
+        let chinese = "本研究的核心创新点是探究 EGFR 突变 NSCLC 经 osimertinib 序贯耐药后涌现的 KRAS-G12C 亚克隆群体在共突变背景上与初治 G12C 队列的差异性 (PMID: 41691490)";
+        // > 140 chars — intentionally wide to cross any 140-byte slice boundary
+        let text = format!("## 假说 1\n{chinese}\n");
+        let by_pmid = PmidDedupCheckTool::scan_text(&text);
+        let occs = by_pmid.get("41691490").expect("PMID extracted");
+        assert_eq!(occs.len(), 1);
+        // Context should be ≤ 140 *chars* (140 chars + 1 ellipsis OR the full line if shorter).
+        // Critically: no panic.
+        assert!(occs[0].context.chars().count() <= 141);
     }
 
     #[test]
