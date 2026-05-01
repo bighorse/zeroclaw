@@ -197,6 +197,18 @@ impl SopEngine {
             .get_mut(run_id)
             .ok_or_else(|| anyhow::anyhow!("Active run not found: {run_id}"))?;
 
+        // Reject advance while the run is parked at a `requires_confirmation`
+        // gate — otherwise any caller (notably the LLM via SopAdvanceTool)
+        // can drive the run through a checkpoint without ever transitioning
+        // the run back to `Running` via `approve_step`. That defeats the
+        // entire supervised-approval flow.
+        if run.status == SopRunStatus::WaitingApproval {
+            bail!(
+                "Run {run_id} is waiting for approval at step {}; call approve_step before advance_step",
+                run.current_step
+            );
+        }
+
         let sop = self
             .sops
             .iter()
@@ -1616,6 +1628,64 @@ mod tests {
 
         let run = engine.active_runs().get(&run_id).unwrap();
         assert_eq!(run.status, SopRunStatus::Running);
+    }
+
+    #[test]
+    fn advance_step_rejects_waiting_approval_run() {
+        // Regression: a Supervised SOP must NOT be advanceable while parked
+        // at a `requires_confirmation` gate. Without this guard, any caller
+        // (notably the LLM via SopAdvanceTool) can drive the run through a
+        // checkpoint without ever transitioning back to `Running` via
+        // `approve_step`, defeating the entire supervised-approval flow.
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            engine.active_runs().get(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval
+        );
+
+        let err = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "ok".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("waiting for approval"),
+            "unexpected error: {err}"
+        );
+
+        // Run state remains WaitingApproval; no step result was recorded.
+        let run = engine.active_runs().get(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::WaitingApproval);
+        assert_eq!(run.current_step, 1);
+        assert!(run.step_results.is_empty(), "step result must not leak");
+
+        // Once approved, the legitimate path advances normally.
+        engine.approve_step(&run_id).unwrap();
+        engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "ok".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
     }
 
     #[test]
