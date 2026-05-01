@@ -4,11 +4,17 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
+
+/// Regex matching `批准 run-xxx` or `approve run-xxx` (case-insensitive
+/// keyword). Compiled once on first use.
+static SOP_APPROVE_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+/// Counterpart to [`SOP_APPROVE_REGEX`] for rejection.
+static SOP_REJECT_REGEX: OnceLock<regex::Regex> = OnceLock::new();
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -541,6 +547,12 @@ pub struct LarkChannel {
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
     /// Optional workspace directory to save downloaded attachments
     workspace_dir: Option<PathBuf>,
+    /// Daemon-shared SOP engine. When `Some`, inbound text messages are
+    /// pre-parsed for SOP control commands (`批准 run-xxx` / `拒绝
+    /// run-xxx`); matched commands invoke the engine directly and reply
+    /// to the chat without going through the LLM agent loop. `None`
+    /// preserves legacy "everything goes to the LLM" behaviour.
+    sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
 }
 
 impl LarkChannel {
@@ -585,11 +597,33 @@ impl LarkChannel {
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
             workspace_dir: None,
+            sop_engine: None,
         }
     }
 
     pub fn with_workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
         self.workspace_dir = Some(workspace_dir);
+        self
+    }
+
+    /// Inject the daemon-shared SOP engine. Enables in-channel parsing
+    /// of `批准/拒绝 run-xxx` commands without round-tripping through
+    /// HTTP or the LLM agent loop.
+    pub fn with_sop_engine(mut self, engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>) -> Self {
+        self.sop_engine = Some(engine);
+        self
+    }
+
+    /// `Option`-flavoured variant of [`with_sop_engine`] for ergonomic
+    /// builder chains where the engine is conditionally available
+    /// (e.g. daemon vs standalone CLI).
+    pub fn with_sop_engine_opt(
+        mut self,
+        engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    ) -> Self {
+        if engine.is_some() {
+            self.sop_engine = engine;
+        }
         self
     }
 
@@ -1139,6 +1173,29 @@ impl LarkChannel {
                             .await;
                     });
 
+                    // SOP control command intercept — when the daemon
+                    // wired a shared SopEngine, parse the inbound text
+                    // for `批准/approve/拒绝/reject run-xxx` and act
+                    // on it directly. Matched commands skip the LLM
+                    // agent loop entirely; unmatched fall through.
+                    if let Some(reply) = self.try_handle_sop_command(&text) {
+                        let send_channel = self.clone();
+                        let send_target = lark_msg.chat_id.clone();
+                        tokio::spawn(async move {
+                            let msg = crate::channels::traits::SendMessage::new(
+                                reply, send_target,
+                            );
+                            if let Err(e) = send_channel.send(&msg).await {
+                                tracing::warn!("Lark: SOP command reply failed: {e}");
+                            }
+                        });
+                        tracing::info!(
+                            "Lark WS: SOP control command handled in-channel for {}",
+                            lark_msg.chat_id
+                        );
+                        continue;
+                    }
+
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: lark_msg.chat_id.clone(),
@@ -1163,6 +1220,92 @@ impl LarkChannel {
     /// Check if a user open_id is allowed
     fn is_user_allowed(&self, open_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == open_id)
+    }
+
+    /// Try to handle a SOP control command embedded in an inbound chat
+    /// message. Returns `Some(reply_text)` when the message was handled
+    /// (caller should NOT forward to the LLM); `None` otherwise.
+    ///
+    /// Recognised forms (case-insensitive on the keyword, run id is
+    /// case-sensitive because SopEngine uses it as an exact map key):
+    ///
+    ///   `批准 run-xxx`   `approve run-xxx`     → SopEngine.approve_step
+    ///   `拒绝 run-xxx`   `reject run-xxx`      → 501 placeholder reply
+    ///
+    /// Anything else returns `None` and falls through to the LLM agent
+    /// loop. We deliberately keep the surface tiny — operators do
+    /// *commands*, conversation goes to the LLM.
+    fn try_handle_sop_command(&self, text: &str) -> Option<String> {
+        let engine = self.sop_engine.as_ref()?;
+
+        // Strip the leading bot mention if present (e.g. "@PharmaClaw 批准 run-xxx").
+        // We don't try to be clever: just look for the command keyword
+        // anywhere in the first ~200 chars and capture the run id that
+        // follows.
+        let head: &str = text.get(..text.len().min(200)).unwrap_or(text);
+
+        let approve_re = SOP_APPROVE_REGEX.get_or_init(|| {
+            regex::Regex::new(r"(?i)(?:批准|approve)\s+(run-[A-Za-z0-9_-]+)")
+                .expect("static regex compiles")
+        });
+        let reject_re = SOP_REJECT_REGEX.get_or_init(|| {
+            regex::Regex::new(r"(?i)(?:拒绝|reject)\s+(run-[A-Za-z0-9_-]+)")
+                .expect("static regex compiles")
+        });
+
+        if let Some(caps) = approve_re.captures(head) {
+            let run_id = caps.get(1)?.as_str().to_string();
+            let result = {
+                let mut eng = match engine.lock() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!("Lark SOP cmd: engine lock poisoned: {e}");
+                        return Some(format!(
+                            "❌ SOP 引擎锁中毒,无法处理批准请求(`{run_id}`)。请检查 daemon 日志。"
+                        ));
+                    }
+                };
+                eng.approve_step(&run_id)
+            };
+            return Some(match result {
+                Ok(action) => {
+                    let next = match &action {
+                        crate::sop::SopRunAction::ExecuteStep { step, .. } => {
+                            format!("ExecuteStep #{} — {}", step.number, step.title)
+                        }
+                        crate::sop::SopRunAction::WaitApproval { step, .. } => {
+                            format!(
+                                "WaitApproval — next gate at step #{} ({})",
+                                step.number, step.title
+                            )
+                        }
+                        crate::sop::SopRunAction::DeterministicStep { step, .. } => {
+                            format!("DeterministicStep — {}", step.title)
+                        }
+                        crate::sop::SopRunAction::CheckpointWait { step, .. } => {
+                            format!("CheckpointWait — {}", step.title)
+                        }
+                        crate::sop::SopRunAction::Completed { .. } => "Completed".to_string(),
+                        crate::sop::SopRunAction::Failed { reason, .. } => {
+                            format!("Failed: {reason}")
+                        }
+                    };
+                    format!(
+                        "✅ 已批准 `{run_id}`,SOP 推进。下一动作:`{next}`\n\n继续在飞书发消息让我推进剩余步骤。"
+                    )
+                }
+                Err(e) => format!("❌ 批准 `{run_id}` 失败:{e}"),
+            });
+        }
+
+        if let Some(caps) = reject_re.captures(head) {
+            let run_id = caps.get(1)?.as_str();
+            return Some(format!(
+                "⚠️ 拒绝功能尚未在 SOP 引擎实现(run `{run_id}` 仍处于 WaitingApproval)。\n如需终止该 SOP,请在 daemon 重启或手动清理。",
+            ));
+        }
+
+        None
     }
 
     /// Get or refresh tenant access token
