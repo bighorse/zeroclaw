@@ -109,6 +109,11 @@ pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use sop_advance::SopAdvanceTool;
+// SopApproveTool is intentionally NOT in the LLM tool list (see
+// `all_tools_with_runtime` for rationale). The `pub use` is kept so the
+// gateway approve handler and external callers can still construct it
+// directly when invoked from a trusted, non-LLM code path.
+#[allow(unused_imports)]
 pub use sop_approve::SopApproveTool;
 pub use sop_execute::SopExecuteTool;
 pub use sop_list::SopListTool;
@@ -394,6 +399,15 @@ pub fn all_tools_with_runtime(
     // `AppState.sop_engine` so runs started by `POST /sop/*` are visible
     // to in-agent `sop_status` / `sop_advance`). Otherwise spin up a
     // fresh engine and reload — fine for self-contained agent runs.
+    //
+    // ⚠️  SopApproveTool is intentionally NOT registered into the LLM's
+    // tool surface. PharmaClaw's `requires_confirmation:true` steps must
+    // be approved by a human via an external channel, not by the LLM
+    // self-approving (which would defeat the dual-sign quality gate).
+    // Approval is reachable only via:
+    //   - HTTP: `POST /sop/approve/{run_id}/{step}` (gateway)
+    //   - LarkChannel command: `@bot 批准 run-xxx 步骤 N` (parsed by
+    //     channel before reaching the LLM)
     {
         let sop_engine = external_sop_engine.unwrap_or_else(|| {
             let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
@@ -403,7 +417,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
+        // SopApproveTool deliberately omitted — see comment above.
         tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
     }
 

@@ -3431,9 +3431,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
-/// Start all configured channels and route messages to the agent
+/// Start all configured channels and route messages to the agent.
+///
+/// `external_sop_engine`: when `Some`, the agent loop's tool list
+/// shares this engine with the daemon's gateway. This is required for
+/// the daemon-singleton SopEngine pattern — without it, runs started
+/// by an in-agent `sop_execute` are invisible to `POST /sop/approve`.
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
+pub async fn start_channels(
+    config: Config,
+    external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -3515,7 +3523,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        None,
+        external_sop_engine,
     ));
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);

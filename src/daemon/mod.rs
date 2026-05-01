@@ -51,11 +51,23 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 .await;
     }
 
+    // Daemon-singleton SOP engine: shared with both the gateway (for
+    // `POST /sop/approve/{run_id}`) and the channels' agent loop (so
+    // `sop_execute` / `sop_advance` operate on the same `active_runs`).
+    // Without this, runs started in one component are invisible to the
+    // other — the split-brain bug.
+    let sop_engine = {
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone());
+        engine.reload(&config.workspace_dir);
+        std::sync::Arc::new(std::sync::Mutex::new(engine))
+    };
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
+        let gateway_engine = std::sync::Arc::clone(&sop_engine);
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -63,7 +75,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg).await }
+                let engine = std::sync::Arc::clone(&gateway_engine);
+                async move { crate::gateway::run_gateway(&host, port, cfg, Some(engine)).await }
             },
         ));
     }
@@ -71,13 +84,15 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
+            let channels_engine = std::sync::Arc::clone(&sop_engine);
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
                 move || {
                     let cfg = channels_cfg.clone();
-                    async move { crate::channels::start_channels(cfg).await }
+                    let engine = std::sync::Arc::clone(&channels_engine);
+                    async move { crate::channels::start_channels(cfg, Some(engine)).await }
                 },
             ));
         } else {
