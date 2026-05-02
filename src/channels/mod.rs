@@ -3754,6 +3754,22 @@ pub async fn start_channels(
                     ),
                 ));
             }
+            if config.hooks.builtin.sop_enforcement.enabled {
+                if let Some(engine) = external_sop_engine.as_ref() {
+                    runner.register(Box::new(
+                        crate::hooks::builtin::SopEnforcementHook::new(
+                            config.hooks.builtin.sop_enforcement.clone(),
+                            std::sync::Arc::clone(engine),
+                        ),
+                    ));
+                } else {
+                    tracing::warn!(
+                        "[hooks.builtin.sop_enforcement] enabled but no daemon-shared SopEngine \
+                         available — hook will not be installed. Run via `zeroclaw daemon` (not \
+                         standalone `zeroclaw channel start`) to get enforcement."
+                    );
+                }
+            }
             Some(Arc::new(runner))
         } else {
             None
