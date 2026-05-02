@@ -2183,6 +2183,17 @@ pub struct BuiltinHooksConfig {
     /// PM/PI gets a chat notification with the run id and step number.
     #[serde(default)]
     pub sop_approval_notifier: SopApprovalNotifierConfig,
+    /// Configuration for the SOP enforcement hook.
+    ///
+    /// When an active SOP run exists, this hook intercepts mutating tool
+    /// calls (`file_write`, `file_edit`) and rejects writes that fall
+    /// outside the configured allowlist of path prefixes. Prevents the
+    /// LLM from calling `sop_execute` to "start" a run, then writing
+    /// deliverables straight to arbitrary paths (e.g. `reports/`)
+    /// without ever calling `sop_advance` — which silently bypasses
+    /// every per-step quality gate the SOP defines.
+    #[serde(default)]
+    pub sop_enforcement: SopEnforcementConfig,
 }
 
 /// Configuration for the webhook-audit builtin hook.
@@ -2256,6 +2267,53 @@ pub struct SopApprovalNotifierConfig {
     /// `<at user_id="ou_xxx">` mentions or routing hints. Default: empty.
     #[serde(default)]
     pub mention_text: String,
+}
+
+/// Configuration for the SOP enforcement hook.
+///
+/// Closes a critical SOP-engine gap: `sop_execute` only **starts** a
+/// run; the LLM is then free to write any file to any path without
+/// ever calling `sop_advance`. That bypasses every per-step gate
+/// (PI verification, prior-art retrieval, weakness rebuttal, PM 二元
+/// pass/fail). Live observation on PharmaClaw v3:
+///
+///   23:20:21  sop_execute (run starts at step 1, status=Running)
+///   23:21:58  file_write → reports/proposal_part1.md  ← bypassed
+///   23:23:50  file_write → reports/proposal_part2.md  ← bypassed
+///   23:23:55  sop_advance (called once, after the report was done)
+///
+/// This hook intercepts `file_write` / `file_edit` `before_tool_call`
+/// and rejects writes whose `path` falls outside the configured
+/// allowlist of prefixes whenever **any** SOP run is active. Reads
+/// (`file_read`, `glob_search`, etc.) are never touched.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SopEnforcementConfig {
+    /// Enable the SOP enforcement hook. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path prefixes (relative to workspace root) that mutating tools
+    /// may target while an SOP run is active. Anything else is
+    /// `Cancel`'d. Defaults cover the canonical PharmaClaw layout:
+    /// per-PI case files, scripts, and persistent state.
+    #[serde(default = "default_enforcement_allowed_prefixes")]
+    pub allowed_path_prefixes: Vec<String>,
+}
+
+impl Default for SopEnforcementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_path_prefixes: default_enforcement_allowed_prefixes(),
+        }
+    }
+}
+
+fn default_enforcement_allowed_prefixes() -> Vec<String> {
+    vec![
+        "case_library/".to_string(),
+        "scripts/".to_string(),
+        "state/".to_string(),
+    ]
 }
 
 // ── SOP engine configuration ───────────────────────────────────

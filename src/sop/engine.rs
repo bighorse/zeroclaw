@@ -59,6 +59,16 @@ impl SopEngine {
         &self.active_runs
     }
 
+    /// Test-only mutator for injecting active runs without going
+    /// through `start_run` (which would require loading a real SOP
+    /// definition). Used by hook unit tests (e.g. `sop_enforcement`)
+    /// that need an active run snapshot but don't care about how it
+    /// got there.
+    #[cfg(test)]
+    pub fn active_runs_mut_for_test(&mut self) -> &mut HashMap<String, SopRun> {
+        &mut self.active_runs
+    }
+
     /// Look up a run by ID (active or finished).
     pub fn get_run(&self, run_id: &str) -> Option<&SopRun> {
         self.active_runs
