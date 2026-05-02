@@ -47,6 +47,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod pdf_read;
+pub mod pi_publication_validator;
 pub mod pmid_dedup_check;
 pub mod proxy_config;
 pub mod publish_file;
@@ -101,6 +102,7 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
+pub use pi_publication_validator::PiPublicationValidatorTool;
 pub use pmid_dedup_check::PmidDedupCheckTool;
 pub use proxy_config::ProxyConfigTool;
 pub use publish_file::PublishFileTool;
@@ -428,6 +430,15 @@ pub fn all_tools_with_runtime(
         // simply because PharmaClaw-style supervised SOP flows are
         // where this check is most useful.
         tool_arcs.push(Arc::new(PmidDedupCheckTool::new(workspace_dir.to_path_buf())));
+
+        // PI publication-attribution validator — same SOP-context
+        // gating. Filters PubMed search output so the LLM cannot
+        // promote topic-similar but author-mismatched papers into
+        // the "PI representative work" list. SOP step 1 P0-5 calls
+        // this; step 7 PM 审核 5.2c re-validates.
+        tool_arcs.push(Arc::new(PiPublicationValidatorTool::new(
+            workspace_dir.to_path_buf(),
+        )));
     }
 
     if let Some(key) = composio_key {
