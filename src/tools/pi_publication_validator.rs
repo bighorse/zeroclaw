@@ -71,6 +71,34 @@ struct PaperRecord {
     is_corresponding: bool,
     #[serde(default)]
     total_authors: u32,
+    /// Raw author list as returned by PubMed eFetch. Used as a fallback
+    /// when the LLM-written pubmed-search script doesn't pre-compute
+    /// `is_first_author` / `is_corresponding` / `last_author` flags
+    /// (observed live on V6: emily Shao Zhimin's `pi_recent_papers.json`
+    /// only had `authors[]` raw list, no per-paper position flags, so the
+    /// validator originally fell through to "PI not in primary author
+    /// position" — but worse, the LLM then read the raw `authors[]` and
+    /// fabricated "Shao ZM (last author)" against PubMed's actual data).
+    /// When this field is present and the structured flags above are all
+    /// default (false / empty), the validator computes positions from
+    /// this raw list itself.
+    #[serde(default)]
+    authors: Vec<RawAuthor>,
+}
+
+/// Raw author entry shape emitted by the pubmed-search SKILL when the
+/// script doesn't normalise author position. Tolerant: `last` and
+/// `full` are optional, and unknown extra fields are accepted.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RawAuthor {
+    #[serde(default)]
+    last: String,
+    #[serde(default)]
+    first: String,
+    #[serde(default)]
+    full: String,
+    #[serde(default)]
+    affiliation: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,8 +177,51 @@ impl PiPublicationValidatorTool {
         !a_first.is_empty() && !b_first.is_empty() && a_first == b_first
     }
 
+    /// Match a raw PubMed author entry against `pi_name`. PubMed
+    /// renders author objects with separate `last`, `first`, and a
+    /// composed `full` field (e.g. `last="Zhang"`, `first="Li"`,
+    /// `full="Zhang Li"`); we accept any of these matching the PI
+    /// name token-wise. Affiliation is intentionally NOT used —
+    /// V6's "Shao Zhiming" mis-attribution was partly because the
+    /// `corresponding=true` heuristic keyed off affiliation text
+    /// (which contained Shao's institution as one of many).
+    fn raw_author_matches(author: &RawAuthor, pi_name: &str) -> bool {
+        if pi_name.is_empty() {
+            return false;
+        }
+        // Try `full` first, then `last + first`, then `last` alone.
+        if !author.full.is_empty() && Self::last_author_matches(&author.full, pi_name) {
+            return true;
+        }
+        if !author.last.is_empty() {
+            if !author.first.is_empty() {
+                let combined = format!("{} {}", author.last, author.first);
+                if Self::last_author_matches(&combined, pi_name) {
+                    return true;
+                }
+            }
+            if Self::last_author_matches(&author.last, pi_name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True when *no* structured author-position flags are populated.
+    /// In that case `classify` falls back to scanning `paper.authors`
+    /// directly.
+    fn structured_fields_empty(paper: &PaperRecord) -> bool {
+        !paper.is_first_author
+            && !paper.is_corresponding
+            && paper.last_author.is_empty()
+            && paper.first_author.is_empty()
+    }
+
     fn classify(paper: &PaperRecord, pi_name: &str) -> Result<PaperVerdict, String> {
         let mut positions: Vec<&str> = Vec::new();
+
+        // Primary path: structured fields populated by the pubmed-search
+        // script (the V5 张力 case did this correctly).
         if paper.is_first_author {
             positions.push("first-author");
         }
@@ -160,11 +231,48 @@ impl PiPublicationValidatorTool {
         if Self::last_author_matches(&paper.last_author, pi_name) {
             positions.push("last-author");
         }
+        // V7 fallback: when the script didn't pre-compute position flags
+        // (V6 邵志敏 case shipped raw `authors[]` only), classify directly
+        // from the raw list. This closes the path that let the LLM read
+        // `authors[]` and fabricate a "last author" claim that
+        // contradicted PubMed's actual ordering (DESTINY-Breast05
+        // PMID:41370739: Shao Zhiming was 3rd of ~70, NOT last).
+        if positions.is_empty()
+            && Self::structured_fields_empty(paper)
+            && !paper.authors.is_empty()
+        {
+            let n = paper.authors.len();
+            if n >= 1 && Self::raw_author_matches(&paper.authors[0], pi_name) {
+                positions.push("first-author (from raw authors[])");
+            }
+            if n >= 2 && Self::raw_author_matches(&paper.authors[n - 1], pi_name) {
+                positions.push("last-author (from raw authors[])");
+            }
+            // Co-first detection: if PI is at position 0 and the next
+            // author is also explicitly tagged co-first in PubMed, we'd
+            // need an `is_co_first` flag — out of scope here. Position 0
+            // alone covers 99% of "first-author" attribution.
+        }
+
         if positions.is_empty() {
+            // If we have a non-empty authors list but PI didn't match
+            // first/last, surface the actual middle position so the LLM
+            // can't claim "last author" — it will see exactly where the
+            // PI sits.
+            let position_hint = if paper.authors.is_empty() {
+                format!(" Paper has {} total authors", paper.total_authors)
+            } else {
+                let n = paper.authors.len();
+                paper
+                    .authors
+                    .iter()
+                    .position(|a| Self::raw_author_matches(a, pi_name))
+                    .map(|i| format!(" (PI is at position {} of {n})", i + 1))
+                    .unwrap_or_else(|| format!(" (PI not found in {n}-author list)"))
+            };
             Err(format!(
-                "PI not in primary author position (first / corresponding / last). \
-                 Paper has {} total authors; PI appears elsewhere or not at all.",
-                paper.total_authors
+                "PI not in primary author position (first / corresponding / last).{position_hint} \
+                 Citing this paper as 'PI representative work' would be academic-integrity-grade misattribution."
             ))
         } else {
             Ok(PaperVerdict {
@@ -392,6 +500,39 @@ mod tests {
             is_first_author: is_first,
             is_corresponding: is_corr,
             total_authors: 5,
+            authors: vec![],
+        }
+    }
+
+    /// Helper for raw-authors[]-only papers (v7 fallback path), where
+    /// the pubmed-search script didn't pre-compute position flags.
+    fn paper_raw_authors(pmid: &str, authors: Vec<&str>) -> PaperRecord {
+        let n = u32::try_from(authors.len()).unwrap_or(u32::MAX);
+        let raw = authors
+            .into_iter()
+            .map(|name| {
+                let mut parts = name.splitn(2, ' ');
+                let last = parts.next().unwrap_or("").to_string();
+                let first = parts.next().unwrap_or("").to_string();
+                RawAuthor {
+                    full: name.to_string(),
+                    last,
+                    first,
+                    affiliation: String::new(),
+                }
+            })
+            .collect();
+        PaperRecord {
+            pmid: pmid.to_string(),
+            title: format!("Paper {pmid}"),
+            journal: "Test Journal".into(),
+            year: "2026".into(),
+            first_author: String::new(),
+            last_author: String::new(),
+            is_first_author: false,
+            is_corresponding: false,
+            total_authors: n,
+            authors: raw,
         }
     }
 
@@ -505,6 +646,95 @@ mod tests {
         assert!(report.contains("PMID:1"));
         assert!(report.contains("PMID:2"));
         assert!(report.contains("misattribution"));
+    }
+
+    #[test]
+    fn classify_v7_fallback_accepts_first_author_from_raw_list() {
+        // Regression for V6 mis-attribution mode: pubmed-search script
+        // shipped only `authors[]` raw list with no structured flags.
+        // V7 fallback should accept PI as first-author when authors[0]
+        // matches.
+        let p = paper_raw_authors(
+            "12345",
+            vec!["Zhang Li", "Wang Y", "Liu Z"],
+        );
+        let v = PiPublicationValidatorTool::classify(&p, "Zhang Li").unwrap();
+        assert!(v.author_position.contains("first-author"));
+        assert!(v.author_position.contains("from raw authors[]"));
+    }
+
+    #[test]
+    fn classify_v7_fallback_accepts_last_author_from_raw_list() {
+        let p = paper_raw_authors(
+            "12345",
+            vec!["Wang Y", "Liu Z", "Zhang Li"],
+        );
+        let v = PiPublicationValidatorTool::classify(&p, "Zhang Li").unwrap();
+        assert!(v.author_position.contains("last-author"));
+    }
+
+    #[test]
+    fn classify_v7_fallback_rejects_middle_author_with_position_hint() {
+        // The exact V6 DESTINY-Breast05 failure mode: PI is at a middle
+        // position (3rd of ~70), but absent structured flags the LLM
+        // read the raw list and fabricated "Shao ZM (last author)".
+        // The validator must (a) reject and (b) tell the LLM exactly
+        // where the PI sits so it cannot fabricate an alternative.
+        let mut authors = vec!["Loibl S", "Park YH", "Shao Z"];
+        for i in 0..67 {
+            // Pad with placeholder authors so we have ~70 total
+            let _ = i;
+            authors.push("Placeholder X");
+        }
+        let p = paper_raw_authors("41370739", authors);
+        let err = PiPublicationValidatorTool::classify(&p, "Shao Z").unwrap_err();
+        assert!(
+            err.contains("PI is at position 3 of 70"),
+            "expected position hint with concrete index; got: {err}"
+        );
+        assert!(err.contains("academic-integrity"));
+    }
+
+    #[test]
+    fn classify_v7_fallback_skipped_when_structured_flags_present() {
+        // If the pubmed-search script DID compute position flags
+        // (the v5 张力 case), the structured path takes precedence and
+        // the raw `authors[]` list is ignored — even if it contradicts.
+        // Belt-and-braces: trust the script, not raw text.
+        let mut p = paper("12345", "Zhang Li", "Other Author", true, false);
+        p.authors = vec![RawAuthor {
+            full: "Other Author".into(),
+            last: "Other".into(),
+            first: "Author".into(),
+            affiliation: String::new(),
+        }];
+        let v = PiPublicationValidatorTool::classify(&p, "Zhang Li").unwrap();
+        // Structured path matched first-author flag — fallback never ran
+        assert_eq!(v.author_position, "first-author");
+    }
+
+    #[test]
+    fn raw_author_matches_handles_pubmed_full_field() {
+        let a = RawAuthor {
+            full: "Zhang Li".into(),
+            last: "Zhang".into(),
+            first: "Li".into(),
+            affiliation: String::new(),
+        };
+        assert!(PiPublicationValidatorTool::raw_author_matches(&a, "Zhang Li"));
+        assert!(PiPublicationValidatorTool::raw_author_matches(&a, "Zhang"));
+        assert!(!PiPublicationValidatorTool::raw_author_matches(&a, "Wang Y"));
+    }
+
+    #[test]
+    fn raw_author_matches_falls_back_to_last_only() {
+        let a = RawAuthor {
+            full: String::new(),
+            last: "Zhang".into(),
+            first: "L".into(),
+            affiliation: String::new(),
+        };
+        assert!(PiPublicationValidatorTool::raw_author_matches(&a, "Zhang"));
     }
 
     #[test]
