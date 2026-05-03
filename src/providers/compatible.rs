@@ -83,6 +83,43 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    /// Vision-capable provider that skips the `/v1/responses` fallback on 404.
+    ///
+    /// Use for providers that expose an OpenAI-compatible chat-completions
+    /// endpoint but do *not* implement the newer `/v1/responses` API. The
+    /// generic `new_with_vision` first tries `/v1/responses` and on 404 falls
+    /// back to `/v1/chat/completions`, which works fine when the responses
+    /// endpoint genuinely 404s. But some providers (notably Alibaba DashScope
+    /// at `https://dashscope.aliyuncs.com/compatible-mode/v1`) return a
+    /// non-404 error to `/v1/responses` (e.g. 400 with a different shape),
+    /// which the fallback heuristic does not catch — the call ultimately
+    /// errors out with "responses fallback failed". Observed live during
+    /// PharmaClaw V15 multi-provider fallback chain experiments on
+    /// 2026-05-03 (run-1777793... fallback to qwen3.6-max-preview returned
+    /// `Qwen native chat transport error: ... (responses fallback failed:
+    /// Qwen Responses API error)`).
+    ///
+    /// Equivalent to [`Self::new_no_responses_fallback`] but preserves the
+    /// vision-capability flag.
+    pub fn new_with_vision_no_responses_fallback(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_vision: bool,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            false,
+            None,
+            false,
+        )
+    }
+
     /// Same as `new` but skips the /v1/responses fallback on 404.
     /// Use for providers (e.g. GLM) that only support chat completions.
     pub fn new_no_responses_fallback(
@@ -1782,6 +1819,50 @@ mod tests {
         // tools/tool_choice should be omitted when None
         assert!(!json.contains("tools"));
         assert!(!json.contains("tool_choice"));
+    }
+
+    #[test]
+    fn new_with_vision_no_responses_fallback_disables_responses_api() {
+        // Regression test for PharmaClaw V15 fallback failure
+        // (run-1777793... 2026-05-03): qwen/DashScope client tried
+        // /v1/responses first and the fallback heuristic mistook
+        // DashScope's non-404 error response for a fatal failure.
+        //
+        // The fix routes qwen through this constructor, which sets
+        // supports_responses_fallback = false so calls go straight
+        // to /v1/chat/completions.
+        let p = OpenAiCompatibleProvider::new_with_vision_no_responses_fallback(
+            "Qwen",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Some("sk-test"),
+            AuthStyle::Bearer,
+            true,
+        );
+        assert_eq!(p.name, "Qwen");
+        assert_eq!(
+            p.base_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
+        assert!(p.supports_vision, "vision flag must be preserved");
+        assert!(
+            !p.supports_responses_fallback,
+            "responses fallback must be disabled — that's the whole point"
+        );
+    }
+
+    #[test]
+    fn new_with_vision_keeps_responses_fallback_enabled() {
+        // Regression guard: don't accidentally also disable responses
+        // fallback on the regular vision constructor (used by other
+        // providers that genuinely support /v1/responses).
+        let p = OpenAiCompatibleProvider::new_with_vision(
+            "Test",
+            "https://api.example.com",
+            Some("sk-test"),
+            AuthStyle::Bearer,
+            true,
+        );
+        assert!(p.supports_responses_fallback);
     }
 
     #[test]
