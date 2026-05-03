@@ -380,6 +380,24 @@ pub async fn run_gateway(
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
             provider_timeout_secs: Some(config.provider_timeout_secs),
+            // PR-H: derive per-fallback `[model_providers.X]` base_url overrides.
+            fallback_provider_base_urls: config
+                .reliability
+                .fallback_providers
+                .iter()
+                .filter_map(|fb_name| {
+                    config
+                        .model_providers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(fb_name))
+                        .and_then(|(_, profile)| {
+                            profile
+                                .base_url
+                                .as_ref()
+                                .map(|url| (fb_name.clone(), url.clone()))
+                        })
+                })
+                .collect(),
         },
     )?);
     let model = config

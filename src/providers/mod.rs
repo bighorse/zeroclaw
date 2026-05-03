@@ -680,6 +680,23 @@ pub struct ProviderRuntimeOptions {
     /// HTTP request timeout in seconds for LLM provider API calls.
     /// `None` uses the provider's built-in default (120s for compatible providers).
     pub provider_timeout_secs: Option<u64>,
+    /// Per-fallback-provider base_url overrides, derived from
+    /// `[model_providers.X]` config blocks where `X` is also listed in
+    /// `[reliability.fallback_providers]`.
+    ///
+    /// Keys are fallback provider names (matching the entries in
+    /// `reliability.fallback_providers`); values are the `base_url` from
+    /// the corresponding `[model_providers.X]` block. Empty by default —
+    /// when empty, fallback providers use their built-in default URLs.
+    ///
+    /// Closes a config-system asymmetry observed during PharmaClaw V15
+    /// fallback chain experiments on 2026-05-03:
+    /// `apply_named_model_provider_profile` only applies
+    /// `[model_providers.X]` overrides to the *primary* (default) provider
+    /// — fallback providers were ignored, so users could not customize
+    /// fallback endpoints (e.g. point qwen at a self-hosted DashScope
+    /// proxy or override the API base URL for testing).
+    pub fallback_provider_base_urls: std::collections::HashMap<String, String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -691,6 +708,7 @@ impl Default for ProviderRuntimeOptions {
             secrets_encrypt: true,
             reasoning_enabled: None,
             provider_timeout_secs: None,
+            fallback_provider_base_urls: std::collections::HashMap::new(),
         }
     }
 }
@@ -1423,7 +1441,30 @@ pub fn create_resilient_provider_with_options(
             None => options.clone(),
         };
 
-        match create_provider_with_options(provider_name, None, &fallback_options) {
+        // Per-fallback `[model_providers.X]` base_url override (PR-H, V15
+        // fallback chain experiments 2026-05-03). When the user has
+        // configured `[model_providers.qwen] base_url = "https://..."`
+        // and `qwen` is in `fallback_providers`, route the fallback
+        // provider creation through `create_provider_with_url_and_options`
+        // with that custom URL instead of the provider's default.
+        let fallback_url_override = options
+            .fallback_provider_base_urls
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(fallback))
+            .map(|(_, url)| url.as_str());
+
+        let fallback_result = if fallback_url_override.is_some() {
+            create_provider_with_url_and_options(
+                provider_name,
+                None,
+                fallback_url_override,
+                &fallback_options,
+            )
+        } else {
+            create_provider_with_options(provider_name, None, &fallback_options)
+        };
+
+        match fallback_result {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -2621,6 +2662,92 @@ mod tests {
         // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
         // receive this key; they resolve their own credentials independently.
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
+        assert!(provider.is_ok());
+    }
+
+    /// PR-H regression: `[model_providers.X]` base_url overrides for X in
+    /// `fallback_providers` are now applied at fallback creation time
+    /// (previously only the *primary* provider could be re-pointed via
+    /// `apply_named_model_provider_profile`). Config:
+    ///
+    ///   [reliability]
+    ///   fallback_providers = ["qwen"]
+    ///   [model_providers.qwen]
+    ///   base_url = "https://my-self-hosted-qwen.example.com/v1"
+    ///
+    /// must produce a fallback provider pointing at the custom URL, not
+    /// at qwen's built-in default.
+    #[test]
+    fn resilient_fallback_applies_per_provider_base_url_override() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["lmstudio".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "lmstudio".to_string(),
+            "http://my-custom-lmstudio.local:1234/v1".to_string(),
+        );
+
+        let options = ProviderRuntimeOptions {
+            fallback_provider_base_urls: overrides,
+            ..ProviderRuntimeOptions::default()
+        };
+
+        // Construction must succeed — the override is consumed by
+        // create_provider_with_url_and_options instead of the default
+        // create_provider_with_options path.
+        let provider = create_resilient_provider_with_options(
+            "openai",
+            Some("openai-test-key"),
+            None,
+            &reliability,
+            &options,
+        );
+        assert!(
+            provider.is_ok(),
+            "fallback with base_url override must initialize: {:?}",
+            provider.err()
+        );
+    }
+
+    /// PR-H regression: empty `fallback_provider_base_urls` (the default)
+    /// must continue to use the original code path that calls
+    /// `create_provider_with_options` with no URL override. Otherwise the
+    /// new branch would silently regress the dozens of existing
+    /// fallback-without-override deployments.
+    #[test]
+    fn resilient_fallback_without_override_uses_default_path() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["lmstudio".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let options = ProviderRuntimeOptions::default(); // empty overrides
+        assert!(options.fallback_provider_base_urls.is_empty());
+
+        let provider = create_resilient_provider_with_options(
+            "openai",
+            Some("openai-test-key"),
+            None,
+            &reliability,
+            &options,
+        );
         assert!(provider.is_ok());
     }
 

@@ -429,7 +429,9 @@ pub fn all_tools_with_runtime(
         // report. No engine dependency; we use the same conditional
         // simply because PharmaClaw-style supervised SOP flows are
         // where this check is most useful.
-        tool_arcs.push(Arc::new(PmidDedupCheckTool::new(workspace_dir.to_path_buf())));
+        tool_arcs.push(Arc::new(PmidDedupCheckTool::new(
+            workspace_dir.to_path_buf(),
+        )));
 
         // PI publication-attribution validator — same SOP-context
         // gating. Filters PubMed search output so the LLM cannot
@@ -476,6 +478,10 @@ pub fn all_tools_with_runtime(
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
                 provider_timeout_secs: Some(root_config.provider_timeout_secs),
+                // PR-H: per-fallback base_url overrides. Tools delegate
+                // path generally doesn't need fallback overrides — leave
+                // empty; fallback providers use their built-in defaults.
+                fallback_provider_base_urls: std::collections::HashMap::new(),
             },
         )
         .with_parent_tools(parent_tools)

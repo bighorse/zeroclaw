@@ -1018,6 +1018,7 @@ data: [DONE]
             auth_profile_override: None,
             reasoning_enabled: None,
             provider_timeout_secs: None,
+            fallback_provider_base_urls: std::collections::HashMap::new(),
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
