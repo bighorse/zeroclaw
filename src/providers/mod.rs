@@ -1184,13 +1184,22 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
-            "Qwen",
-            qwen_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-            true,
-        ))),
+        // Qwen / DashScope: skip the /v1/responses fallback. DashScope's
+        // compatible-mode endpoint does not implement the newer Responses API
+        // and returns a non-404 error that the generic fallback path treats
+        // as fatal ("responses fallback failed: Qwen Responses API error").
+        // Use the vision-capable but no-responses-fallback constructor so
+        // that calls go straight to /v1/chat/completions where DashScope
+        // actually serves them.
+        name if qwen_base_url(name).is_some() => Ok(compat(
+            OpenAiCompatibleProvider::new_with_vision_no_responses_fallback(
+                "Qwen",
+                qwen_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+                true,
+            ),
+        )),
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(compat(OpenAiCompatibleProvider::new(
