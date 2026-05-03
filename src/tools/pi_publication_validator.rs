@@ -456,6 +456,66 @@ impl Tool for PiPublicationValidatorTool {
             }
         };
 
+        // V12 fix: schema regression detector. Closes the IgAN V12 case
+        // (run 2026-05-03) where pi_recent_papers.json had 75 papers but
+        // every single one had `authors: []` AND empty structured
+        // first/last author fields. Validator silently rejected all 75,
+        // and the LLM downstream then free-generated citations like
+        // "Heerspink HJL, Zhang H." for Sparsentan PROTECT — fabricating
+        // PI authorship on a global trial where the PI is not a primary
+        // author. Same recurrence pattern as V3/V6/V9 first/last author
+        // misattribution. The PR #23 raw-authors fallback can't fire
+        // when authors[] is empty.
+        //
+        // We emit a hard error (not just a warning) so the SOP step 1
+        // notes can detect schema regression and force the LLM to
+        // re-run the pubmed-search script with the v3.1 schema (raw
+        // authors[] populated). Silently passing zero valid papers
+        // through to step 8 is what produced the V12 misattribution.
+        if !papers.is_empty() {
+            let regression_count = papers
+                .iter()
+                .filter(|p| p.authors.is_empty() && Self::structured_fields_empty(p))
+                .count();
+            if regression_count == papers.len() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Schema regression in {json_file}: all {n} papers have empty `authors[]` \
+                         AND empty structured first/last author fields. This is the V3/V6/V9/V12 \
+                         recurring bug — the pubmed-search script printed `first_author et al.` \
+                         strings instead of preserving raw `authors[]` per `pubmed-search/SKILL.md \
+                         §3.1`. Without raw authors[], this validator cannot verify PI position \
+                         and the v7 raw fallback (PR #23) cannot fire. Continuing would let the \
+                         LLM free-generate citation strings downstream, fabricating PI authorship \
+                         on global trials where the PI is mid-list (V12 IgAN: Zhang H errantly \
+                         attributed as senior co-author of Sparsentan PROTECT / NefIgArd / \
+                         APPLAUSE-IgAN).\n\n\
+                         Fix: re-run pubmed-search script with `pubmed-search/SKILL.md §3.1` \
+                         schema — every paper's `authors[]` array must contain the full author \
+                         list with `last/first/full/initials` fields copied directly from PubMed \
+                         eutils MedlineCitation/AuthorList. Then re-call this validator.",
+                        n = papers.len()
+                    )),
+                });
+            }
+            // Partial regression (some papers have authors[], others
+            // don't) is logged but not blocking — the v7 fallback can
+            // still salvage the populated subset.
+            if regression_count * 2 > papers.len() {
+                tracing::warn!(
+                    tool = "pi_publication_validator",
+                    json_file = %json_file,
+                    regression_count = regression_count,
+                    total = papers.len(),
+                    "partial schema regression: >50% of papers have empty authors[] AND empty \
+                     structured fields; v7 fallback will fail for those papers and they will \
+                     all reject"
+                );
+            }
+        }
+
         let mut valid = Vec::new();
         let mut rejected = Vec::new();
         for paper in &papers {
@@ -749,5 +809,146 @@ mod tests {
         let report = PiPublicationValidatorTool::render_report("Zhang Li", &valid, &[]);
         assert!(report.contains("✅ Valid"));
         assert!(!report.contains("⚠️ Rejected"));
+    }
+
+    // -------------------------------------------------------------
+    // V12 IgAN regression: schema-regression detection on full-empty
+    // authors[] AND empty structured fields. Closes the
+    // "Heerspink HJL, Zhang H" misattribution path observed on
+    // 2026-05-03 (run-1777767... ; case_library/insight/zhang_hong/
+    // v12_post_p0_fix/pi_recent_papers.json).
+    // -------------------------------------------------------------
+
+    fn paper_no_authors_no_structured(pmid: &str) -> PaperRecord {
+        // Mirrors the V12 IgAN failure mode: pubmed-search script
+        // wrote pmid/title/journal/year but neither populated raw
+        // authors[] nor structured first/last author fields.
+        PaperRecord {
+            pmid: pmid.to_string(),
+            title: format!("Paper {pmid}"),
+            journal: "NEJM".into(),
+            year: "2026".into(),
+            first_author: String::new(),
+            last_author: String::new(),
+            is_first_author: false,
+            is_corresponding: false,
+            total_authors: 0,
+            authors: vec![],
+        }
+    }
+
+    fn write_papers_json(dir: &std::path::Path, papers: &[PaperRecord]) -> std::path::PathBuf {
+        let pi_dir = dir.join("case_library").join("insight").join("zhang_h");
+        std::fs::create_dir_all(&pi_dir).expect("create case dir");
+        let path = pi_dir.join("pi_recent_papers.json");
+        let payload = serde_json::json!({
+            "pi_name": "Zhang H",
+            "total_papers": papers.len(),
+            "all_papers": papers,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap())
+            .expect("write json");
+        path
+    }
+
+    #[tokio::test]
+    async fn schema_regression_all_papers_empty_returns_hard_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let json_path = write_papers_json(
+            tmp.path(),
+            &[
+                paper_no_authors_no_structured("41910396"),
+                paper_no_authors_no_structured("37591292"),
+                paper_no_authors_no_structured("37015244"),
+            ],
+        );
+        let tool = PiPublicationValidatorTool::new(tmp.path().to_path_buf());
+        let rel = json_path
+            .strip_prefix(tmp.path())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let result = tool
+            .execute(serde_json::json!({
+                "json_file": rel,
+                "pi_name": "Zhang H",
+            }))
+            .await
+            .expect("tool ran");
+        assert!(!result.success, "expected hard error, got success");
+        let err = result.error.expect("error message present");
+        assert!(err.contains("Schema regression"), "err: {err}");
+        assert!(err.contains("3 papers"), "err: {err}");
+        assert!(err.contains("V3/V6/V9/V12"), "err: {err}");
+        assert!(err.contains("§3.1"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn schema_regression_partial_passes_with_warning() {
+        // Mixed: 1 paper with authors[], 2 papers without. v7 fallback
+        // can salvage the populated one; the other two reject normally.
+        // Should NOT hard-error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mixed = vec![
+            paper_raw_authors("41571098", vec!["Liu X", "Zhang H"]),
+            paper_no_authors_no_structured("41910396"),
+            paper_no_authors_no_structured("37015244"),
+        ];
+        let json_path = write_papers_json(tmp.path(), &mixed);
+        let tool = PiPublicationValidatorTool::new(tmp.path().to_path_buf());
+        let rel = json_path
+            .strip_prefix(tmp.path())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let result = tool
+            .execute(serde_json::json!({
+                "json_file": rel,
+                "pi_name": "Zhang H",
+            }))
+            .await
+            .expect("tool ran");
+        assert!(
+            result.success,
+            "partial regression should not hard-error; got: {:?}",
+            result.error
+        );
+        // Output should still classify the salvageable paper as valid.
+        assert!(
+            result.output.contains("41571098"),
+            "expected valid PMID 41571098 in output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_regression_does_not_fire_when_structured_fields_present() {
+        // Paper has empty authors[] but populated first_author /
+        // last_author / is_first_author flags — pre-v7 schema, fully
+        // valid path, no regression.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pre_v7_paper = paper("41571098", "", "Zhang H", false, true);
+        let json_path = write_papers_json(tmp.path(), &[pre_v7_paper]);
+        let tool = PiPublicationValidatorTool::new(tmp.path().to_path_buf());
+        let rel = json_path
+            .strip_prefix(tmp.path())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let result = tool
+            .execute(serde_json::json!({
+                "json_file": rel,
+                "pi_name": "Zhang H",
+            }))
+            .await
+            .expect("tool ran");
+        assert!(
+            result.success,
+            "structured-fields-only schema must remain valid; got: {:?}",
+            result.error
+        );
     }
 }
