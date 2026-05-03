@@ -306,6 +306,99 @@ impl ReliableProvider {
         chain
     }
 
+    /// Whether `provider` is a plausible host for `model`.
+    ///
+    /// The fallback loop in [`Self::chat_with_system`] iterates the cartesian
+    /// product of `(model, provider)`. Without this guard, the chain
+    /// `fallback_providers = ["qwen"]` + `model_fallbacks["deepseek-v4-pro"]
+    /// = ["qwen3.6-max-preview"]` produces four attempt pairs:
+    ///
+    /// 1. (deepseek, deepseek-v4-pro)   ✓
+    /// 2. (qwen, deepseek-v4-pro)       ✗ qwen rejects: model name mismatch
+    /// 3. (deepseek, qwen3.6-max-preview) ✗ deepseek rejects: model name mismatch
+    /// 4. (qwen, qwen3.6-max-preview)   ✓
+    ///
+    /// Pairs 2 and 3 burn time and produce confusing logs (observed live on
+    /// 2026-05-03 PharmaClaw V15 fallback chain experiments). This helper
+    /// uses a conservative name-prefix heuristic to skip pairs that are
+    /// almost certainly wrong, while leaving generic providers (openrouter,
+    /// custom HTTP endpoints, etc.) untouched so that any model may still
+    /// be routed through them.
+    ///
+    /// Conservative means: only return `false` when both the provider and
+    /// the model belong to *known disjoint families*. When in doubt, return
+    /// `true` and let the actual provider's API be the final arbiter — the
+    /// existing retry/non-retryable error logic handles unknown shapes.
+    pub(crate) fn provider_can_host_model(provider: &str, model: &str) -> bool {
+        // Provider classes whose models always start with a recognizable
+        // prefix. If the provider matches one of these but the model
+        // doesn't carry the matching prefix, the call is doomed.
+        let provider_lower = provider.to_ascii_lowercase();
+        let model_lower = model.to_ascii_lowercase();
+
+        let provider_family = native_provider_family(&provider_lower);
+        let model_family = native_model_family(&model_lower);
+
+        match (provider_family, model_family) {
+            // Both classified — must agree.
+            (Some(p), Some(m)) => p == m,
+            // Either unclassified — assume compatible (let API decide).
+            _ => true,
+        }
+    }
+}
+
+/// Native model families recognized by name prefix. Returns `None` for
+/// generic / multi-vendor models (e.g. "llama-3.3-70b" served by many
+/// providers) where prefix-based routing would be wrong.
+fn native_model_family(model_lower: &str) -> Option<&'static str> {
+    if model_lower.starts_with("deepseek") {
+        Some("deepseek")
+    } else if model_lower.starts_with("qwen") || model_lower.starts_with("qwq") {
+        Some("qwen")
+    } else if model_lower.starts_with("claude-") {
+        Some("anthropic")
+    } else if model_lower.starts_with("gpt-")
+        || model_lower.starts_with("o1-")
+        || model_lower.starts_with("o3-")
+        || model_lower.starts_with("o4-")
+    {
+        Some("openai")
+    } else if model_lower.starts_with("kimi-") || model_lower.starts_with("moonshot") {
+        Some("moonshot")
+    } else if model_lower.starts_with("glm-") {
+        Some("glm")
+    } else {
+        None
+    }
+}
+
+/// Native provider families recognized by alias. Returns `None` for
+/// generic / multi-vendor providers (e.g. "openrouter", custom HTTP
+/// endpoints) where any model may legitimately be routed.
+fn native_provider_family(provider_lower: &str) -> Option<&'static str> {
+    if provider_lower == "deepseek" {
+        Some("deepseek")
+    } else if matches!(
+        provider_lower,
+        "qwen" | "dashscope" | "qwen-cn" | "dashscope-cn" | "qwen-us" | "dashscope-us"
+    ) || provider_lower.starts_with("qwen-")
+    {
+        Some("qwen")
+    } else if provider_lower == "anthropic" || provider_lower == "claude" {
+        Some("anthropic")
+    } else if provider_lower == "openai" || provider_lower == "azure_openai" {
+        Some("openai")
+    } else if matches!(provider_lower, "moonshot" | "kimi" | "kimi-code") {
+        Some("moonshot")
+    } else if provider_lower == "glm" || provider_lower == "zhipu" {
+        Some("glm")
+    } else {
+        None
+    }
+}
+
+impl ReliableProvider {
     /// Advance to the next API key and return it, or None if no extra keys configured.
     fn rotate_key(&self) -> Option<&str> {
         if self.api_keys.is_empty() {
@@ -362,6 +455,17 @@ impl Provider for ReliableProvider {
                         provider = provider_name,
                         model = *current_model,
                         "Skipping provider with prior credential failure"
+                    );
+                    continue;
+                }
+                if !Self::provider_can_host_model(provider_name, current_model) {
+                    // Cross-product fallback skip: e.g. deepseek can't serve
+                    // qwen models and vice versa. See provider_can_host_model
+                    // docs for the full conservative heuristic.
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping (provider, model) pair: known disjoint families"
                     );
                     continue;
                 }
@@ -502,6 +606,17 @@ impl Provider for ReliableProvider {
                         provider = provider_name,
                         model = *current_model,
                         "Skipping provider with prior credential failure"
+                    );
+                    continue;
+                }
+                if !Self::provider_can_host_model(provider_name, current_model) {
+                    // Cross-product fallback skip: e.g. deepseek can't serve
+                    // qwen models and vice versa. See provider_can_host_model
+                    // docs for the full conservative heuristic.
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping (provider, model) pair: known disjoint families"
                     );
                     continue;
                 }
@@ -649,6 +764,17 @@ impl Provider for ReliableProvider {
                     );
                     continue;
                 }
+                if !Self::provider_can_host_model(provider_name, current_model) {
+                    // Cross-product fallback skip: e.g. deepseek can't serve
+                    // qwen models and vice versa. See provider_can_host_model
+                    // docs for the full conservative heuristic.
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping (provider, model) pair: known disjoint families"
+                    );
+                    continue;
+                }
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -776,6 +902,17 @@ impl Provider for ReliableProvider {
                         provider = provider_name,
                         model = *current_model,
                         "Skipping provider with prior credential failure"
+                    );
+                    continue;
+                }
+                if !Self::provider_can_host_model(provider_name, current_model) {
+                    // Cross-product fallback skip: e.g. deepseek can't serve
+                    // qwen models and vice versa. See provider_can_host_model
+                    // docs for the full conservative heuristic.
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping (provider, model) pair: known disjoint families"
                     );
                     continue;
                 }
@@ -2096,5 +2233,119 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Cross-product fallback skip — regression for V15 (2026-05-03):
+    // when fallback_providers + model_fallbacks are both configured, the
+    // resulting (provider, model) cartesian product attempted four pairs
+    // including (qwen, deepseek-v4-pro) and (deepseek, qwen3.6-max-preview),
+    // both of which are guaranteed to fail with model-name-mismatch errors
+    // and produced confusing daemon logs.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn provider_can_host_model_accepts_native_pairs() {
+        // Each native provider must accept its own family.
+        assert!(ReliableProvider::provider_can_host_model(
+            "deepseek",
+            "deepseek-v4-pro"
+        ));
+        assert!(ReliableProvider::provider_can_host_model(
+            "qwen",
+            "qwen3.6-max-preview"
+        ));
+        assert!(ReliableProvider::provider_can_host_model(
+            "dashscope",
+            "qwen-turbo"
+        ));
+        assert!(ReliableProvider::provider_can_host_model(
+            "anthropic",
+            "claude-sonnet-4-6"
+        ));
+        assert!(ReliableProvider::provider_can_host_model(
+            "openai", "gpt-4o"
+        ));
+        assert!(ReliableProvider::provider_can_host_model(
+            "openai",
+            "o1-preview"
+        ));
+        assert!(ReliableProvider::provider_can_host_model(
+            "moonshot", "kimi-k2"
+        ));
+        assert!(ReliableProvider::provider_can_host_model("glm", "glm-4"));
+    }
+
+    #[test]
+    fn provider_can_host_model_rejects_v15_observed_mismatches() {
+        // The exact cross-product pairs PharmaClaw V15 fallback chain
+        // attempted on 2026-05-03 — both must now skip immediately.
+        assert!(
+            !ReliableProvider::provider_can_host_model("qwen", "deepseek-v4-pro"),
+            "qwen does not host deepseek-* models"
+        );
+        assert!(
+            !ReliableProvider::provider_can_host_model("deepseek", "qwen3.6-max-preview"),
+            "deepseek does not host qwen* models"
+        );
+    }
+
+    #[test]
+    fn provider_can_host_model_rejects_other_disjoint_families() {
+        assert!(!ReliableProvider::provider_can_host_model(
+            "anthropic",
+            "gpt-4o"
+        ));
+        assert!(!ReliableProvider::provider_can_host_model(
+            "openai",
+            "claude-opus-4-6"
+        ));
+        assert!(!ReliableProvider::provider_can_host_model(
+            "deepseek",
+            "claude-sonnet-4-6"
+        ));
+    }
+
+    #[test]
+    fn provider_can_host_model_passes_unknown_through() {
+        // Unknown provider + any model: assume routable (e.g. openrouter,
+        // custom HTTP endpoints can serve mixed model families).
+        assert!(ReliableProvider::provider_can_host_model(
+            "openrouter",
+            "deepseek-v4-pro"
+        ));
+        assert!(ReliableProvider::provider_can_host_model(
+            "openrouter",
+            "claude-sonnet-4-6"
+        ));
+        assert!(ReliableProvider::provider_can_host_model(
+            "custom-http",
+            "qwen-max"
+        ));
+
+        // Unknown model + native provider: assume routable (e.g. a new
+        // model family released by an existing vendor before zeroclaw is
+        // updated).
+        assert!(ReliableProvider::provider_can_host_model(
+            "deepseek",
+            "future-deepseek-model-name"
+        ));
+
+        // Empty strings: degenerate — be permissive, the actual API call
+        // will fail with a clearer error message.
+        assert!(ReliableProvider::provider_can_host_model("", ""));
+    }
+
+    #[test]
+    fn provider_can_host_model_handles_case() {
+        // Both inputs may arrive in any case; classification is case-insensitive.
+        assert!(ReliableProvider::provider_can_host_model(
+            "DeepSeek",
+            "DeepSeek-V4-Pro"
+        ));
+        assert!(!ReliableProvider::provider_can_host_model(
+            "QWEN",
+            "DEEPSEEK-V4-PRO"
+        ));
     }
 }
