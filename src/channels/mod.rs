@@ -3447,6 +3447,26 @@ pub async fn start_channels(
     external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
 ) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
+
+    // PR-H: derive per-fallback `[model_providers.X]` base_url overrides.
+    let fallback_provider_base_urls = config
+        .reliability
+        .fallback_providers
+        .iter()
+        .filter_map(|fb_name| {
+            config
+                .model_providers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(fb_name))
+                .and_then(|(_, profile)| {
+                    profile
+                        .base_url
+                        .as_ref()
+                        .map(|url| (fb_name.clone(), url.clone()))
+                })
+        })
+        .collect::<std::collections::HashMap<String, String>>();
+
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -3454,6 +3474,7 @@ pub async fn start_channels(
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         provider_timeout_secs: Some(config.provider_timeout_secs),
+        fallback_provider_base_urls,
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
@@ -3756,12 +3777,10 @@ pub async fn start_channels(
             }
             if config.hooks.builtin.sop_enforcement.enabled {
                 if let Some(engine) = external_sop_engine.as_ref() {
-                    runner.register(Box::new(
-                        crate::hooks::builtin::SopEnforcementHook::new(
-                            config.hooks.builtin.sop_enforcement.clone(),
-                            std::sync::Arc::clone(engine),
-                        ),
-                    ));
+                    runner.register(Box::new(crate::hooks::builtin::SopEnforcementHook::new(
+                        config.hooks.builtin.sop_enforcement.clone(),
+                        std::sync::Arc::clone(engine),
+                    )));
                 } else {
                     tracing::warn!(
                         "[hooks.builtin.sop_enforcement] enabled but no daemon-shared SopEngine \
