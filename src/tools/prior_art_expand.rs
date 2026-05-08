@@ -77,6 +77,19 @@ use super::traits::{Tool, ToolResult};
 
 const NCBI_ESEARCH_BASE: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
 const NCBI_EFETCH_BASE: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
+const NCBI_ELINK_BASE: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi";
+
+/// Cap on PI PMIDs we will run elink for. Each elink response can
+/// be up to ~100 similar PMIDs; for a productive PI with 30 papers
+/// this would be 3000 candidates which is overwhelming for the
+/// downstream Layer 4 LLM-as-judge pass. The cap forces the LLM
+/// to pre-select the PI's most-relevant prior work as seeds.
+const MAX_PI_PMIDS: usize = 8;
+
+/// Cap on similar PMIDs kept per PI seed. NIH returns up to ~100
+/// similar; we keep top 30 to stay within Layer 4 budget while
+/// preserving the strongest signal (NIH ranks by relevance).
+const SIMILAR_PMIDS_PER_SEED: usize = 30;
 
 /// Maximum PMIDs returned per individual query. NIH eutils default is
 /// 20; we ask for 100 because Layer 1's signal of interest is
@@ -255,8 +268,7 @@ mod mesh {
                 }
             };
 
-            let (canonical_name, entry_terms, tree_numbers) =
-                parse_mesh_record(&record_text);
+            let (canonical_name, entry_terms, tree_numbers) = parse_mesh_record(&record_text);
 
             // Sanity check: PubMed's esearch on db=mesh ranks by
             // relevance and can map polysemous terms to surprising
@@ -280,13 +292,13 @@ mod mesh {
             // Dedup against the original to avoid pathological
             // `(ALOX15 OR ALOX15)` clauses in L1 query building.
             let mut synonyms: Vec<String> = Vec::new();
-            if !canonical_name.is_empty()
-                && !canonical_name.eq_ignore_ascii_case(term)
-            {
+            if !canonical_name.is_empty() && !canonical_name.eq_ignore_ascii_case(term) {
                 synonyms.push(canonical_name);
             }
             for et in entry_terms {
-                if !et.eq_ignore_ascii_case(term) && !synonyms.iter().any(|s| s.eq_ignore_ascii_case(&et)) {
+                if !et.eq_ignore_ascii_case(term)
+                    && !synonyms.iter().any(|s| s.eq_ignore_ascii_case(&et))
+                {
                     synonyms.push(et);
                 }
             }
@@ -308,15 +320,13 @@ mod mesh {
                                 .into_iter()
                                 .filter(|s| {
                                     !s.eq_ignore_ascii_case(term)
-                                        && !out.synonyms.iter()
-                                            .any(|x| x.eq_ignore_ascii_case(s))
+                                        && !out.synonyms.iter().any(|x| x.eq_ignore_ascii_case(s))
                                 })
                                 .collect();
                         }
                         Err(e) => {
-                            out.error = Some(format!(
-                                "sibling search failed for tree '{parent}': {e}"
-                            ));
+                            out.error =
+                                Some(format!("sibling search failed for tree '{parent}': {e}"));
                         }
                     }
                 }
@@ -416,11 +426,7 @@ mod mesh {
             let resp = self
                 .http
                 .get(NCBI_EFETCH_BASE)
-                .query(&[
-                    ("db", "mesh"),
-                    ("id", &uids.join(",")),
-                    ("retmode", "xml"),
-                ])
+                .query(&[("db", "mesh"), ("id", &uids.join(",")), ("retmode", "xml")])
                 .send()
                 .await?;
             let status = resp.status();
@@ -605,7 +611,10 @@ mod mesh {
                 "share_token should reject 'ferroptosis' → 'AIFM2 protein'"
             );
             // Legitimate matches:
-            assert!(share_token("Cerebral Hemorrhage", "intracerebral hemorrhage"));
+            assert!(share_token(
+                "Cerebral Hemorrhage",
+                "intracerebral hemorrhage"
+            ));
             assert!(share_token("Ferroptosis", "ferroptosis"));
             assert!(share_token("Neuron, Pacemaker", "neuron"));
         }
@@ -617,6 +626,126 @@ mod mesh {
             // Short tokens (<3 chars) are ignored
             assert!(!share_token("PD L2", "ID 12"));
         }
+    }
+}
+
+/// PubMed elink-based research-path expansion (Layer 3 of
+/// PHC-RFC-2026-003).
+///
+/// For each PI seed PMID, calls NIH's elink API to retrieve the
+/// `pubmed_pubmed` link set — PubMed's own TF-IDF + author-overlap
+/// model of "papers similar to this one". This produces:
+///
+/// - **PI research-path narrative input**: the LLM can see which
+///   topics PI's prior work clusters with, so the proposal can
+///   honestly position itself as a continuation rather than a
+///   non-sequitur. Closes the v15b 张宏 case where individual
+///   PI publications were cited as supporting evidence without
+///   showing they actually clustered with the proposal's claim.
+/// - **Layer 4 candidate pool**: similar PMIDs add to the
+///   prior-art candidate set so LLM-as-judge can decide whether
+///   any of them undermine the novelty claim.
+///
+/// Layer 3 results do NOT feed the blank_claim_check verdict.
+/// PI-similarity is a recall signal for narrative completeness,
+/// not a signal that the claim has direct prior art (the LLM
+/// could legitimately extend its own work in a novel direction).
+mod pi_path {
+    use std::time::Duration;
+
+    use serde_json::Value;
+
+    use super::{NCBI_ELINK_BASE, SIMILAR_PMIDS_PER_SEED};
+
+    /// Per-PI-seed similarity record. Surfaced in the report so
+    /// the LLM can audit "did I miss a paper that elink says is
+    /// adjacent to my own prior work?"
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct PiSeedSimilarity {
+        pub seed_pmid: String,
+        pub similar_pmids: Vec<String>,
+        pub error: Option<String>,
+    }
+
+    pub(super) struct ElinkClient {
+        http: reqwest::Client,
+    }
+
+    impl ElinkClient {
+        pub(super) fn new(http: reqwest::Client) -> Self {
+            Self { http }
+        }
+
+        /// Run `elink dbfrom=pubmed db=pubmed linkname=pubmed_pubmed`
+        /// for one seed PMID. Returns up to SIMILAR_PMIDS_PER_SEED
+        /// results, with the seed itself filtered out (NIH includes
+        /// the seed PMID in the response with the highest relevance
+        /// score; we never want it in the candidate pool).
+        pub(super) async fn similar_for(&self, seed: &str) -> PiSeedSimilarity {
+            let mut out = PiSeedSimilarity {
+                seed_pmid: seed.to_string(),
+                ..Default::default()
+            };
+
+            let resp = match self
+                .http
+                .get(NCBI_ELINK_BASE)
+                .query(&[
+                    ("dbfrom", "pubmed"),
+                    ("db", "pubmed"),
+                    ("linkname", "pubmed_pubmed"),
+                    ("id", seed),
+                    ("retmode", "json"),
+                ])
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    out.error = Some(format!("elink transport error: {e}"));
+                    return out;
+                }
+            };
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                out.error = Some(format!("elink HTTP {status}: {body}"));
+                return out;
+            }
+            let parsed: Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.error = Some(format!("elink non-JSON body: {e}"));
+                    return out;
+                }
+            };
+            // Shape: linksets[0].linksetdbs[0].links is the array of
+            // similar PMIDs.
+            let links = parsed
+                .get("linksets")
+                .and_then(|l| l.as_array())
+                .and_then(|a| a.first())
+                .and_then(|ls| ls.get("linksetdbs"))
+                .and_then(|l| l.as_array())
+                .and_then(|a| a.first())
+                .and_then(|lsd| lsd.get("links"))
+                .and_then(|l| l.as_array())
+                .cloned()
+                .unwrap_or_default();
+            out.similar_pmids = links
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|p| p != seed)
+                .take(SIMILAR_PMIDS_PER_SEED)
+                .collect();
+            out
+        }
+    }
+
+    /// Polite delay between elink calls (shared 3 req/s budget
+    /// with the L1/L2 NCBI traffic).
+    pub(super) async fn pause() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -847,6 +976,38 @@ impl MeshAudit {
     }
 }
 
+/// Per-PI-seed record of what Layer 3 (elink) returned, plus the
+/// dedup'd cross-seed similar PMID pool. Surfaced in the report so
+/// the LLM can build the PI research-path narrative ("PI's prior
+/// work clusters with these N papers; the proposal extends from
+/// PMID:X via the (axis Y) link").
+#[derive(Debug, Clone, Default, Serialize)]
+struct PiPathAudit {
+    enabled: bool,
+    seeds_processed: usize,
+    seeds_capped: bool,
+    /// Per-seed similar-PMID lists (full output for audit).
+    per_seed: Vec<PiSeedRecord>,
+    /// Dedup'd union of all similar PMIDs across seeds, capped at
+    /// 100 for report readability. The full list is in `per_seed`.
+    aggregated_pmids: Vec<String>,
+    /// Total unique similar PMIDs before any cap.
+    total_unique: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct PiSeedRecord {
+    seed_pmid: String,
+    similar_pmids: Vec<String>,
+    error: Option<String>,
+}
+
+impl PiPathAudit {
+    fn disabled() -> Self {
+        Self::default()
+    }
+}
+
 pub struct PriorArtExpandTool {
     http: reqwest::Client,
     /// Optional NCBI eutils API key. With key, NIH allows 10 req/s
@@ -866,15 +1027,52 @@ impl PriorArtExpandTool {
         Self { http, api_key }
     }
 
+    /// Layer 3: For each PI seed PMID, fetch PubMed's Similar
+    /// Articles list. Returns aggregated unique similar PMIDs plus
+    /// per-seed audit detail. Caps the seed count at MAX_PI_PMIDS
+    /// to bound API cost; the LLM is responsible for picking the
+    /// PI's most-relevant prior work as seeds (the SOP step 5
+    /// prompt says "include up to 8 PMIDs from PI's last-author or
+    /// first-author papers most aligned with the claim").
+    async fn expand_via_pi_path(&self, pi_pmids: &[String]) -> PiPathAudit {
+        let mut audit = PiPathAudit {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let seeds: Vec<&String> = pi_pmids.iter().take(MAX_PI_PMIDS).collect();
+        audit.seeds_capped = pi_pmids.len() > MAX_PI_PMIDS;
+
+        let client = pi_path::ElinkClient::new(self.http.clone());
+        let mut union: std::collections::BTreeSet<String> = Default::default();
+
+        for (i, seed) in seeds.iter().enumerate() {
+            if i > 0 {
+                pi_path::pause().await;
+            }
+            let r = client.similar_for(seed).await;
+            for p in &r.similar_pmids {
+                union.insert(p.clone());
+            }
+            audit.per_seed.push(PiSeedRecord {
+                seed_pmid: r.seed_pmid,
+                similar_pmids: r.similar_pmids,
+                error: r.error,
+            });
+        }
+
+        audit.seeds_processed = audit.per_seed.len();
+        audit.total_unique = union.len();
+        audit.aggregated_pmids = union.into_iter().take(100).collect();
+        audit
+    }
+
     /// Layer 2: expand each axis term through MeSH (synonyms +
     /// siblings). Returns the augmented dimensions and a per-axis
     /// audit trail recording what MeSH added for transparency.
     /// Errors per term are swallowed (logged into the audit) so a
     /// MeSH outage degrades gracefully to L1-only behavior.
-    async fn expand_via_mesh(
-        &self,
-        original: &ClaimDimensions,
-    ) -> (ClaimDimensions, MeshAudit) {
+    async fn expand_via_mesh(&self, original: &ClaimDimensions) -> (ClaimDimensions, MeshAudit) {
         let client = mesh::MeshClient::new(self.http.clone());
         let mut audit = MeshAudit::default();
         audit.enabled = true;
@@ -1104,16 +1302,26 @@ impl PriorArtExpandTool {
         original_dim: &ClaimDimensions,
         expanded_dim: &ClaimDimensions,
         mesh_audit: &MeshAudit,
+        pi_audit: &PiPathAudit,
         tiers: &[TierResult],
         verdict: &BlankClaimVerdict,
     ) -> String {
         use std::fmt::Write;
         let mut out = String::new();
 
+        // Header reflects which layers actually ran.
+        let mut layers = Vec::new();
+        layers.push("Layer 1");
+        if mesh_audit.enabled {
+            layers.push("Layer 2");
+        }
+        if pi_audit.enabled {
+            layers.push("Layer 3");
+        }
         let _ = writeln!(
             out,
-            "# Prior Art Neighborhood Expansion (Layer 1{})\n",
-            if mesh_audit.enabled { " + 2" } else { "" }
+            "# Prior Art Neighborhood Expansion ({})\n",
+            layers.join(" + ")
         );
         let _ = writeln!(out, "**Claim**: {claim}\n");
 
@@ -1143,16 +1351,21 @@ impl PriorArtExpandTool {
         // L2 audit: per-axis MeSH expansion record. Only emit when L2
         // ran (otherwise the section is noise).
         if mesh_audit.enabled {
-            let total_added: usize =
-                mesh_audit.per_axis.iter().map(|a| a.total_added).sum();
+            let total_added: usize = mesh_audit.per_axis.iter().map(|a| a.total_added).sum();
             let _ = writeln!(out, "## Layer 2: MeSH ontology expansion\n");
             let _ = writeln!(
                 out,
                 "MeSH expansion added **{total_added} term(s)** across {} axes (synonyms + tree siblings of the primary axis term).\n",
                 mesh_audit.per_axis.len()
             );
-            let _ = writeln!(out, "| axis | input | added synonyms | added siblings | error |");
-            let _ = writeln!(out, "|------|-------|----------------|----------------|-------|");
+            let _ = writeln!(
+                out,
+                "| axis | input | added synonyms | added siblings | error |"
+            );
+            let _ = writeln!(
+                out,
+                "|------|-------|----------------|----------------|-------|"
+            );
             for a in &mesh_audit.per_axis {
                 let syn = if a.added_synonyms.is_empty() {
                     "_(none)_".to_string()
@@ -1180,7 +1393,10 @@ impl PriorArtExpandTool {
             // Surface what the LLM ORIGINALLY decomposed, so reviewers
             // can confirm L2 only widened recall and didn't replace
             // the LLM's choices.
-            let _ = writeln!(out, "<details><summary>Original LLM-decomposed axes (pre-expansion)</summary>\n");
+            let _ = writeln!(
+                out,
+                "<details><summary>Original LLM-decomposed axes (pre-expansion)</summary>\n"
+            );
             let _ = writeln!(out, "| axis | terms |");
             let _ = writeln!(out, "|------|-------|");
             let _ = writeln!(out, "| molecule | {} |", original_dim.molecule.join(", "));
@@ -1199,6 +1415,75 @@ impl PriorArtExpandTool {
                 );
             }
             let _ = writeln!(out, "\n</details>\n");
+        }
+
+        // L3 audit: PI research-path expansion via PubMed elink.
+        // Only emit when L3 ran (otherwise the section is noise).
+        if pi_audit.enabled {
+            let _ = writeln!(out, "## Layer 3: PI research-path (PubMed elink)\n");
+            let cap_note = if pi_audit.seeds_capped {
+                format!(" (input list capped at first {} seeds)", MAX_PI_PMIDS)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                out,
+                "Processed **{} PI seed PMID(s)**{cap_note}; aggregated **{} unique** similar PMIDs across seeds.\n",
+                pi_audit.seeds_processed, pi_audit.total_unique
+            );
+
+            let _ = writeln!(out, "### Per-seed similarity\n");
+            let _ = writeln!(
+                out,
+                "| seed PMID | # similar | sample similar PMIDs | error |"
+            );
+            let _ = writeln!(
+                out,
+                "|-----------|----------:|---------------------|-------|"
+            );
+            for s in &pi_audit.per_seed {
+                let sample: Vec<String> = s.similar_pmids.iter().take(5).cloned().collect();
+                let sample_str = if sample.is_empty() {
+                    "_(none)_".to_string()
+                } else {
+                    sample.join(", ")
+                };
+                let err = s
+                    .error
+                    .as_deref()
+                    .map(|e| format!("⚠️ {e}"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} |",
+                    s.seed_pmid,
+                    s.similar_pmids.len(),
+                    sample_str,
+                    err
+                );
+            }
+            let _ = writeln!(out);
+
+            // Cross-seed aggregated PMIDs feed Layer 4 candidate
+            // judgment. Surfaced for the LLM to scan for any paper
+            // it might have missed despite axis-based search.
+            if !pi_audit.aggregated_pmids.is_empty() {
+                let cap_more = if pi_audit.total_unique > pi_audit.aggregated_pmids.len() {
+                    format!(
+                        " (showing first {}; full {} captured for Layer 4)",
+                        pi_audit.aggregated_pmids.len(),
+                        pi_audit.total_unique
+                    )
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    out,
+                    "<details><summary>Aggregated PI-path PMIDs{cap_more}</summary>\n"
+                );
+                let _ = writeln!(out, "{}\n", pi_audit.aggregated_pmids.join(", "));
+                let _ = writeln!(out, "</details>\n");
+            }
         }
 
         // Verdict comes first — this is the deterministic gate the SOP
@@ -1292,6 +1577,15 @@ impl Tool for PriorArtExpandTool {
                         "intervention": {"type": "array", "items": {"type": "string"}}
                     },
                     "required": ["molecule", "disease", "mechanism", "cell_type", "outcome"]
+                },
+                "enable_mesh_expansion": {
+                    "type": "boolean",
+                    "description": "Layer 2: when true (default), each axis term is augmented with NCBI MeSH synonyms (Entry Terms) and tree siblings before generating L1 queries. Set false to isolate L1 behavior."
+                },
+                "pi_pmids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Layer 3 (optional): PI seed PMIDs whose PubMed Similar-Articles links should be aggregated into the candidate pool. Use up to 8 PMIDs from the PI's first/last-author papers most aligned with the claim. Output is surfaced in a 'Layer 3: PI research-path' report section and feeds Layer 4 candidate judgment."
                 }
             },
             "required": ["claim", "dimensions"]
@@ -1307,8 +1601,8 @@ impl Tool for PriorArtExpandTool {
         let dim_value = args
             .get("dimensions")
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: dimensions"))?;
-        let original_dim: ClaimDimensions = serde_json::from_value(dim_value.clone())
-            .map_err(|e| {
+        let original_dim: ClaimDimensions =
+            serde_json::from_value(dim_value.clone()).map_err(|e| {
                 anyhow::anyhow!("dimensions field could not be parsed as ClaimDimensions: {e}")
             })?;
 
@@ -1341,11 +1635,35 @@ impl Tool for PriorArtExpandTool {
             (original_dim.clone(), MeshAudit::disabled())
         };
 
+        // Layer 3: PI research-path expansion via PubMed elink.
+        // Optional — only fires when caller passes pi_pmids.
+        let pi_pmids: Vec<String> = args
+            .get("pi_pmids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pi_audit = if pi_pmids.is_empty() {
+            PiPathAudit::disabled()
+        } else {
+            self.expand_via_pi_path(&pi_pmids).await
+        };
+
         let queries = build_queries(&dim);
         let tiers = self.run_all_tiers(&queries).await;
         let verdict = Self::assess_blank_claim(&tiers);
-        let report =
-            Self::render_report(&claim, &original_dim, &dim, &mesh_audit, &tiers, &verdict);
+        let report = Self::render_report(
+            &claim,
+            &original_dim,
+            &dim,
+            &mesh_audit,
+            &pi_audit,
+            &tiers,
+            &verdict,
+        );
 
         Ok(ToolResult {
             success: true,
@@ -1615,11 +1933,13 @@ mod tests {
             sample_neighbor_pmids: vec!["12345".into()],
         };
         let mesh = MeshAudit::disabled();
+        let pi = PiPathAudit::disabled();
         let r = PriorArtExpandTool::render_report(
             "ALOX15 in ICH ferroptosis",
             &dim,
             &dim,
             &mesh,
+            &pi,
             &tiers,
             &verdict,
         );
@@ -1631,8 +1951,9 @@ mod tests {
         assert!(r.contains("## Tier breakdown"));
         assert!(r.contains("## Queries used (for audit)"));
         assert!(r.contains("ALOX15[tiab] AND ICH[tiab]"));
-        // Mesh disabled → no L2 section header.
+        // Mesh + PI path disabled → no L2 / L3 section headers.
         assert!(!r.contains("## Layer 2: MeSH ontology expansion"));
+        assert!(!r.contains("## Layer 3: PI research-path"));
     }
 
     #[test]
@@ -1661,12 +1982,57 @@ mod tests {
                 total_added: 2,
             }],
         };
-        let r = PriorArtExpandTool::render_report("x", &dim, &dim, &mesh, &tiers, &verdict);
-        assert!(r.contains("Layer 1 + 2"));
+        let pi = PiPathAudit::disabled();
+        let r = PriorArtExpandTool::render_report("x", &dim, &dim, &mesh, &pi, &tiers, &verdict);
+        assert!(r.contains("Layer 1 + Layer 2"));
         assert!(r.contains("## Layer 2: MeSH ontology expansion"));
         assert!(r.contains("Cerebral Hemorrhage"));
         assert!(r.contains("Subarachnoid Hemorrhage"));
         assert!(r.contains("Original LLM-decomposed axes"));
+    }
+
+    #[test]
+    fn render_report_with_pi_path_includes_layer_3_section() {
+        let dim = dim_full();
+        let tiers = vec![TierResult {
+            label: "T1".into(),
+            description: "5-axis".into(),
+            query: "...".into(),
+            pmids: vec![],
+            error: None,
+        }];
+        let verdict = BlankClaimVerdict {
+            verdict: "ok_to_claim_blank".into(),
+            rationale: "all zero".into(),
+            sample_neighbor_pmids: vec![],
+        };
+        let mesh = MeshAudit::disabled();
+        let pi = PiPathAudit {
+            enabled: true,
+            seeds_processed: 2,
+            seeds_capped: false,
+            per_seed: vec![
+                PiSeedRecord {
+                    seed_pmid: "40288664".into(),
+                    similar_pmids: vec!["38308041".into(), "39561537".into()],
+                    error: None,
+                },
+                PiSeedRecord {
+                    seed_pmid: "34976103".into(),
+                    similar_pmids: vec!["31604796".into()],
+                    error: None,
+                },
+            ],
+            aggregated_pmids: vec!["38308041".into(), "39561537".into(), "31604796".into()],
+            total_unique: 3,
+        };
+        let r = PriorArtExpandTool::render_report("x", &dim, &dim, &mesh, &pi, &tiers, &verdict);
+        assert!(r.contains("Layer 1 + Layer 3"));
+        assert!(r.contains("## Layer 3: PI research-path (PubMed elink)"));
+        assert!(r.contains("Processed **2 PI seed PMID(s)**"));
+        assert!(r.contains("3 unique** similar PMIDs"));
+        assert!(r.contains("40288664"));
+        assert!(r.contains("Aggregated PI-path PMIDs"));
     }
 
     #[test]
@@ -1685,8 +2051,8 @@ mod tests {
             sample_neighbor_pmids: vec![],
         };
         let mesh = MeshAudit::disabled();
-        let r =
-            PriorArtExpandTool::render_report("x", &dim, &dim, &mesh, &tiers, &verdict);
+        let pi = PiPathAudit::disabled();
+        let r = PriorArtExpandTool::render_report("x", &dim, &dim, &mesh, &pi, &tiers, &verdict);
         assert!(r.contains("_(error)_"));
         assert!(r.contains("HTTP 502"));
     }
