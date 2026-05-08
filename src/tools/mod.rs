@@ -49,6 +49,7 @@ pub mod model_routing_config;
 pub mod pdf_read;
 pub mod pi_publication_validator;
 pub mod pmid_dedup_check;
+pub mod prior_art_expand;
 pub mod proxy_config;
 pub mod publish_file;
 pub mod pushover;
@@ -104,6 +105,7 @@ pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
 pub use pi_publication_validator::PiPublicationValidatorTool;
 pub use pmid_dedup_check::PmidDedupCheckTool;
+pub use prior_art_expand::PriorArtExpandTool;
 pub use proxy_config::ProxyConfigTool;
 pub use publish_file::PublishFileTool;
 pub use pushover::PushoverTool;
@@ -441,6 +443,18 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(PiPublicationValidatorTool::new(
             workspace_dir.to_path_buf(),
         )));
+
+        // Prior-art neighborhood expansion (Layer 1, PHC-RFC-2026-003).
+        // Runs 11 tiered PubMed eSearch queries against the LLM's
+        // claim decomposition and emits a deterministic
+        // `blank_claim_check` verdict. SOP step 5 must consult the
+        // verdict before allowing "0 papers / complete blank /
+        // 完全空白" framing in disease_scan.md / hypotheses.md.
+        // Closes the v_zhang ICH+ALOX15 overstatement and the v_li
+        // GZFL+dienogest already-published vs novel contradiction.
+        // No api_key plumbed yet — defaults to NIH's 3 req/s public
+        // limit, which costs ~4s per claim for 11 queries.
+        tool_arcs.push(Arc::new(PriorArtExpandTool::new(None)));
     }
 
     if let Some(key) = composio_key {
