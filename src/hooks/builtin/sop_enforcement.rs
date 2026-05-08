@@ -98,6 +98,38 @@ const STEP8_PROPOSAL_GLOB: &str = "case_library/insight/*/*proposal.md";
 /// proposal.md would be a false positive.
 const STEP8_GATED_SOPS: &[&str] = &["jl-insight-research-proposal"];
 
+/// Patterns that indicate residual template placeholders the LLM
+/// forgot to substitute. Origin: PI 高原 v_gao_v5 一审反馈 #1 整改
+/// 单 P0-1: 报告第 1 页有 `[疾病方向]` `<auto-filled>` 残留致评审秒杀.
+/// LLM self-review systematically blind to these — must be detected
+/// by deterministic regex.
+///
+/// Patterns are kept narrow on purpose: we only catch shapes that are
+/// almost certainly template residue, not normal markdown brackets
+/// like `[PMID:12345]` or `[See §2.3]`. Specifically:
+///   - Pure CJK inside square brackets (real Chinese template tokens).
+///   - Angle-bracket auto-fill markers (`<auto-filled>`, `<TBD>`, ...).
+///   - Triple-dash data placeholders (`---{var}---`, `---data---`).
+const PLACEHOLDER_RESIDUE_PATTERNS: &[(&str, &str)] = &[
+    // Pure-CJK bracket placeholders like [疾病方向] [关键靶点] [假说1].
+    // Real template residue in PharmaClaw is virtually always all-CJK.
+    // This avoids false positives on `[PMID:12345]` / `[作者 Year]`.
+    (
+        r"\[[\u{4e00}-\u{9fff}]+\]",
+        "pure-CJK bracket placeholder (e.g. [疾病方向])",
+    ),
+    // Auto-fill markers from various templates.
+    (
+        r"<auto-filled>|<auto-fill>|<待填>|<TBD>|<TODO>|<XXX>",
+        "auto-fill marker",
+    ),
+    // Triple-dash data placeholders.
+    (
+        r"---\{[a-z_]+\}---|---data---",
+        "triple-dash data placeholder",
+    ),
+];
+
 pub struct SopEnforcementHook {
     config: SopEnforcementConfig,
     engine: Arc<Mutex<SopEngine>>,
@@ -240,6 +272,93 @@ impl SopEnforcementHook {
         ))
     }
 
+    /// Gate 3: scan all proposal.md files for residual template
+    /// placeholders. Triggered on `sop_advance` at step 8+ for gated
+    /// SOPs (regardless of `status` value — this gate is broader than
+    /// the size gate because the residue bug is severity-independent).
+    ///
+    /// Returns `Some(cancel_message)` on detection, `None` if clean.
+    fn check_placeholder_residue_gate(&self, name: &str, args: &Value) -> Option<String> {
+        if name != STEP8_GATE_TOOL {
+            return None;
+        }
+        // Detect at any sop_advance from step 8 onwards. Status doesn't
+        // matter — placeholder residue is fatal at any point past assembly.
+        let (run_id, sop_name, current_step) = {
+            let engine = self.engine.lock().ok()?;
+            engine
+                .active_runs()
+                .values()
+                .find(|r| {
+                    matches!(r.status, SopRunStatus::Running)
+                        && r.current_step >= 8
+                        && STEP8_GATED_SOPS.contains(&r.sop_name.as_str())
+                })
+                .map(|r| (r.run_id.clone(), r.sop_name.clone(), r.current_step))?
+        };
+        let _ = (args,); // status not used; gate is broader
+
+        let glob_pattern_path = self.workspace_dir.join(STEP8_PROPOSAL_GLOB);
+        let glob_pattern_str = glob_pattern_path.to_string_lossy();
+        let proposals: Vec<_> = match glob::glob(&glob_pattern_str) {
+            Ok(g) => g.flatten().collect(),
+            Err(_) => return None,
+        };
+        if proposals.is_empty() {
+            return None;
+        }
+
+        let mut findings: Vec<String> = Vec::new();
+        for proposal in &proposals {
+            let Ok(content) = std::fs::read_to_string(proposal) else {
+                continue;
+            };
+            for (pattern, label) in PLACEHOLDER_RESIDUE_PATTERNS {
+                let Ok(re) = regex::Regex::new(pattern) else {
+                    continue;
+                };
+                let mut matches: Vec<String> = re
+                    .find_iter(&content)
+                    .map(|m| m.as_str().to_string())
+                    .collect();
+                if !matches.is_empty() {
+                    matches.sort();
+                    matches.dedup();
+                    let sample: Vec<String> = matches.iter().take(5).cloned().collect();
+                    findings.push(format!(
+                        "  • {path}: {label}\n    matches: [{matches}{ellipsis}]",
+                        path = proposal.display(),
+                        label = label,
+                        matches = sample.join(", "),
+                        ellipsis = if matches.len() > 5 { ", ..." } else { "" },
+                    ));
+                }
+            }
+        }
+        if findings.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "🚫 SOP step {current_step} placeholder residue gate: template placeholders \
+             not substituted in proposal output.\n\n\
+             Active run `{run_id}` (`{sop_name}`) is at step {current_step} and called \
+             `sop_advance`, but residual template tokens (e.g. `[疾病方向]`, `<auto-filled>`, \
+             `<TBD>`) were detected in proposal files. These are致命 bugs: PI 评审 v_gao_v5 \
+             第 1 页因 `[疾病方向]` 和 `<auto-filled>` 残留被直接判 P0 阻断级 \"不会签字\".\n\n\
+             Findings:\n{findings}\n\n\
+             To proceed:\n\
+             • file_read each affected file, locate the placeholder context.\n\
+             • Substitute with the actual content from pi_intel.md / disease_scan.md / \
+               hypotheses.md (the chapter files have the real values).\n\
+             • Re-call `sop_advance` once all placeholders are gone.\n\
+             • If a placeholder is intentional (e.g. `__PI_FILL__` in PI-only fields), \
+               it does NOT trigger this gate — only `[CAPS_BRACKET]`, `<auto-filled>`, \
+               and `<TBD>`-class markers do.",
+            findings = findings.join("\n"),
+        ))
+    }
+
     /// Test whether `path` is permitted under the configured allowlist.
     /// Both the path and prefixes are normalised by stripping leading
     /// `./` so the LLM's idiomatic `./foo` matches a `foo/` prefix.
@@ -304,6 +423,17 @@ impl HookHandler for SopEnforcementHook {
                 hook = "sop-enforcement",
                 tool = %name,
                 "rejecting sop_advance: step 8 proposal.md size gate"
+            );
+            return HookResult::Cancel(reason);
+        }
+
+        // Gate 3: placeholder residue scan on sop_advance at step 8+
+        // (broader than Gate 1 — fires on any status, not just completed)
+        if let Some(reason) = self.check_placeholder_residue_gate(&name, &args) {
+            tracing::warn!(
+                hook = "sop-enforcement",
+                tool = %name,
+                "rejecting sop_advance: placeholder residue in proposal"
             );
             return HookResult::Cancel(reason);
         }
@@ -715,6 +845,148 @@ mod tests {
         assert!(
             matches!(result, HookResult::Continue(_)),
             "status=failed should bypass size gate"
+        );
+    }
+
+    // ── Gate 3 (placeholder residue) tests ─────────────────────────
+
+    /// Helper: write a 22 KB proposal whose body contains the supplied
+    /// residue text in addition to filler. Size > 20 KB so size gate
+    /// passes and Gate 3 is the only thing that can fire.
+    fn write_proposal_with_text(
+        case_dir: &std::path::Path,
+        pi_name: &str,
+        residue: &str,
+    ) -> PathBuf {
+        let pi_dir = case_dir.join("case_library").join("insight").join(pi_name);
+        std::fs::create_dir_all(&pi_dir).expect("create case dir");
+        let proposal = pi_dir.join("2026-05-03_proposal.md");
+        let mut payload = String::with_capacity(22 * 1024 + residue.len());
+        payload.push_str(residue);
+        payload.push('\n');
+        payload.push_str(&"x".repeat(22 * 1024));
+        std::fs::write(&proposal, payload).expect("write proposal");
+        proposal
+    }
+
+    #[tokio::test]
+    async fn placeholder_residue_gate_catches_caps_bracket() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_proposal_with_text(
+            tmp.path(),
+            "zhang_hong",
+            "本课题聚焦 [疾病方向] 中的 [关键靶点] 调控机制",
+        );
+        let _cwd = CwdGuard::enter(tmp.path());
+
+        let hook = test_hook(
+            cfg(true, &["case_library/"]),
+            engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
+        );
+        // Even with status=in_progress (the LLM bypass that defeats Gate 1),
+        // Gate 3 should still fire.
+        let result = hook
+            .before_tool_call(
+                "sop_advance".into(),
+                json!({"status": "in_progress", "output": "step 8 progressing"}),
+            )
+            .await;
+        match result {
+            HookResult::Cancel(msg) => {
+                assert!(
+                    msg.contains("placeholder residue gate"),
+                    "msg should mention placeholder residue gate: {msg}"
+                );
+                assert!(
+                    msg.contains("[疾病方向]") || msg.contains("[关键靶点]"),
+                    "msg should surface a concrete residue match: {msg}"
+                );
+            }
+            HookResult::Continue(_) => panic!("expected Cancel for caps-bracket residue"),
+        }
+    }
+
+    #[tokio::test]
+    async fn placeholder_residue_gate_catches_auto_fill_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_proposal_with_text(
+            tmp.path(),
+            "zhang_hong",
+            "SOP run_id: <auto-filled>\n调用数据库: <TBD>",
+        );
+        let _cwd = CwdGuard::enter(tmp.path());
+
+        let hook = test_hook(
+            cfg(true, &["case_library/"]),
+            engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
+        );
+        let result = hook
+            .before_tool_call(
+                "sop_advance".into(),
+                json!({"status": "completed", "output": "proposal done"}),
+            )
+            .await;
+        match result {
+            HookResult::Cancel(msg) => {
+                assert!(msg.contains("placeholder residue gate"), "msg: {msg}");
+                assert!(
+                    msg.contains("<auto-filled>") || msg.contains("<TBD>"),
+                    "msg should surface auto-fill markers: {msg}"
+                );
+            }
+            HookResult::Continue(_) => panic!("expected Cancel for auto-fill markers"),
+        }
+    }
+
+    #[tokio::test]
+    async fn placeholder_residue_gate_passes_clean_proposal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // 22 KB of clean content — no residue patterns, includes
+        // legitimate `__PI_FILL__` (which is NOT a residue marker).
+        write_proposal_with_text(
+            tmp.path(),
+            "zhang_hong",
+            "PI 邮箱 __PI_FILL__: zhang.hong@example.cn (PI 自填)",
+        );
+        let _cwd = CwdGuard::enter(tmp.path());
+
+        let hook = test_hook(
+            cfg(true, &["case_library/"]),
+            engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
+        );
+        let result = hook
+            .before_tool_call(
+                "sop_advance".into(),
+                json!({"status": "completed", "output": "proposal done"}),
+            )
+            .await;
+        assert!(
+            matches!(result, HookResult::Continue(_)),
+            "clean proposal with __PI_FILL__ should NOT trigger placeholder residue gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_residue_gate_only_fires_at_step_8_plus() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_proposal_with_text(tmp.path(), "zhang_hong", "[疾病方向] 占位符存在");
+        let _cwd = CwdGuard::enter(tmp.path());
+
+        // Active run is at step 5 — placeholders pre-step-8 are normal
+        // (still being assembled). Gate 3 must NOT fire.
+        let hook = test_hook(
+            cfg(true, &["case_library/"]),
+            engine_with_run("jl-insight-research-proposal", 5, SopRunStatus::Running),
+        );
+        let result = hook
+            .before_tool_call(
+                "sop_advance".into(),
+                json!({"status": "completed", "output": "step 5 done"}),
+            )
+            .await;
+        assert!(
+            matches!(result, HookResult::Continue(_)),
+            "placeholders pre-step-8 should not trigger Gate 3"
         );
     }
 }
