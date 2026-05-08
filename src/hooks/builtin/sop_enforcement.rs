@@ -66,6 +66,7 @@
 //! under `case_library/insight/*/`, checks `len() >= 20480`, and
 //! cancels the advance with a self-correction message if not.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -100,11 +101,25 @@ const STEP8_GATED_SOPS: &[&str] = &["jl-insight-research-proposal"];
 pub struct SopEnforcementHook {
     config: SopEnforcementConfig,
     engine: Arc<Mutex<SopEngine>>,
+    /// Workspace root used to anchor relative globs (e.g.
+    /// [`STEP8_PROPOSAL_GLOB`]). The daemon's CWD is the repo root,
+    /// not the workspace, so unanchored globs miss `case_library/`
+    /// entirely. Without this anchor every step 8 size-gate check
+    /// returned "no proposal.md found" regardless of actual files.
+    workspace_dir: PathBuf,
 }
 
 impl SopEnforcementHook {
-    pub fn new(config: SopEnforcementConfig, engine: Arc<Mutex<SopEngine>>) -> Self {
-        Self { config, engine }
+    pub fn new(
+        config: SopEnforcementConfig,
+        engine: Arc<Mutex<SopEngine>>,
+        workspace_dir: PathBuf,
+    ) -> Self {
+        Self {
+            config,
+            engine,
+            workspace_dir,
+        }
     }
 
     /// Returns `Some((run_id, status))` summary if there is at least one
@@ -159,7 +174,9 @@ impl SopEnforcementHook {
         }
         let (run_id, sop_name, _) = self.snapshot_step8_gated_run()?;
 
-        let proposals: Vec<_> = match glob::glob(STEP8_PROPOSAL_GLOB) {
+        let glob_pattern_path = self.workspace_dir.join(STEP8_PROPOSAL_GLOB);
+        let glob_pattern_str = glob_pattern_path.to_string_lossy();
+        let proposals: Vec<_> = match glob::glob(&glob_pattern_str) {
             Ok(g) => g.flatten().collect(),
             Err(_) => return None,
         };
@@ -174,7 +191,7 @@ impl SopEnforcementHook {
                  (pi_intel.md / disease_scan.md / hypotheses.md / technical_route.md / \
                  budget.md / output_matching.md / pm_review.md).\n\n\
                  To proceed: file_write the merged proposal.md, then re-call sop_advance.",
-                glob_pattern = STEP8_PROPOSAL_GLOB,
+                glob_pattern = glob_pattern_str,
                 min_kb = STEP8_PROPOSAL_MIN_BYTES / 1024,
             ));
         }
@@ -333,6 +350,17 @@ mod tests {
         }
     }
 
+    /// Test helper: construct hook with CWD-relative workspace (`.`).
+    /// Step-8 size-gate tests use [`CwdGuard`] to chdir into a tempdir,
+    /// so a relative workspace is correct here. Production code uses an
+    /// absolute path resolved from `config.workspace_dir`.
+    fn test_hook(
+        config: SopEnforcementConfig,
+        engine: Arc<Mutex<SopEngine>>,
+    ) -> SopEnforcementHook {
+        SopEnforcementHook::new(config, engine, PathBuf::from("."))
+    }
+
     fn empty_engine() -> Arc<Mutex<SopEngine>> {
         Arc::new(Mutex::new(SopEngine::new(SopConfig::default())))
     }
@@ -378,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_hook_passes_through() {
-        let hook = SopEnforcementHook::new(cfg(false, &["case_library/"]), empty_engine());
+        let hook = test_hook(cfg(false, &["case_library/"]), empty_engine());
         let result = hook
             .before_tool_call(
                 "file_write".into(),
@@ -390,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_active_run_passes_through() {
-        let hook = SopEnforcementHook::new(cfg(true, &["case_library/"]), empty_engine());
+        let hook = test_hook(cfg(true, &["case_library/"]), empty_engine());
         let result = hook
             .before_tool_call(
                 "file_write".into(),
@@ -405,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_tools_are_never_enforced() {
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_active_run(SopRunStatus::Running),
         );
@@ -422,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_to_allowed_prefix_passes() {
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/", "scripts/"]),
             engine_with_active_run(SopRunStatus::Running),
         );
@@ -443,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_outside_prefix_is_cancelled_with_helpful_message() {
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/", "scripts/"]),
             engine_with_active_run(SopRunStatus::Running),
         );
@@ -471,7 +499,7 @@ mod tests {
         // returns Err during this state. The LLM's natural retry path
         // is to switch to file_write — exactly what we must keep
         // gated.
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_active_run(SopRunStatus::WaitingApproval),
         );
@@ -486,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_path_arg_passes_through_for_clearer_error() {
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_active_run(SopRunStatus::Running),
         );
@@ -554,7 +582,7 @@ mod tests {
         write_proposal(tmp.path(), "zhang_hong", 5); // 5KB < 20KB
         let _cwd = CwdGuard::enter(tmp.path());
 
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
         );
@@ -580,7 +608,7 @@ mod tests {
         write_proposal(tmp.path(), "zhang_hong", 30); // 30KB ≥ 20KB
         let _cwd = CwdGuard::enter(tmp.path());
 
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
         );
@@ -603,7 +631,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("case_library/insight")).unwrap();
         let _cwd = CwdGuard::enter(tmp.path());
 
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
         );
@@ -628,7 +656,7 @@ mod tests {
         let _cwd = CwdGuard::enter(tmp.path());
 
         // Active run is at step 7, not step 8 → gate must not fire
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_run("jl-insight-research-proposal", 7, SopRunStatus::Running),
         );
@@ -651,7 +679,7 @@ mod tests {
         let _cwd = CwdGuard::enter(tmp.path());
 
         // Different SOP (not in STEP8_GATED_SOPS) → gate must not fire
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_run("some-other-sop", 8, SopRunStatus::Running),
         );
@@ -674,7 +702,7 @@ mod tests {
         let _cwd = CwdGuard::enter(tmp.path());
 
         // sop_advance with status=failed should not trigger size gate
-        let hook = SopEnforcementHook::new(
+        let hook = test_hook(
             cfg(true, &["case_library/"]),
             engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
         );
