@@ -32,7 +32,8 @@ async fn v_zhang_ich_alox15_must_flag_neighborhood() {
             "mechanism": ["ferroptosis", "lipid peroxidation"],
             "cell_type": ["neuron", "neuronal"],
             "outcome":   ["cell death", "neurodegeneration"]
-        }
+        },
+        "enable_mesh_expansion": true
     });
     let result = tool.execute(args).await.expect("tool runs");
     assert!(result.success, "tool failed: {:?}", result.error);

@@ -76,6 +76,7 @@ use serde_json::{json, Value};
 use super::traits::{Tool, ToolResult};
 
 const NCBI_ESEARCH_BASE: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
+const NCBI_EFETCH_BASE: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
 
 /// Maximum PMIDs returned per individual query. NIH eutils default is
 /// 20; we ask for 100 because Layer 1's signal of interest is
@@ -151,6 +152,471 @@ impl ClaimDimensions {
             out.push("outcome");
         }
         out
+    }
+}
+
+/// MeSH ontology expansion (Layer 2 of PHC-RFC-2026-003).
+///
+/// Wraps NCBI's MeSH database via eutils. For each input axis term
+/// returns Entry Terms (synonyms) and immediate siblings via the
+/// MeSH tree. Sibling lookup is the v_zhang case's path to catching
+/// SAH / cerebral infarction when the axis term is `Intracerebral
+/// Hemorrhage` — these are the cross-disease neighbors that L1's
+/// drop-disease tier eventually catches but L2 catches up-front
+/// at the term-mapping stage, before any PubMed query runs.
+///
+/// ## What MeSH gives us
+///
+/// `efetch?db=mesh&id=<UID>&retmode=xml` returns a structured text
+/// blob (NCBI quirk: `retmode=xml` for db=mesh actually returns
+/// labeled-section text, not XML — see efetch_mesh_record below).
+/// The two sections we use:
+///
+/// - **Entry Terms**: synonyms of the same MeSH concept. For
+///   "Cerebral Hemorrhage" (UID 68002543) these include
+///   "Intracerebral Hemorrhage", "Brain Hemorrhage Cerebral",
+///   "Cerebral Parenchymal Hemorrhage" — directly useful as
+///   axis-term expansions because PubMed queries with `[tiab]`
+///   restriction won't auto-expand to these.
+/// - **Tree Number(s)**: hierarchical position
+///   (e.g. `C14.907.253.573.200` for Cerebral Hemorrhage). The
+///   parent prefix (`C14.907.253.573` = Intracranial Hemorrhages)
+///   has other immediate children — the siblings — which we resolve
+///   via a second esearch (`<parent>[Tree Number]`).
+///
+/// ## Failure mode
+///
+/// MeSH lookup degrades gracefully: any error (network / rate-limit
+/// / term not in MeSH) emits an axis annotation in the report and
+/// the tool falls back to L1-only expansion for that axis. The
+/// blank_claim_check verdict is unaffected (L2 only widens recall;
+/// L1 alone is sufficient for the v_zhang case empirically).
+mod mesh {
+    use std::time::Duration;
+
+    use serde_json::Value;
+
+    use super::{NCBI_EFETCH_BASE, NCBI_ESEARCH_BASE};
+
+    /// Per-axis-term expansion: synonyms + siblings. The original
+    /// term is always included so the caller can blindly replace
+    /// the axis term list with the expansion result.
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct MeshExpansion {
+        pub original: String,
+        pub synonyms: Vec<String>,
+        pub siblings: Vec<String>,
+        /// Best-effort lookup error, or `None` on success.
+        pub error: Option<String>,
+    }
+
+    pub(super) struct MeshClient {
+        http: reqwest::Client,
+    }
+
+    impl MeshClient {
+        pub(super) fn new(http: reqwest::Client) -> Self {
+            Self { http }
+        }
+
+        /// Look up a single axis term in MeSH. Returns the canonical
+        /// MeSH descriptor name (which may differ from the input
+        /// term, e.g. "ICH" → "Cerebral Hemorrhage") plus synonyms
+        /// and siblings.
+        pub(super) async fn expand_term(&self, term: &str) -> MeshExpansion {
+            let mut out = MeshExpansion {
+                original: term.to_string(),
+                ..Default::default()
+            };
+
+            let uid = match self.lookup_uid(term).await {
+                Ok(Some(uid)) => uid,
+                Ok(None) => {
+                    // Term doesn't map to MeSH — that's fine, many
+                    // chemical / drug / acronym tokens won't. The
+                    // axis still has its L1 synonyms.
+                    return out;
+                }
+                Err(e) => {
+                    out.error = Some(format!("MeSH lookup failed for '{term}': {e}"));
+                    return out;
+                }
+            };
+
+            // Polite delay between paired esearch + efetch for the
+            // same term. NIH 3 req/s budget shared with L1.
+            tokio::time::sleep(Duration::from_millis(350)).await;
+
+            let record_text = match self.fetch_record(&uid).await {
+                Ok(t) => t,
+                Err(e) => {
+                    out.error = Some(format!("MeSH efetch failed for UID {uid}: {e}"));
+                    return out;
+                }
+            };
+
+            let (canonical_name, entry_terms, tree_numbers) =
+                parse_mesh_record(&record_text);
+
+            // Sanity check: PubMed's esearch on db=mesh ranks by
+            // relevance and can map polysemous terms to surprising
+            // concepts. Live observation: "cell death" mapped to
+            // "PD-L2 Ligand" (CD273) which has no relation to the
+            // generic concept; "ferroptosis" mapped to "AIFM2
+            // protein, mouse" (a regulator, not the concept). When
+            // the canonical MeSH name shares no token with the
+            // input term, we treat the lookup as a miss rather than
+            // contaminate the axis with unrelated synonyms. The L1
+            // query then runs on the LLM's original axis terms.
+            if !canonical_name.is_empty() && !share_token(&canonical_name, term) {
+                out.error = Some(format!(
+                    "MeSH canonical name '{canonical_name}' does not share a token with input '{term}' \
+                     — treating as polysemous miss, axis not expanded"
+                ));
+                return out;
+            }
+
+            // Canonical MeSH name + Entry Terms become axis synonyms.
+            // Dedup against the original to avoid pathological
+            // `(ALOX15 OR ALOX15)` clauses in L1 query building.
+            let mut synonyms: Vec<String> = Vec::new();
+            if !canonical_name.is_empty()
+                && !canonical_name.eq_ignore_ascii_case(term)
+            {
+                synonyms.push(canonical_name);
+            }
+            for et in entry_terms {
+                if !et.eq_ignore_ascii_case(term) && !synonyms.iter().any(|s| s.eq_ignore_ascii_case(&et)) {
+                    synonyms.push(et);
+                }
+            }
+            out.synonyms = synonyms;
+
+            // Sibling expansion: take the first tree number, drop
+            // the last segment, esearch for that prefix. Skip if
+            // the term has no tree numbers (some chemicals have
+            // none) or if the tree is at the root (no parent).
+            if let Some(tree) = tree_numbers.first() {
+                if let Some(parent) = parent_tree(tree) {
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    match self.search_siblings(&parent).await {
+                        Ok(siblings) => {
+                            // Filter out the term itself (it's the
+                            // tree's exact match) and any duplicate
+                            // of canonical_name / synonyms.
+                            out.siblings = siblings
+                                .into_iter()
+                                .filter(|s| {
+                                    !s.eq_ignore_ascii_case(term)
+                                        && !out.synonyms.iter()
+                                            .any(|x| x.eq_ignore_ascii_case(s))
+                                })
+                                .collect();
+                        }
+                        Err(e) => {
+                            out.error = Some(format!(
+                                "sibling search failed for tree '{parent}': {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+
+            out
+        }
+
+        /// esearch db=mesh by free-text term → returns the first UID
+        /// (PubMed's term-mapping picks the most relevant match).
+        async fn lookup_uid(&self, term: &str) -> anyhow::Result<Option<String>> {
+            let resp = self
+                .http
+                .get(NCBI_ESEARCH_BASE)
+                .query(&[
+                    ("db", "mesh"),
+                    ("term", term),
+                    ("retmode", "json"),
+                    ("retmax", "1"),
+                ])
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                anyhow::bail!("HTTP {status}: {body}");
+            }
+            let parsed: Value = serde_json::from_str(&body)?;
+            let uid = parsed
+                .get("esearchresult")
+                .and_then(|r| r.get("idlist"))
+                .and_then(|l| l.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Ok(uid)
+        }
+
+        /// efetch db=mesh by UID → returns the labeled-section text
+        /// blob NCBI emits as the "xml" retmode for the mesh DB.
+        async fn fetch_record(&self, uid: &str) -> anyhow::Result<String> {
+            let resp = self
+                .http
+                .get(NCBI_EFETCH_BASE)
+                .query(&[("db", "mesh"), ("id", uid), ("retmode", "xml")])
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                anyhow::bail!("HTTP {status}: {body}");
+            }
+            Ok(body)
+        }
+
+        /// Resolve siblings of a parent tree number. Returns the
+        /// MeSH descriptor names of all immediate children of the
+        /// parent (which includes the original term — caller filters).
+        async fn search_siblings(&self, parent_tree: &str) -> anyhow::Result<Vec<String>> {
+            // esearch returns UIDs; we then need efetch to get names.
+            // To keep this cheap, we cap retmax at 12 — a node with
+            // more than ~10 immediate siblings is usually too coarse
+            // to be a useful neighborhood (e.g. drug classes).
+            let resp = self
+                .http
+                .get(NCBI_ESEARCH_BASE)
+                .query(&[
+                    ("db", "mesh"),
+                    ("term", &format!("{parent_tree}[Tree Number]")),
+                    ("retmode", "json"),
+                    ("retmax", "12"),
+                ])
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                anyhow::bail!("HTTP {status}: {body}");
+            }
+            let parsed: Value = serde_json::from_str(&body)?;
+            let uids: Vec<String> = parsed
+                .get("esearchresult")
+                .and_then(|r| r.get("idlist"))
+                .and_then(|l| l.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if uids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            // Batch-efetch all sibling UIDs in one call (comma-joined).
+            let resp = self
+                .http
+                .get(NCBI_EFETCH_BASE)
+                .query(&[
+                    ("db", "mesh"),
+                    ("id", &uids.join(",")),
+                    ("retmode", "xml"),
+                ])
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                anyhow::bail!("HTTP {status}: {body}");
+            }
+            // Multi-record response: each record starts with a line
+            // like "1: Cerebral Hemorrhage" / "2: Subarachnoid
+            // Hemorrhage". We only want the names.
+            Ok(parse_descriptor_names(&body))
+        }
+    }
+
+    /// Compute the parent tree number by dropping the last
+    /// dot-segment. `C14.907.253.573.200` → `Some("C14.907.253.573")`.
+    /// Tree numbers with no dot (top-level categories) return None.
+    fn parent_tree(tree: &str) -> Option<String> {
+        tree.rfind('.').map(|i| tree[..i].to_string())
+    }
+
+    /// True when MeSH's canonical name and the input term share at
+    /// least one alphanumeric token (case-insensitive, length ≥3).
+    /// Stop-words ("of", "the", "in") and short tokens are ignored
+    /// to avoid spurious matches. Used to detect polysemous
+    /// mis-mappings ("cell death" → "PD-L2 Ligand" shares no token
+    /// → flagged as miss).
+    pub(super) fn share_token(canonical: &str, input: &str) -> bool {
+        const STOPWORDS: &[&str] = &[
+            "the", "and", "of", "in", "for", "with", "to", "a", "an", "or",
+        ];
+        fn tokenize(s: &str) -> Vec<String> {
+            s.to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| t.len() >= 3 && !STOPWORDS.contains(t))
+                .map(|t| t.to_string())
+                .collect()
+        }
+        let a = tokenize(canonical);
+        let b = tokenize(input);
+        if b.is_empty() {
+            // Input is all stopwords / short tokens — refuse the
+            // expansion entirely. This shouldn't happen for real
+            // axis terms but we fail closed defensively.
+            return false;
+        }
+        if a.is_empty() {
+            // Canonical name has no real tokens (numeric-only
+            // chemical names rare but possible); allow through
+            // since we have no way to compare and downstream
+            // filters can catch noise.
+            return true;
+        }
+        a.iter().any(|t| b.contains(t))
+    }
+
+    /// Parse a MeSH efetch text blob. Returns
+    /// (canonical_descriptor_name, entry_terms, tree_numbers).
+    pub(super) fn parse_mesh_record(text: &str) -> (String, Vec<String>, Vec<String>) {
+        let mut name = String::new();
+        let mut entry_terms: Vec<String> = Vec::new();
+        let mut tree_numbers: Vec<String> = Vec::new();
+        let mut in_entry_terms = false;
+        for (i, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim_end();
+            // First line is `1: <Descriptor Name>` (1-indexed
+            // record number for multi-record responses).
+            if i == 0 {
+                if let Some(rest) = line.split_once(':').map(|(_, r)| r.trim()) {
+                    name = rest.to_string();
+                }
+                continue;
+            }
+            if line.starts_with("Tree Number(s):") {
+                let body = line.trim_start_matches("Tree Number(s):").trim();
+                tree_numbers = body
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                continue;
+            }
+            if line.trim() == "Entry Terms:" {
+                in_entry_terms = true;
+                continue;
+            }
+            if in_entry_terms {
+                let trimmed = line.trim();
+                // Entry Terms section ends at first blank line OR
+                // at a line that doesn't start with whitespace
+                // (the next labeled section starts flush-left).
+                if trimmed.is_empty() {
+                    in_entry_terms = false;
+                    continue;
+                }
+                if !line.starts_with(char::is_whitespace) {
+                    in_entry_terms = false;
+                    // fall through to other parsers
+                } else {
+                    entry_terms.push(trimmed.to_string());
+                    continue;
+                }
+            }
+        }
+        (name, entry_terms, tree_numbers)
+    }
+
+    /// Extract descriptor names from a multi-record efetch response.
+    /// Each record's first line is `<n>: <Name>`; capture the name.
+    pub(super) fn parse_descriptor_names(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for line in text.lines() {
+            // Match lines like "1: Cerebral Hemorrhage" or
+            // "10: Subarachnoid Hemorrhage" — number colon space name.
+            if let Some((prefix, rest)) = line.split_once(':') {
+                if prefix.trim().chars().all(|c| c.is_ascii_digit()) {
+                    let name = rest.trim();
+                    if !name.is_empty() {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parent_tree_drops_last_segment() {
+            assert_eq!(
+                parent_tree("C14.907.253.573.200"),
+                Some("C14.907.253.573".to_string())
+            );
+            assert_eq!(parent_tree("C14"), None);
+            assert_eq!(parent_tree(""), None);
+        }
+
+        #[test]
+        fn parse_mesh_record_extracts_entry_terms_and_tree() {
+            // Real efetch response shape (truncated for tests).
+            let blob = "1: Cerebral Hemorrhage\nBleeding into one or both CEREBRAL HEMISPHERES.\n\nTree Number(s): C10.228.140.300.535.200, C14.907.253.573.200\nEntry Terms:\n    Hemorrhage, Cerebral\n    Cerebral Hemorrhages\n    Intracerebral Hemorrhage\n    Cerebral Parenchymal Hemorrhage\n\n    All MeSH Categories\n";
+            let (name, entry_terms, tree_numbers) = parse_mesh_record(blob);
+            assert_eq!(name, "Cerebral Hemorrhage");
+            assert!(entry_terms.contains(&"Hemorrhage, Cerebral".to_string()));
+            assert!(entry_terms.contains(&"Intracerebral Hemorrhage".to_string()));
+            assert!(entry_terms.contains(&"Cerebral Parenchymal Hemorrhage".to_string()));
+            assert_eq!(tree_numbers.len(), 2);
+            assert!(tree_numbers.contains(&"C14.907.253.573.200".to_string()));
+        }
+
+        #[test]
+        fn parse_descriptor_names_handles_multi_record_response() {
+            let blob = "1: Cerebral Hemorrhage\nBlah blah\n\n2: Subarachnoid Hemorrhage\nMore blah\n\n3: Intracranial Hemorrhages, Hypertensive\n";
+            let names = parse_descriptor_names(blob);
+            assert_eq!(names.len(), 3);
+            assert_eq!(names[0], "Cerebral Hemorrhage");
+            assert_eq!(names[1], "Subarachnoid Hemorrhage");
+            assert_eq!(names[2], "Intracranial Hemorrhages, Hypertensive");
+        }
+
+        #[test]
+        fn parse_mesh_record_handles_missing_entry_terms() {
+            let blob = "1: ALOX15\nSome compound\n\nTree Number(s): D12.776.123\n";
+            let (name, entry_terms, tree_numbers) = parse_mesh_record(blob);
+            assert_eq!(name, "ALOX15");
+            assert!(entry_terms.is_empty());
+            assert_eq!(tree_numbers, vec!["D12.776.123".to_string()]);
+        }
+
+        #[test]
+        fn share_token_catches_polysemous_mismaps() {
+            // The exact live failure modes:
+            assert!(
+                !share_token("PD-L2 Ligand", "cell death"),
+                "share_token should reject 'cell death' → 'PD-L2 Ligand'"
+            );
+            assert!(
+                !share_token("AIFM2 protein, mouse", "ferroptosis"),
+                "share_token should reject 'ferroptosis' → 'AIFM2 protein'"
+            );
+            // Legitimate matches:
+            assert!(share_token("Cerebral Hemorrhage", "intracerebral hemorrhage"));
+            assert!(share_token("Ferroptosis", "ferroptosis"));
+            assert!(share_token("Neuron, Pacemaker", "neuron"));
+        }
+
+        #[test]
+        fn share_token_ignores_short_words_and_stopwords() {
+            // "the" and "of" alone don't trigger a match
+            assert!(!share_token("Diseases of the Liver", "Of the"));
+            // Short tokens (<3 chars) are ignored
+            assert!(!share_token("PD L2", "ID 12"));
+        }
     }
 }
 
@@ -351,6 +817,36 @@ struct TierResult {
     error: Option<String>,
 }
 
+/// Per-axis record of what Layer 2 (MeSH) added to the LLM's
+/// original axis term list. Surfaced in the report so the LLM
+/// can audit "did MeSH widen recall on the disease axis to
+/// include sibling diseases?" — and so failures are explicit
+/// rather than silent.
+#[derive(Debug, Clone, Default, Serialize)]
+struct AxisMeshAudit {
+    axis: String,
+    input_term: String,
+    added_synonyms: Vec<String>,
+    added_siblings: Vec<String>,
+    error: Option<String>,
+    total_added: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct MeshAudit {
+    enabled: bool,
+    per_axis: Vec<AxisMeshAudit>,
+}
+
+impl MeshAudit {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            per_axis: Vec::new(),
+        }
+    }
+}
+
 pub struct PriorArtExpandTool {
     http: reqwest::Client,
     /// Optional NCBI eutils API key. With key, NIH allows 10 req/s
@@ -368,6 +864,70 @@ impl PriorArtExpandTool {
             .build()
             .expect("reqwest client builds with default config");
         Self { http, api_key }
+    }
+
+    /// Layer 2: expand each axis term through MeSH (synonyms +
+    /// siblings). Returns the augmented dimensions and a per-axis
+    /// audit trail recording what MeSH added for transparency.
+    /// Errors per term are swallowed (logged into the audit) so a
+    /// MeSH outage degrades gracefully to L1-only behavior.
+    async fn expand_via_mesh(
+        &self,
+        original: &ClaimDimensions,
+    ) -> (ClaimDimensions, MeshAudit) {
+        let client = mesh::MeshClient::new(self.http.clone());
+        let mut audit = MeshAudit::default();
+        audit.enabled = true;
+
+        let mut out = original.clone();
+        // Expand each axis. Polite delay between terms is built
+        // into MeshClient (350ms between paired esearch+efetch).
+        for (axis_name, axis_terms) in [
+            ("molecule", &mut out.molecule),
+            ("disease", &mut out.disease),
+            ("mechanism", &mut out.mechanism),
+            ("cell_type", &mut out.cell_type),
+            ("outcome", &mut out.outcome),
+            ("model", &mut out.model),
+            ("intervention", &mut out.intervention),
+        ] {
+            if axis_terms.is_empty() {
+                continue;
+            }
+            // To bound API cost, expand only the first term per axis.
+            // The remaining terms are kept verbatim. The first term
+            // is canonically the most-specific synonym (the LLM is
+            // instructed to put the canonical name first); MeSH's
+            // sibling expansion off that anchor catches the
+            // cross-disease neighbors that matter.
+            let primary = axis_terms[0].clone();
+            let expansion = client.expand_term(&primary).await;
+
+            let mut added: Vec<String> = Vec::new();
+            for syn in &expansion.synonyms {
+                if !axis_terms.iter().any(|t| t.eq_ignore_ascii_case(syn)) {
+                    axis_terms.push(syn.clone());
+                    added.push(syn.clone());
+                }
+            }
+            for sib in &expansion.siblings {
+                if !axis_terms.iter().any(|t| t.eq_ignore_ascii_case(sib)) {
+                    axis_terms.push(sib.clone());
+                    added.push(sib.clone());
+                }
+            }
+
+            audit.per_axis.push(AxisMeshAudit {
+                axis: axis_name.into(),
+                input_term: primary,
+                added_synonyms: expansion.synonyms,
+                added_siblings: expansion.siblings,
+                error: expansion.error,
+                total_added: added.len(),
+            });
+        }
+
+        (out, audit)
     }
 
     /// Execute one PubMed eSearch with up to 2 retries on HTTP 429
@@ -541,32 +1101,105 @@ impl PriorArtExpandTool {
 
     fn render_report(
         claim: &str,
-        dim: &ClaimDimensions,
+        original_dim: &ClaimDimensions,
+        expanded_dim: &ClaimDimensions,
+        mesh_audit: &MeshAudit,
         tiers: &[TierResult],
         verdict: &BlankClaimVerdict,
     ) -> String {
         use std::fmt::Write;
         let mut out = String::new();
 
-        let _ = writeln!(out, "# Prior Art Neighborhood Expansion (Layer 1)\n");
+        let _ = writeln!(
+            out,
+            "# Prior Art Neighborhood Expansion (Layer 1{})\n",
+            if mesh_audit.enabled { " + 2" } else { "" }
+        );
         let _ = writeln!(out, "**Claim**: {claim}\n");
 
         // Dimension echo so the LLM can audit its own decomposition.
-        let _ = writeln!(out, "## Decomposed axes\n");
+        // Show the expanded version (what queries actually used) so the
+        // tier breakdown below makes sense to the reader.
+        let _ = writeln!(out, "## Decomposed axes (post-expansion)\n");
         let _ = writeln!(out, "| axis | terms |");
         let _ = writeln!(out, "|------|-------|");
-        let _ = writeln!(out, "| molecule | {} |", dim.molecule.join(", "));
-        let _ = writeln!(out, "| disease | {} |", dim.disease.join(", "));
-        let _ = writeln!(out, "| mechanism | {} |", dim.mechanism.join(", "));
-        let _ = writeln!(out, "| cell_type | {} |", dim.cell_type.join(", "));
-        let _ = writeln!(out, "| outcome | {} |", dim.outcome.join(", "));
-        if !dim.model.is_empty() {
-            let _ = writeln!(out, "| model | {} |", dim.model.join(", "));
+        let _ = writeln!(out, "| molecule | {} |", expanded_dim.molecule.join(", "));
+        let _ = writeln!(out, "| disease | {} |", expanded_dim.disease.join(", "));
+        let _ = writeln!(out, "| mechanism | {} |", expanded_dim.mechanism.join(", "));
+        let _ = writeln!(out, "| cell_type | {} |", expanded_dim.cell_type.join(", "));
+        let _ = writeln!(out, "| outcome | {} |", expanded_dim.outcome.join(", "));
+        if !expanded_dim.model.is_empty() {
+            let _ = writeln!(out, "| model | {} |", expanded_dim.model.join(", "));
         }
-        if !dim.intervention.is_empty() {
-            let _ = writeln!(out, "| intervention | {} |", dim.intervention.join(", "));
+        if !expanded_dim.intervention.is_empty() {
+            let _ = writeln!(
+                out,
+                "| intervention | {} |",
+                expanded_dim.intervention.join(", ")
+            );
         }
         let _ = writeln!(out);
+
+        // L2 audit: per-axis MeSH expansion record. Only emit when L2
+        // ran (otherwise the section is noise).
+        if mesh_audit.enabled {
+            let total_added: usize =
+                mesh_audit.per_axis.iter().map(|a| a.total_added).sum();
+            let _ = writeln!(out, "## Layer 2: MeSH ontology expansion\n");
+            let _ = writeln!(
+                out,
+                "MeSH expansion added **{total_added} term(s)** across {} axes (synonyms + tree siblings of the primary axis term).\n",
+                mesh_audit.per_axis.len()
+            );
+            let _ = writeln!(out, "| axis | input | added synonyms | added siblings | error |");
+            let _ = writeln!(out, "|------|-------|----------------|----------------|-------|");
+            for a in &mesh_audit.per_axis {
+                let syn = if a.added_synonyms.is_empty() {
+                    "_(none)_".to_string()
+                } else {
+                    a.added_synonyms.join(", ")
+                };
+                let sib = if a.added_siblings.is_empty() {
+                    "_(none)_".to_string()
+                } else {
+                    a.added_siblings.join(", ")
+                };
+                let err = a
+                    .error
+                    .as_deref()
+                    .map(|e| format!("⚠️ {e}"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} |",
+                    a.axis, a.input_term, syn, sib, err
+                );
+            }
+            let _ = writeln!(out);
+
+            // Surface what the LLM ORIGINALLY decomposed, so reviewers
+            // can confirm L2 only widened recall and didn't replace
+            // the LLM's choices.
+            let _ = writeln!(out, "<details><summary>Original LLM-decomposed axes (pre-expansion)</summary>\n");
+            let _ = writeln!(out, "| axis | terms |");
+            let _ = writeln!(out, "|------|-------|");
+            let _ = writeln!(out, "| molecule | {} |", original_dim.molecule.join(", "));
+            let _ = writeln!(out, "| disease | {} |", original_dim.disease.join(", "));
+            let _ = writeln!(out, "| mechanism | {} |", original_dim.mechanism.join(", "));
+            let _ = writeln!(out, "| cell_type | {} |", original_dim.cell_type.join(", "));
+            let _ = writeln!(out, "| outcome | {} |", original_dim.outcome.join(", "));
+            if !original_dim.model.is_empty() {
+                let _ = writeln!(out, "| model | {} |", original_dim.model.join(", "));
+            }
+            if !original_dim.intervention.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "| intervention | {} |",
+                    original_dim.intervention.join(", ")
+                );
+            }
+            let _ = writeln!(out, "\n</details>\n");
+        }
 
         // Verdict comes first — this is the deterministic gate the SOP
         // step 5 prompt acts on.
@@ -674,11 +1307,12 @@ impl Tool for PriorArtExpandTool {
         let dim_value = args
             .get("dimensions")
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: dimensions"))?;
-        let dim: ClaimDimensions = serde_json::from_value(dim_value.clone()).map_err(|e| {
-            anyhow::anyhow!("dimensions field could not be parsed as ClaimDimensions: {e}")
-        })?;
+        let original_dim: ClaimDimensions = serde_json::from_value(dim_value.clone())
+            .map_err(|e| {
+                anyhow::anyhow!("dimensions field could not be parsed as ClaimDimensions: {e}")
+            })?;
 
-        if !dim.required_axes_present() {
+        if !original_dim.required_axes_present() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -686,15 +1320,32 @@ impl Tool for PriorArtExpandTool {
                     "dimensions is missing required axes: {:?}. SOP step 5 must populate \
                      molecule, disease, mechanism, cell_type, outcome before calling \
                      prior_art_expand.",
-                    dim.missing_required()
+                    original_dim.missing_required()
                 )),
             });
         }
 
+        // Layer 2: MeSH ontology expansion. Default ON because the
+        // failure mode this fixes (recall on alternative phrasings)
+        // is the v_zhang case's path to catching SAH / cerebral
+        // infarction. Disable via `enable_mesh_expansion: false`
+        // for tests that want to isolate L1 behavior.
+        let enable_mesh = args
+            .get("enable_mesh_expansion")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let (dim, mesh_audit) = if enable_mesh {
+            self.expand_via_mesh(&original_dim).await
+        } else {
+            (original_dim.clone(), MeshAudit::disabled())
+        };
+
         let queries = build_queries(&dim);
         let tiers = self.run_all_tiers(&queries).await;
         let verdict = Self::assess_blank_claim(&tiers);
-        let report = Self::render_report(&claim, &dim, &tiers, &verdict);
+        let report =
+            Self::render_report(&claim, &original_dim, &dim, &mesh_audit, &tiers, &verdict);
 
         Ok(ToolResult {
             success: true,
@@ -963,8 +1614,15 @@ mod tests {
             rationale: "T1 returned 1".into(),
             sample_neighbor_pmids: vec!["12345".into()],
         };
-        let r =
-            PriorArtExpandTool::render_report("ALOX15 in ICH ferroptosis", &dim, &tiers, &verdict);
+        let mesh = MeshAudit::disabled();
+        let r = PriorArtExpandTool::render_report(
+            "ALOX15 in ICH ferroptosis",
+            &dim,
+            &dim,
+            &mesh,
+            &tiers,
+            &verdict,
+        );
         assert!(r.contains("# Prior Art Neighborhood Expansion (Layer 1)"));
         assert!(r.contains("**Claim**: ALOX15 in ICH ferroptosis"));
         assert!(r.contains("## Decomposed axes"));
@@ -973,6 +1631,42 @@ mod tests {
         assert!(r.contains("## Tier breakdown"));
         assert!(r.contains("## Queries used (for audit)"));
         assert!(r.contains("ALOX15[tiab] AND ICH[tiab]"));
+        // Mesh disabled → no L2 section header.
+        assert!(!r.contains("## Layer 2: MeSH ontology expansion"));
+    }
+
+    #[test]
+    fn render_report_with_mesh_includes_layer_2_section() {
+        let dim = dim_full();
+        let tiers = vec![TierResult {
+            label: "T1".into(),
+            description: "5-axis".into(),
+            query: "...".into(),
+            pmids: vec![],
+            error: None,
+        }];
+        let verdict = BlankClaimVerdict {
+            verdict: "ok_to_claim_blank".into(),
+            rationale: "all zero".into(),
+            sample_neighbor_pmids: vec![],
+        };
+        let mesh = MeshAudit {
+            enabled: true,
+            per_axis: vec![AxisMeshAudit {
+                axis: "disease".into(),
+                input_term: "ICH".into(),
+                added_synonyms: vec!["Cerebral Hemorrhage".into()],
+                added_siblings: vec!["Subarachnoid Hemorrhage".into()],
+                error: None,
+                total_added: 2,
+            }],
+        };
+        let r = PriorArtExpandTool::render_report("x", &dim, &dim, &mesh, &tiers, &verdict);
+        assert!(r.contains("Layer 1 + 2"));
+        assert!(r.contains("## Layer 2: MeSH ontology expansion"));
+        assert!(r.contains("Cerebral Hemorrhage"));
+        assert!(r.contains("Subarachnoid Hemorrhage"));
+        assert!(r.contains("Original LLM-decomposed axes"));
     }
 
     #[test]
@@ -990,7 +1684,9 @@ mod tests {
             rationale: "all zero".into(),
             sample_neighbor_pmids: vec![],
         };
-        let r = PriorArtExpandTool::render_report("x", &dim, &tiers, &verdict);
+        let mesh = MeshAudit::disabled();
+        let r =
+            PriorArtExpandTool::render_report("x", &dim, &dim, &mesh, &tiers, &verdict);
         assert!(r.contains("_(error)_"));
         assert!(r.contains("HTTP 502"));
     }
