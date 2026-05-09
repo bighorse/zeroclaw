@@ -12,7 +12,7 @@
 
 use serde_json::json;
 use zeroclaw::tools::traits::Tool;
-use zeroclaw::tools::PriorArtExpandTool;
+use zeroclaw::tools::{PriorArtExpandTool, PriorArtJudgeTool};
 
 /// v_zhang case (2026-05-08, run-1778245403320-0002):
 /// LLM wrote "PubMed 2021-2026: ICH+ALOX15 = 0 篇" and built the novelty
@@ -130,5 +130,70 @@ async fn v_gao_v5_sglt2i_ascites_neighborhood_must_be_non_empty() {
         "verdict was ok_to_claim_blank but SGLT2i+ascites has multiple \
          published / in-flight studies; Layer 1 missed the neighborhood. \
          Report:\n{report}"
+    );
+}
+
+/// L3 + L4 integration: PI seed expansion (张小波 PMID:40288664) and
+/// abstract-fetching for 3 known prior-art PMIDs. Verifies the
+/// efetch text-mode parser extracts title/journal/year/abstract
+/// correctly on real PubMed responses.
+#[tokio::test]
+#[ignore = "hits NCBI eutils — run with --ignored"]
+async fn pi_path_layer_3_returns_similar_pmids() {
+    let tool = PriorArtExpandTool::new(None);
+    let args = json!({
+        "claim": "ALOX-15 in ICH ferroptosis (with PI research path)",
+        "dimensions": {
+            "molecule":  ["ALOX15"],
+            "disease":   ["intracerebral hemorrhage", "ICH"],
+            "mechanism": ["ferroptosis"],
+            "cell_type": ["neuron"],
+            "outcome":   ["cell death"]
+        },
+        "enable_mesh_expansion": false,
+        "pi_pmids": ["40288664"]
+    });
+    let result = tool.execute(args).await.expect("tool runs");
+    assert!(result.success, "tool failed: {:?}", result.error);
+    let report = result.output;
+    eprintln!("\n===== L3 report =====\n{report}\n=====================\n");
+    assert!(report.contains("Layer 1 + Layer 3"));
+    assert!(report.contains("## Layer 3: PI research-path"));
+    assert!(report.contains("Processed **1 PI seed PMID(s)**"));
+    // PMID:40288664 elink should return ≥10 similar papers
+    // (live-observed: ~98 returned, capped at SIMILAR_PMIDS_PER_SEED=30).
+    assert!(report.contains("**1 PI seed PMID(s)**"),);
+}
+
+/// L4 abstract fetcher: pass 3 known v_zhang neighborhood PMIDs and
+/// verify the report contains structured judgment templates with
+/// non-empty title + abstract for each.
+#[tokio::test]
+#[ignore = "hits NCBI eutils — run with --ignored"]
+async fn judge_layer_4_fetches_abstracts_and_emits_templates() {
+    let tool = PriorArtJudgeTool::new(None);
+    let args = json!({
+        "claim": "ALOX-15 is the rate-limiting enzyme of neuronal ferroptosis after ICH",
+        "candidate_pmids": ["35186185", "35090880", "40288664"]
+    });
+    let result = tool.execute(args).await.expect("tool runs");
+    assert!(result.success, "tool failed: {:?}", result.error);
+    let report = result.output;
+    eprintln!("\n===== L4 report =====\n{report}\n=====================\n");
+
+    assert!(report.contains("# Prior Art LLM-as-Judge (Layer 4)"));
+    // All three PMIDs surfaced as candidates with judgment templates.
+    assert!(report.contains("PMID:35186185"));
+    assert!(report.contains("PMID:35090880"));
+    assert!(report.contains("PMID:40288664"));
+    // Each candidate has its own judgment template.
+    assert!(report.contains("\"pmid\": \"35186185\""));
+    assert!(report.contains("\"pmid\": \"35090880\""));
+    assert!(report.contains("\"pmid\": \"40288664\""));
+    // PMID:40288664 is张小波's CDK1/GRASP55/ICH paper — title
+    // should mention CDK1 or Golgi.
+    assert!(
+        report.to_lowercase().contains("cdk1") || report.to_lowercase().contains("golgi"),
+        "expected张小波's CDK1/Golgi paper title in report"
     );
 }

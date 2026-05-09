@@ -522,12 +522,11 @@ mod mesh {
                     in_entry_terms = false;
                     continue;
                 }
-                if !line.starts_with(char::is_whitespace) {
+                if line.starts_with(char::is_whitespace) {
+                    entry_terms.push(trimmed.to_string());
+                } else {
                     in_entry_terms = false;
                     // fall through to other parsers
-                } else {
-                    entry_terms.push(trimmed.to_string());
-                    continue;
                 }
             }
         }
@@ -1044,7 +1043,7 @@ impl PriorArtExpandTool {
         audit.seeds_capped = pi_pmids.len() > MAX_PI_PMIDS;
 
         let client = pi_path::ElinkClient::new(self.http.clone());
-        let mut union: std::collections::BTreeSet<String> = Default::default();
+        let mut union: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
         for (i, seed) in seeds.iter().enumerate() {
             if i > 0 {
