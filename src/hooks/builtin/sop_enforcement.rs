@@ -87,6 +87,57 @@ const STEP8_GATE_TOOL: &str = "sop_advance";
 /// Typical full立项 reports are 25-35KB after merging chapter files.
 const STEP8_PROPOSAL_MIN_BYTES: u64 = 20 * 1024;
 
+/// Per-chapter minimum sizes for the prerequisites diagnostic (A-fix
+/// for the 2026-05-09 v_zhang dedup-stuck case). When Gate 1 rejects
+/// a step 8 sop_advance, we list each chapter file's status against
+/// these thresholds so the LLM has actionable repair signal instead
+/// of just "size gate" → loop → dedup abort. Numbers are calibrated
+/// from the gao_yuan / li_juanmei completed runs (median chapter
+/// sizes were 8-15KB; we set thresholds at the 25th percentile so
+/// "barely complete" still passes).
+const CHAPTER_CHECKS: &[(&str, u64)] = &[
+    ("pi_intel.md", 6 * 1024),
+    ("disease_scan.md", 8 * 1024),
+    ("hypotheses.md", 10 * 1024),
+    ("technical_route.md", 6 * 1024),
+    ("budget.md", 4 * 1024),
+    ("output_matching.md", 4 * 1024),
+    ("pm_review.md", 3 * 1024),
+];
+
+#[derive(Debug)]
+enum ChapterStatus {
+    Missing,
+    Undersized { actual: u64, required: u64 },
+    Ok { size: u64 },
+}
+
+#[derive(Debug)]
+struct ChapterDiag {
+    file: &'static str,
+    status: ChapterStatus,
+}
+
+impl ChapterDiag {
+    fn render_line(&self) -> String {
+        match &self.status {
+            ChapterStatus::Missing => format!("  ❌ MISSING:    {}", self.file),
+            ChapterStatus::Undersized { actual, required } => format!(
+                "  ⚠️  UNDERSIZED: {} ({} bytes < required {})",
+                self.file, actual, required
+            ),
+            ChapterStatus::Ok { size } => format!("  ✅ ok ({} bytes): {}", size, self.file),
+        }
+    }
+
+    fn is_blocker(&self) -> bool {
+        matches!(
+            self.status,
+            ChapterStatus::Missing | ChapterStatus::Undersized { .. }
+        )
+    }
+}
+
 /// Glob pattern for step 8 deliverable proposal.md files. Matches
 /// PharmaClaw `jl-insight-research-proposal` convention:
 /// `case_library/insight/<pi_name>/<date>_proposal.md` and variants
@@ -154,6 +205,51 @@ impl SopEnforcementHook {
         }
     }
 
+    /// Diagnostic helper: pick the most-recently-modified case dir
+    /// under `case_library/insight/*/` and return per-chapter status
+    /// against [`CHAPTER_CHECKS`]. The most-recent dir is the active
+    /// case (Step 1 always writes pi_intel.md first), so this is a
+    /// reliable signal even when the bot hasn't yet created
+    /// proposal.md. Used to convert Gate 1's "size gate" reject into
+    /// actionable "missing/undersized files X, Y, Z" diagnosis so
+    /// the bot can pivot instead of looping into the dedup abort.
+    fn diagnose_case_dir(&self) -> Option<(PathBuf, Vec<ChapterDiag>)> {
+        use std::time::SystemTime;
+        let case_glob = self.workspace_dir.join("case_library/insight/*/");
+        let case_glob_str = case_glob.to_string_lossy();
+        let mut candidates: Vec<(PathBuf, SystemTime)> = match glob::glob(&case_glob_str) {
+            Ok(g) => g
+                .flatten()
+                .filter(|p| p.is_dir())
+                .filter_map(|p| {
+                    std::fs::metadata(&p)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| (p, t))
+                })
+                .collect(),
+            Err(_) => return None,
+        };
+        candidates.sort_by_key(|(_, t)| *t);
+        let case_dir = candidates.last()?.0.clone();
+
+        let mut diags: Vec<ChapterDiag> = Vec::with_capacity(CHAPTER_CHECKS.len());
+        for (name, min_bytes) in CHAPTER_CHECKS {
+            let path = case_dir.join(name);
+            let size = std::fs::metadata(&path).ok().map(|m| m.len());
+            let status = match size {
+                None => ChapterStatus::Missing,
+                Some(s) if s < *min_bytes => ChapterStatus::Undersized {
+                    actual: s,
+                    required: *min_bytes,
+                },
+                Some(s) => ChapterStatus::Ok { size: s },
+            };
+            diags.push(ChapterDiag { file: name, status });
+        }
+        Some((case_dir, diags))
+    }
+
     /// Returns `Some((run_id, status))` summary if there is at least one
     /// SOP run in a live state (`Pending` / `Running` / `WaitingApproval`
     /// / `PausedCheckpoint`); `None` otherwise. We snapshot under the
@@ -176,8 +272,16 @@ impl SopEnforcementHook {
     }
 
     /// Returns `Some((run_id, sop_name, current_step))` for the live run
-    /// if its `sop_name` is in [`STEP8_GATED_SOPS`] and `current_step ==
+    /// if its `sop_name` is in [`STEP8_GATED_SOPS`] and `current_step >=
     /// 8`. Used by the step 8 size gate.
+    ///
+    /// Why `>= 8` (2026-05-09 v_ma_yiming bypass fix): the original
+    /// `== 8` guard let the LLM bypass the gate by sop_advance'ing past
+    /// step 8 with an empty/undersized proposal.md and then writing the
+    /// final proposal.md during step 9-11 archival. Once the run was
+    /// past step 8 the gate could never re-arm. Expanding to `>= 8`
+    /// means every sop_advance from step 8 onward (including the final
+    /// step 11 → completed transition) re-checks proposal.md size.
     fn snapshot_step8_gated_run(&self) -> Option<(String, String, u32)> {
         let engine = self.engine.lock().ok()?;
         engine
@@ -185,26 +289,37 @@ impl SopEnforcementHook {
             .values()
             .find(|r| {
                 matches!(r.status, SopRunStatus::Running)
-                    && r.current_step == 8
+                    && r.current_step >= 8
                     && STEP8_GATED_SOPS.contains(&r.sop_name.as_str())
             })
             .map(|r| (r.run_id.clone(), r.sop_name.clone(), r.current_step))
     }
 
-    /// If the call is `sop_advance status=completed` while a step-8-gated
-    /// SOP run is at step 8, glob for the latest `*proposal.md` and
-    /// require its size to be at least [`STEP8_PROPOSAL_MIN_BYTES`].
-    /// Returns `Some(cancel_message)` if the gate should fire,
-    /// `None` if the call should pass through.
+    /// If the call is `sop_advance` (status `completed` or `skipped`) while a
+    /// step-8-gated SOP run is at step 8 or beyond, glob for the latest
+    /// `*proposal.md` and require its size to be at least
+    /// [`STEP8_PROPOSAL_MIN_BYTES`]. Returns `Some(cancel_message)` if the
+    /// gate should fire, `None` if the call should pass through.
+    ///
+    /// Why `skipped` is also gated (2026-05-09 v_ma_yiming bypass fix): the
+    /// original guard only checked `status == "completed"`, so the LLM could
+    /// bypass the gate by calling `sop_advance status=skipped` at step 8 and
+    /// then writing a small proposal.md during the archival phase. `failed`
+    /// is the only escape hatch left because it terminates the entire run as
+    /// `SopRunStatus::Failed` — that's the legitimate "this SOP cannot
+    /// produce a deliverable" path, not the "skip the size check" path.
     fn check_step8_size_gate(&self, name: &str, args: &Value) -> Option<String> {
         if name != STEP8_GATE_TOOL {
             return None;
         }
         let status = args.get("status").and_then(|v| v.as_str())?;
-        if status != "completed" {
+        if status == "failed" {
             return None;
         }
-        let (run_id, sop_name, _) = self.snapshot_step8_gated_run()?;
+        if status != "completed" && status != "skipped" {
+            return None;
+        }
+        let (run_id, sop_name, current_step) = self.snapshot_step8_gated_run()?;
 
         let glob_pattern_path = self.workspace_dir.join(STEP8_PROPOSAL_GLOB);
         let glob_pattern_str = glob_pattern_path.to_string_lossy();
@@ -214,17 +329,55 @@ impl SopEnforcementHook {
         };
 
         if proposals.is_empty() {
+            // Diagnose what's actually present in the active case dir
+            // so the LLM can repair specifically rather than retry the
+            // same sop_advance call (the recurring 2026-05-09 v_zhang
+            // dedup-abort failure mode).
+            let diagnosis = match self.diagnose_case_dir() {
+                Some((case_dir, diags)) => {
+                    let chapter_lines: Vec<String> =
+                        diags.iter().map(|d| d.render_line()).collect();
+                    let blockers: Vec<&str> = diags
+                        .iter()
+                        .filter(|d| d.is_blocker())
+                        .map(|d| d.file)
+                        .collect();
+                    format!(
+                        "Active case dir: `{case}`\n\n\
+                         Chapter file status (each step's required output):\n{lines}\n\n\
+                         📋 BLOCKERS — file_write these BEFORE retrying sop_advance:\n  {blockers}",
+                        case = case_dir.display(),
+                        lines = chapter_lines.join("\n"),
+                        blockers = if blockers.is_empty() {
+                            "(none — only proposal.md missing)".to_string()
+                        } else {
+                            blockers.join(", ")
+                        },
+                    )
+                }
+                None => "(could not locate active case dir)".to_string(),
+            };
+
             return Some(format!(
                 "🚫 SOP step 8 size gate: no `*proposal.md` found under `{glob_pattern}`.\n\n\
-                 Active run `{run_id}` (`{sop_name}`) is at step 8 (报告组装) and you called \
-                 `sop_advance status=completed`, but no merged proposal.md exists yet.\n\n\
-                 Step 8 must produce a single final `case_library/insight/<pi_name>/<date>_proposal.md` \
-                 ≥{min_kb}KB (typical 25-35KB) by merging the chapter files \
-                 (pi_intel.md / disease_scan.md / hypotheses.md / technical_route.md / \
-                 budget.md / output_matching.md / pm_review.md).\n\n\
-                 To proceed: file_write the merged proposal.md, then re-call sop_advance.",
+                 Active run `{run_id}` (`{sop_name}`) is at step {current_step} (step 8 报告组装 is \
+                 the deliverable producer) and you called `sop_advance status={status}`, but no \
+                 merged proposal.md exists yet.\n\n\
+                 {diagnosis}\n\n\
+                 ▶️  REPAIR PLAN (do these in order, do NOT retry sop_advance until done):\n\
+                 1. For each MISSING / UNDERSIZED chapter above, file_write its content. The \
+                    chapter sizes you wrote in earlier steps did not pass; reopen and expand them.\n\
+                 2. After all chapters are ✅, file_write the merged proposal.md \
+                    (`case_library/insight/<pi_name>/<date>_proposal.md`, ≥{min_kb}KB, typical \
+                    25-35KB) by combining the 7 chapter files.\n\
+                 3. Then re-call sop_advance status=completed.\n\n\
+                 ⚠️ Calling sop_advance with the same args without doing the above will trigger \
+                 the agent dedup detector and abort the conversation. The fix is content, not retry.",
                 glob_pattern = glob_pattern_str,
                 min_kb = STEP8_PROPOSAL_MIN_BYTES / 1024,
+                diagnosis = diagnosis,
+                current_step = current_step,
+                status = status,
             ));
         }
 
@@ -244,31 +397,65 @@ impl SopEnforcementHook {
             return None;
         }
 
+        // Same actionable-diagnosis logic as the no-proposal branch:
+        // list each chapter's status so the LLM can identify which
+        // ones are still under-sized and need expansion before the
+        // proposal.md merge will pass.
+        let diagnosis = match self.diagnose_case_dir() {
+            Some((_case_dir, diags)) => {
+                let chapter_lines: Vec<String> = diags.iter().map(|d| d.render_line()).collect();
+                let blockers: Vec<&str> = diags
+                    .iter()
+                    .filter(|d| d.is_blocker())
+                    .map(|d| d.file)
+                    .collect();
+                format!(
+                    "Chapter file status:\n{lines}\n\n\
+                     📋 Likely root cause: the missing/undersized chapters were never written or \
+                     are stubs. Repair sequence: {blockers_or_done}",
+                    lines = chapter_lines.join("\n"),
+                    blockers_or_done = if blockers.is_empty() {
+                        "all chapters look fine — proposal.md just needs a fuller merge \
+                         (cat the chapter files together to reach ≥20KB)."
+                            .to_string()
+                    } else {
+                        format!(
+                            "expand {} first, then re-merge into proposal.md.",
+                            blockers.join(" + ")
+                        )
+                    },
+                )
+            }
+            None => "(could not locate active case dir)".to_string(),
+        };
+
         Some(format!(
             "🚫 SOP step 8 size gate: latest `proposal.md` is too small.\n\n\
              • Path:     `{path}`\n\
              • Size:     {size} bytes\n\
              • Required: ≥{required} bytes (≈{min_kb}KB, typical 25-35KB)\n\
-             • Run:      `{run_id}` (`{sop_name}`, step 8)\n\n\
+             • Run:      `{run_id}` (`{sop_name}`, step {current_step})\n\n\
+             {diagnosis}\n\n\
              This is a recurring V4-V11 bug: the LLM treats the chapter files \
              (pi_intel.md / disease_scan.md / hypotheses.md / technical_route.md / \
              budget.md / output_matching.md / pm_review.md, ~67KB combined) as \
              'report assembled', producing only a 4-5KB index proposal.md that \
              points at the chapter files instead of merging them. PI delivery \
              experience: 'this looks unfinished'.\n\n\
-             To proceed:\n\
-             • file_write parts (`part1.md` / `part2.md` / `part3.md`) under \
-               `case_library/insight/<pi_name>/`.\n\
-             • shell `cat case_library/insight/<pi_name>/part*.md > \
-               case_library/insight/<pi_name>/<date>_proposal.md`.\n\
-             • Re-call `sop_advance status=completed` once the merged \
-               proposal.md is ≥{min_kb}KB.",
+             ▶️  To proceed:\n\
+             • For each ❌ MISSING or ⚠️ UNDERSIZED chapter above, file_write its content first.\n\
+             • Then file_write the merged proposal.md by combining all 7 chapters.\n\
+             • Re-call `sop_advance status=completed` once the merged proposal.md is ≥{min_kb}KB.\n\n\
+             ⚠️ Retrying sop_advance with the same args without writing the missing files will \
+             trigger the agent dedup detector and abort the conversation. The fix is content, not retry.",
             path = latest.display(),
             size = size,
             required = STEP8_PROPOSAL_MIN_BYTES,
             min_kb = STEP8_PROPOSAL_MIN_BYTES / 1024,
             run_id = run_id,
             sop_name = sop_name,
+            current_step = current_step,
+            diagnosis = diagnosis,
         ))
     }
 
@@ -776,6 +963,122 @@ mod tests {
                 assert!(msg.contains("no `*proposal.md` found"), "msg: {msg}");
             }
             HookResult::Continue(_) => panic!("expected Cancel when no proposal exists"),
+        }
+    }
+
+    /// 2026-05-09 v_zhang regression: Gate 1 reject must list each
+    /// chapter file's MISSING / UNDERSIZED / OK status so the LLM can
+    /// repair specifically instead of looping into dedup-abort. The
+    /// previous reject message just said "size gate" → bot reissued
+    /// the same sop_advance call → dedup detector aborted the turn.
+    #[tokio::test]
+    async fn step8_size_gate_reject_lists_missing_chapters() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Active case dir has only pi_intel.md, all other chapters
+        // missing — the exact 2026-05-09 v_zhang state.
+        let case_dir = tmp.path().join("case_library/insight/zhang_xiaobo");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        std::fs::write(case_dir.join("pi_intel.md"), "x".repeat(8 * 1024)).unwrap();
+        let _cwd = CwdGuard::enter(tmp.path());
+
+        let hook = test_hook(
+            cfg(true, &["case_library/"]),
+            engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
+        );
+        let result = hook
+            .before_tool_call(
+                "sop_advance".into(),
+                json!({"status": "completed", "output": "proposal done"}),
+            )
+            .await;
+        match result {
+            HookResult::Cancel(msg) => {
+                // Must enumerate each missing chapter so the LLM
+                // knows exactly what to file_write before retrying.
+                assert!(
+                    msg.contains("disease_scan.md"),
+                    "missing disease_scan in msg: {msg}"
+                );
+                assert!(
+                    msg.contains("hypotheses.md"),
+                    "missing hypotheses in msg: {msg}"
+                );
+                assert!(
+                    msg.contains("technical_route.md"),
+                    "missing technical_route in msg: {msg}"
+                );
+                assert!(msg.contains("budget.md"), "missing budget in msg: {msg}");
+                assert!(
+                    msg.contains("output_matching.md"),
+                    "missing output_matching in msg: {msg}"
+                );
+                // Must explicitly mark them as MISSING (not just listed)
+                assert!(
+                    msg.contains("MISSING"),
+                    "expected MISSING marker in diagnosis: {msg}"
+                );
+                // Must show the OK chapter (pi_intel.md) too so the
+                // LLM doesn't redundantly rewrite it.
+                assert!(
+                    msg.contains("pi_intel.md"),
+                    "msg should list pi_intel: {msg}"
+                );
+                // Must include the case dir path so the LLM knows
+                // where to write.
+                assert!(
+                    msg.contains("zhang_xiaobo"),
+                    "expected case dir path in msg: {msg}"
+                );
+                // Must explicitly warn against retrying the same
+                // sop_advance (dedup abort prevention).
+                assert!(
+                    msg.contains("dedup") || msg.contains("retry"),
+                    "expected dedup/retry warning in msg: {msg}"
+                );
+            }
+            HookResult::Continue(_) => panic!("expected Cancel when no proposal exists"),
+        }
+    }
+
+    /// Same as above but for the undersized-proposal branch — when
+    /// proposal.md exists but is < 20KB, the diagnosis must still
+    /// list chapter status so the LLM knows whether to expand chapters
+    /// or just re-merge.
+    #[tokio::test]
+    async fn step8_size_gate_undersized_proposal_lists_chapter_status() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_proposal(tmp.path(), "zhang_xiaobo", 5); // 5KB < 20KB
+                                                       // Add some chapters so diagnosis has a mix of OK/MISSING:
+        let case_dir = tmp.path().join("case_library/insight/zhang_xiaobo");
+        std::fs::write(case_dir.join("pi_intel.md"), "x".repeat(8 * 1024)).unwrap();
+        std::fs::write(case_dir.join("disease_scan.md"), "x".repeat(10 * 1024)).unwrap();
+        // hypotheses, technical_route, budget, output_matching, pm_review missing
+        let _cwd = CwdGuard::enter(tmp.path());
+
+        let hook = test_hook(
+            cfg(true, &["case_library/"]),
+            engine_with_run("jl-insight-research-proposal", 8, SopRunStatus::Running),
+        );
+        let result = hook
+            .before_tool_call(
+                "sop_advance".into(),
+                json!({"status": "completed", "output": "proposal done"}),
+            )
+            .await;
+        match result {
+            HookResult::Cancel(msg) => {
+                assert!(msg.contains("Chapter file status"), "msg: {msg}");
+                // OK chapters must show ✅
+                assert!(msg.contains("✅"), "expected ✅ for ok chapters: {msg}");
+                // Missing chapters must show ❌
+                assert!(
+                    msg.contains("❌"),
+                    "expected ❌ for missing chapters: {msg}"
+                );
+                assert!(msg.contains("hypotheses.md"), "msg: {msg}");
+                assert!(msg.contains("budget.md"), "msg: {msg}");
+            }
+            HookResult::Continue(_) => panic!("expected Cancel for 5KB proposal"),
         }
     }
 

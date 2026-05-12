@@ -801,6 +801,52 @@ fn or_clause(axis_terms: &[String]) -> String {
     }
 }
 
+/// Generic high-frequency medical tokens that, when used as a T1
+/// AND-axis, kill recall to ~0 because almost every paper in the
+/// indexed PubMed corpus matches them. v_zhang (zhang_xiaobo,
+/// run-1778245403320-0002) decomposed ICH+ALOX15 into 5 axes including
+/// `cell_type=neuron` and `outcome=cell death` — both generic — so the
+/// 5-axis T1 intersection returned 0 hits even though 3+ direct prior
+/// art papers exist (J Proteome Res 2025 / PMID:35186185 SAH+ALOX15 /
+/// PMID:35090880 stroke+ALOX15). The fix: detect generic axes by
+/// matching the axis's first term against this list and exclude them
+/// from T1's AND-product. T2 (drop-one) keeps all 5 required axes
+/// because its purpose is exactly to relax over-constrained queries.
+const GENERIC_AXIS_TOKENS: &[&str] = &[
+    "neuron",
+    "neurons",
+    "neuronal",
+    "cell",
+    "cells",
+    "cell death",
+    "cell-death",
+    "death",
+    "apoptosis",
+    "necrosis",
+    "disease",
+    "diseases",
+    "disorder",
+    "disorders",
+    "deficit",
+    "deficits",
+    "dysfunction",
+    "tissue",
+    "tissues",
+    "injury",
+    "damage",
+];
+
+/// Returns `true` if the axis's first term (lowercased) matches a
+/// known generic high-frequency token. See `GENERIC_AXIS_TOKENS`.
+fn is_generic_axis(axis: &[String]) -> bool {
+    axis.first()
+        .map(|t| {
+            let lc = t.to_lowercase();
+            GENERIC_AXIS_TOKENS.contains(&lc.as_str())
+        })
+        .unwrap_or(false)
+}
+
 /// Build the AND clause for an intersection of axes. Axes whose terms
 /// are all empty are skipped (so passing `model=[]` to a 4-axis
 /// intersection that included `model` is equivalent to a 3-axis
@@ -830,23 +876,56 @@ fn and_clause(axes: &[&[String]]) -> String {
 fn build_queries(dim: &ClaimDimensions) -> Vec<TieredQuery> {
     let mut queries: Vec<TieredQuery> = Vec::new();
 
-    // T1: 5-axis intersection (+ optional axes when present).
-    let mut t1_axes: Vec<&[String]> = vec![
-        &dim.molecule,
-        &dim.disease,
-        &dim.mechanism,
-        &dim.cell_type,
-        &dim.outcome,
+    // T1: required-axis intersection, EXCLUDING generic axes
+    // (v_zhang fix 2026-05-09). If the LLM's decomposition contains
+    // a generic high-frequency axis like cell_type=neuron or
+    // outcome="cell death", that axis would over-constrain T1 to 0
+    // hits. Generic axes are dropped from T1 only; T2-T5 still see
+    // them because T2's whole purpose is to probe relaxation.
+    //
+    // Edge case: if all 5 required axes are generic (highly unlikely
+    // — molecule and disease should never be generic), fall back to
+    // the original 5-axis intersection so the query is at least
+    // syntactically populated. The `forbidden_neighborhood_exists`
+    // verdict on T2 will still surface the issue.
+    let required_axes: [(&[String], &str); 5] = [
+        (&dim.molecule, "molecule"),
+        (&dim.disease, "disease"),
+        (&dim.mechanism, "mechanism"),
+        (&dim.cell_type, "cell_type"),
+        (&dim.outcome, "outcome"),
     ];
+    let dropped_generic: Vec<&str> = required_axes
+        .iter()
+        .filter(|(axis, _)| is_generic_axis(axis))
+        .map(|(_, name)| *name)
+        .collect();
+    let mut t1_axes: Vec<&[String]> = required_axes
+        .iter()
+        .filter(|(axis, _)| !is_generic_axis(axis))
+        .map(|(axis, _)| *axis)
+        .collect();
+    if t1_axes.len() < 2 {
+        // Safety fallback: too aggressive a filter; keep all 5.
+        t1_axes = required_axes.iter().map(|(axis, _)| *axis).collect();
+    }
     if !dim.model.is_empty() {
         t1_axes.push(&dim.model);
     }
     if !dim.intervention.is_empty() {
         t1_axes.push(&dim.intervention);
     }
+    let t1_description = if dropped_generic.is_empty() {
+        "all required axes intersected (most specific)".to_string()
+    } else {
+        format!(
+            "required axes intersected, generic axes dropped: {} (v_zhang generic-axis filter)",
+            dropped_generic.join(", ")
+        )
+    };
     queries.push(TieredQuery {
         label: "T1".into(),
-        description: "all required axes intersected (most specific)".into(),
+        description: t1_description,
         query: and_clause(&t1_axes),
     });
 
@@ -1738,6 +1817,74 @@ mod tests {
         assert!(qs.iter().any(|q| q.label == "T4.1"));
         assert!(qs.iter().any(|q| q.label == "T4.2"));
         assert!(qs.iter().any(|q| q.label == "T5"));
+    }
+
+    #[test]
+    fn build_queries_t1_drops_generic_axes_v_zhang_fix() {
+        // Exact v_zhang ICH+ALOX15 decomposition: cell_type=neuron and
+        // outcome=cell death are both generic. The 2026-05-09 fix
+        // requires T1 to drop them so the AND-product is 3 axes
+        // (molecule × disease × mechanism), not 5.
+        let dim = dim_full();
+        let qs = build_queries(&dim);
+        let t1 = qs.iter().find(|q| q.label == "T1").unwrap();
+        assert!(
+            t1.query.contains("ALOX15[tiab]"),
+            "T1 must keep molecule axis: {}",
+            t1.query
+        );
+        assert!(
+            t1.query.contains("ICH[tiab]") || t1.query.contains("\"intracerebral"),
+            "T1 must keep disease axis: {}",
+            t1.query
+        );
+        assert!(
+            t1.query.contains("ferroptosis[tiab]"),
+            "T1 must keep mechanism axis: {}",
+            t1.query
+        );
+        assert!(
+            !t1.query.contains("neuron[tiab]") && !t1.query.contains("neuronal[tiab]"),
+            "T1 must DROP generic cell_type=neuron: {}",
+            t1.query
+        );
+        assert!(
+            !t1.query.contains("\"cell death\"[tiab]"),
+            "T1 must DROP generic outcome=cell death: {}",
+            t1.query
+        );
+        // Description must mention which generic axes were dropped.
+        assert!(
+            t1.description.contains("generic") || t1.description.contains("dropped"),
+            "T1 description must explain generic-axis filter: {}",
+            t1.description
+        );
+    }
+
+    #[test]
+    fn build_queries_t1_keeps_all_axes_when_none_generic() {
+        // Verify the filter doesn't false-positive on specific axes.
+        let mut dim = dim_full();
+        dim.cell_type = vec!["microglia".into()];
+        dim.outcome = vec!["lipid peroxidation".into()];
+        let qs = build_queries(&dim);
+        let t1 = qs.iter().find(|q| q.label == "T1").unwrap();
+        assert!(t1.query.contains("microglia[tiab]"));
+        assert!(t1.query.contains("\"lipid peroxidation\"[tiab]"));
+        assert_eq!(
+            t1.description, "all required axes intersected (most specific)",
+            "T1 description should match legacy form when no generic axes"
+        );
+    }
+
+    #[test]
+    fn is_generic_axis_recognizes_v_zhang_offenders() {
+        assert!(is_generic_axis(&["neuron".into(), "neuronal".into()]));
+        assert!(is_generic_axis(&["cell death".into()]));
+        assert!(is_generic_axis(&["NEURON".into()])); // case-insensitive
+        assert!(!is_generic_axis(&["microglia".into()]));
+        assert!(!is_generic_axis(&["ALOX15".into()]));
+        assert!(!is_generic_axis(&[])); // empty axis is not "generic"
     }
 
     #[test]

@@ -190,6 +190,19 @@ impl PriorArtJudgeTool {
         );
         let _ = writeln!(
             out,
+            "**Priority directive (v_zhang_v3 reported missed-recent-paper failure)**: \
+             candidates are sorted **newest-first by publication year**. The first 10-15 \
+             candidates carry the highest signal for novelty-shifting prior art \
+             (PMID:40701963 in the v_zhang case appeared 6-8 months before SOP run and \
+             would have rebutted the 'first to study' framing if seen on time). When \
+             attention budget is tight, prioritize: (1) candidates published in the last \
+             12 months, (2) candidates whose disease + mechanism axes both match the \
+             claim. Older papers can be marked `is_relevant=false neighbor_type=noise` \
+             quickly if clearly off-topic — saving budget for recent same-mechanism work."
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
             "- `is_relevant` (bool) — does this paper bear on the claim at all?"
         );
         let _ = writeln!(
@@ -443,12 +456,29 @@ impl Tool for PriorArtJudgeTool {
             }
         }
 
-        // Sort by input order.
-        papers.sort_by_key(|p| {
-            deduped
-                .iter()
-                .position(|q| q == &p.pmid)
-                .unwrap_or(usize::MAX)
+        // Sort by publication year descending (newest first), then
+        // by input order as tie-breaker. v_zhang_v3 reported PMID:
+        // 40701963 was missed in the original step 2 judgment because
+        // it appeared late in the candidate list (sorted by input
+        // order, which roughly mirrors NCBI relevance) — the LLM
+        // ran out of attention budget before reaching it. Sorting by
+        // year ensures recent (last 12-24 months) papers are seen
+        // first, where novelty-shifting evidence is most likely to
+        // live. Papers with unparseable / missing year sort last.
+        papers.sort_by(|a, b| {
+            let a_year = parse_pub_year(&a.year).unwrap_or(0);
+            let b_year = parse_pub_year(&b.year).unwrap_or(0);
+            b_year.cmp(&a_year).then_with(|| {
+                let a_pos = deduped
+                    .iter()
+                    .position(|q| q == &a.pmid)
+                    .unwrap_or(usize::MAX);
+                let b_pos = deduped
+                    .iter()
+                    .position(|q| q == &b.pmid)
+                    .unwrap_or(usize::MAX);
+                a_pos.cmp(&b_pos)
+            })
         });
 
         let report = Self::render_report(&claim, &papers);
@@ -506,6 +536,29 @@ fn parse_pubmed_text_records(blob: &str) -> Vec<PaperRecord> {
     // Drop any record without a PMID (parse failure on that record).
     out.retain(|r| !r.pmid.is_empty());
     out
+}
+
+/// Extract a 4-digit publication year from a `PaperRecord.year` field.
+/// PubMed text-mode citations encode the year as the first 4-digit
+/// run (e.g. "2025 Jan", "2024", "2025 Apr 15"). Returns `None` if
+/// the field is empty or contains no 4-digit run.
+fn parse_pub_year(year_field: &str) -> Option<u32> {
+    let bytes = year_field.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        let slice = &bytes[i..i + 4];
+        if slice.iter().all(|b| b.is_ascii_digit()) {
+            // Reject 4-digit runs that are part of a longer digit run
+            // (defensive — pubmed years always stand alone).
+            let prev_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
+            let next_ok = i + 4 == bytes.len() || !bytes[i + 4].is_ascii_digit();
+            if prev_ok && next_ok {
+                return std::str::from_utf8(slice).ok().and_then(|s| s.parse().ok());
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_record_start(line: &str) -> bool {
@@ -817,6 +870,63 @@ mod tests {
         assert!(r.contains("Surface every"));
         assert!(r.contains("framing_revision"));
         assert!(r.contains("weighted overlap"));
+    }
+
+    #[test]
+    fn render_report_emits_priority_directive_for_recent_papers() {
+        // v_zhang_v3 fix: the markdown template must tell the LLM
+        // candidates are sorted newest-first and that recent same-
+        // mechanism work is the highest-signal slice.
+        let r = PriorArtJudgeTool::render_report("c", &[]);
+        assert!(
+            r.contains("Priority directive") && r.contains("newest-first"),
+            "report must surface the v_zhang_v3 priority directive"
+        );
+        assert!(r.contains("12 months"));
+    }
+
+    #[test]
+    fn parse_pub_year_extracts_4digit_year_from_various_pubmed_formats() {
+        assert_eq!(parse_pub_year("2025"), Some(2025));
+        assert_eq!(parse_pub_year("2025 Jan"), Some(2025));
+        assert_eq!(parse_pub_year("2024 Apr 15"), Some(2024));
+        assert_eq!(parse_pub_year("2025;"), Some(2025));
+        assert_eq!(parse_pub_year(""), None);
+        assert_eq!(parse_pub_year("no year here"), None);
+        // Reject longer digit runs (defensive).
+        assert_eq!(parse_pub_year("12345"), None);
+    }
+
+    #[test]
+    fn render_report_orders_papers_newest_first_via_year() {
+        // Construct papers in mixed order; render_report does NOT
+        // sort, but execute() does — so verify via direct sort
+        // simulation that newest papers end up first in the slice.
+        let mut papers = vec![
+            PaperRecord {
+                pmid: "OLD1".into(),
+                year: "2018".into(),
+                ..Default::default()
+            },
+            PaperRecord {
+                pmid: "NEW1".into(),
+                year: "2025 Jan".into(),
+                ..Default::default()
+            },
+            PaperRecord {
+                pmid: "MID1".into(),
+                year: "2022".into(),
+                ..Default::default()
+            },
+        ];
+        papers.sort_by(|a, b| {
+            let ay = parse_pub_year(&a.year).unwrap_or(0);
+            let by = parse_pub_year(&b.year).unwrap_or(0);
+            by.cmp(&ay)
+        });
+        assert_eq!(papers[0].pmid, "NEW1");
+        assert_eq!(papers[1].pmid, "MID1");
+        assert_eq!(papers[2].pmid, "OLD1");
     }
 
     #[tokio::test]
