@@ -245,7 +245,15 @@ impl OpenAiCompatibleProvider {
             let builder = Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .default_headers(headers);
+                .default_headers(headers)
+                // 2026-05-13 clawops daemon deadlock fix (see also
+                // config/schema.rs build_runtime_proxy_client_with_timeouts):
+                // reqwest keep-alive pool was retaining half-closed
+                // sockets after large SSE responses; the cached Client
+                // would pick a dead socket on the 5th-8th LLM call and
+                // hang forever in read() with no wake. Force fresh TCP
+                // connection per call to avoid the broken socket reuse.
+                .pool_max_idle_per_host(0);
             let builder =
                 crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible");
 
