@@ -957,7 +957,37 @@ impl Provider for ReliableProvider {
                         messages: request.messages,
                         tools: request.tools,
                     };
-                    match provider.chat(req, current_model, temperature).await {
+                    // 2026-05-13 hard outer timeout on chat() call.
+                    // reqwest's internal .timeout() and our spawn-task
+                    // SSE idle-timeout (compatible.rs) have proven
+                    // unreliable across the non-streaming chat() path
+                    // — daemon observed futex-locked with no chat
+                    // response after 4+ min on deepseek-v4-pro.
+                    // 240s = generous for reasoning models on 120K
+                    // context, firm enough to trigger fallback to
+                    // qwen before the gateway 5min timeout strands
+                    // the client.
+                    let chat_fut =
+                        provider.chat(req, current_model, temperature);
+                    let chat_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(240),
+                        chat_fut,
+                    )
+                    .await;
+                    let outcome = match chat_result {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            tracing::error!(
+                                provider = provider_name,
+                                model = *current_model,
+                                "Provider chat() exceeded 240s outer timeout — treating as unexpected eof for fallback"
+                            );
+                            Err(anyhow::anyhow!(
+                                "unexpected eof: provider chat() exceeded 240s outer timeout (provider unresponsive)"
+                            ))
+                        }
+                    };
+                    match outcome {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
