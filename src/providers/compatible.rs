@@ -689,6 +689,22 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
 ///    hundreds of chunks per second across reasoning_content +
 ///    content. 100-slot backpressure stalled the sender. Bumped to
 ///    1024.
+/// Max idle time between SSE chunks before treating the stream as dead.
+/// reqwest's request-level `.timeout()` only covers up to first-byte;
+/// once the SSE response is established, individual chunk-to-chunk
+/// gaps are NOT bounded — a misbehaving provider (observed with
+/// deepseek-v4-pro 2026-05-13 on clawops policy-match SOP) can leave
+/// the stream open with no data for 30+ minutes, hanging the daemon.
+///
+/// 90s is generous for reasoning models that may pause between
+/// reasoning_content + content phases, but firmly catches "deepseek
+/// stopped sending" silent hangs. On timeout we emit a
+/// `StreamError::Provider("unexpected eof ...")` — the message
+/// contains "unexpected eof" so `reliable::is_stream_protocol_error()`
+/// classifies it as non-retryable and the fallback chain kicks in
+/// immediately instead of waiting forever.
+const SSE_IDLE_TIMEOUT_SECS: u64 = 90;
+
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
@@ -708,7 +724,24 @@ fn sse_bytes_to_chunks(
 
         let mut bytes_stream = response.bytes_stream();
 
-        while let Some(item) = bytes_stream.next().await {
+        let idle = std::time::Duration::from_secs(SSE_IDLE_TIMEOUT_SECS);
+        loop {
+            let item = match tokio::time::timeout(idle, bytes_stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break, // stream ended cleanly
+                Err(_) => {
+                    // Idle timeout fired — provider stopped sending
+                    // chunks. Surface as a stream-protocol error so
+                    // reliable.rs short-circuits retries on this
+                    // provider and switches to the fallback chain.
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!(
+                            "unexpected eof: no SSE chunk received for {SSE_IDLE_TIMEOUT_SECS}s (provider silent hang)"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
             match item {
                 Ok(bytes) => {
                     byte_buf.extend_from_slice(&bytes);
@@ -2976,6 +3009,40 @@ mod tests {
         assert!(
             src.contains("mpsc::channel::<StreamResult<StreamChunk>>(1024)"),
             "SSE channel capacity should be 1024 (bumped from 100 in v_zhang fix)"
+        );
+    }
+
+    // ── SSE idle-timeout (2026-05-13 clawops policy-match hang fix) ──
+    //
+    // reqwest's request-level .timeout() doesn't cover chunk-to-chunk
+    // idle time once the SSE response is established. deepseek-v4-pro
+    // was observed stopping mid-stream and leaving the connection open
+    // for 30+ minutes, hanging the daemon. We now bound the idle
+    // window and emit a stream-protocol error on timeout so reliable.rs
+    // short-circuits same-provider retries and falls back immediately.
+
+    #[test]
+    fn sse_idle_timeout_constant_is_set() {
+        assert_eq!(
+            SSE_IDLE_TIMEOUT_SECS, 90,
+            "SSE idle timeout must be 90s — generous for reasoning-pause but firm against silent hangs"
+        );
+    }
+
+    #[test]
+    fn sse_idle_timeout_error_message_classifies_as_stream_protocol() {
+        // The timeout branch sends a StreamError::Provider with a
+        // string containing "unexpected eof" so that
+        // reliable::is_stream_protocol_error() classifies it as a
+        // non-retryable stream-protocol error and the fallback chain
+        // is engaged. We verify the format here so future refactors
+        // don't accidentally break the contract.
+        let msg = format!(
+            "unexpected eof: no SSE chunk received for {SSE_IDLE_TIMEOUT_SECS}s (provider silent hang)"
+        );
+        assert!(
+            msg.to_lowercase().contains("unexpected eof"),
+            "idle timeout error must contain 'unexpected eof' for is_stream_protocol_error() match"
         );
     }
 
