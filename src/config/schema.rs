@@ -1799,7 +1799,18 @@ pub fn build_runtime_proxy_client_with_timeouts(
 
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        // 2026-05-13 clawops policy-match daemon deadlock fix:
+        // reqwest's default keep-alive pool was leaking half-closed
+        // sockets when the remote (dashscope/deepseek) closed
+        // connections after large SSE responses. The cached Client
+        // shared across LLM calls accumulated these dead sockets,
+        // and after 5-8 calls a new chat() request would pick a
+        // half-closed socket from the pool and hang forever in
+        // read() with no wake (5 worker futex_wait + 1 ep_poll).
+        // Force every LLM call to use a fresh TCP connection so
+        // no half-closed socket is ever reused.
+        .pool_max_idle_per_host(0);
     let builder = apply_runtime_proxy_to_builder(builder, service_key);
     let client = builder.build().unwrap_or_else(|error| {
         tracing::warn!(
