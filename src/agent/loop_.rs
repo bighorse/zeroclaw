@@ -34,6 +34,12 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// loops even when the tool is in `tool_call_dedup_exempt` (e.g. `shell`).
 const MAX_CONSECUTIVE_IDENTICAL_RESULTS: u32 = 2;
 
+/// Max number of synthetic "forced reflection" user messages we may inject into a
+/// single turn when stuck-detection trips. Each reflection asks the model to diagnose
+/// its own loop and pick a different path before retrying. Once exhausted, the loop
+/// truly bails. Setting this to 0 restores the previous bail-on-first-detection behavior.
+const MAX_FORCED_REFLECTIONS_PER_TURN: u32 = 2;
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
@@ -2323,6 +2329,13 @@ pub(crate) async fn run_tool_call_loop(
     // (e.g. `shell`). Each entry is `(tool_name, output_hash)`.
     let mut last_successful_fingerprint: Option<Vec<(String, u64)>> = None;
     let mut consecutive_identical_results: u32 = 0;
+    // Counts how many forced-reflection user messages have been injected this turn.
+    // When stuck-detection trips, we inject a self-diagnosis prompt instead of
+    // bailing immediately; we only bail once this counter reaches the cap.
+    let mut forced_reflections_used: u32 = 0;
+    // Set by stuck-detection when a reflection should be injected at end of iteration,
+    // carrying (stuck_tool_name, consecutive_count) for the prompt text.
+    let mut pending_reflection: Option<(String, u32)> = None;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2399,6 +2412,36 @@ pub(crate) async fn run_tool_call_loop(
             model,
             temperature,
         );
+
+        // 2026-05-13 clawops policy-match deadlock fix: agent loop
+        // calls provider.chat() directly, bypassing reliable.rs which
+        // had its own outer timeout. Without this wrapper, a hung
+        // provider call (deepseek silent-hang, qwen chat_completions
+        // never returning, etc.) blocks the agent loop forever — we've
+        // observed daemons frozen 30+ min with no recovery, no timeout
+        // ever firing. 240s is generous for reasoning models on 120K
+        // context but firm enough to surface the hang as an error so
+        // the loop can either retry or fail the SOP step deterministically.
+        const CHAT_OUTER_TIMEOUT_SECS: u64 = 240;
+        let chat_future = async {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(CHAT_OUTER_TIMEOUT_SECS),
+                chat_future,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::error!(
+                        model,
+                        "agent_loop: provider.chat() exceeded {CHAT_OUTER_TIMEOUT_SECS}s outer timeout — provider unresponsive"
+                    );
+                    Err(anyhow::anyhow!(
+                        "unexpected eof: provider chat() exceeded {CHAT_OUTER_TIMEOUT_SECS}s outer timeout (provider unresponsive)"
+                    ))
+                }
+            }
+        };
 
         let chat_result = if let Some(token) = cancellation_token.as_ref() {
             tokio::select! {
@@ -2972,28 +3015,56 @@ pub(crate) async fn run_tool_call_loop(
                 if consecutive_identical_results >= MAX_CONSECUTIVE_IDENTICAL_RESULTS {
                     let tool_name = this_round_fingerprint
                         .first()
-                        .map(|(n, _)| n.as_str())
-                        .unwrap_or("unknown");
-                    runtime_trace::record_event(
-                        "tool_loop_exhausted",
-                        Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
-                        Some(&turn_id),
-                        Some(false),
-                        Some("agent stuck in repeat-result loop"),
-                        serde_json::json!({
-                            "consecutive_identical_results": consecutive_identical_results + 1,
-                            "iteration": iteration + 1,
-                            "tool": tool_name,
-                        }),
-                    );
-                    anyhow::bail!(
-                        "Agent stuck: {} consecutive iterations produced identical tool \
-                         outputs (same call → same result, no progress). Last tool: '{}'.",
-                        consecutive_identical_results + 1,
-                        tool_name
-                    );
+                        .map(|(n, _)| n.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let count_display = consecutive_identical_results + 1;
+                    if forced_reflections_used < MAX_FORCED_REFLECTIONS_PER_TURN {
+                        // Defer: schedule a forced-reflection prompt to be appended
+                        // after this iteration's tool results land in history, and
+                        // let the loop continue. Counters are reset at injection
+                        // time so the next round starts fresh.
+                        runtime_trace::record_event(
+                            "forced_reflection_scheduled",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(true),
+                            None,
+                            serde_json::json!({
+                                "reason": "repeat_result_loop",
+                                "tool": tool_name,
+                                "consecutive_identical_results": count_display,
+                                "reflections_used_so_far": forced_reflections_used,
+                                "iteration": iteration + 1,
+                            }),
+                        );
+                        pending_reflection = Some((tool_name, count_display));
+                    } else {
+                        runtime_trace::record_event(
+                            "tool_loop_exhausted",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(false),
+                            Some("agent stuck after exhausted forced reflections"),
+                            serde_json::json!({
+                                "consecutive_identical_results": count_display,
+                                "forced_reflections_used": forced_reflections_used,
+                                "iteration": iteration + 1,
+                                "tool": tool_name,
+                            }),
+                        );
+                        anyhow::bail!(
+                            "Agent stuck after {} forced reflections: {} consecutive \
+                             iterations produced identical tool outputs (same call → \
+                             same result, no progress). Last tool: '{}'.",
+                            forced_reflections_used,
+                            count_display,
+                            tool_name
+                        );
+                    }
                 }
             } else {
                 consecutive_identical_results = 0;
@@ -3047,6 +3118,34 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        // ── Forced reflection injection ──────────────────────────────────────
+        // If stuck-detection scheduled a reflection above, append a synthetic
+        // user-role prompt asking the model to diagnose its own loop before
+        // retrying. Reset the repeat-result counters so the next round starts
+        // fresh; the cap on `forced_reflections_used` bounds how many times
+        // this rescue runs before we truly bail.
+        if let Some((stuck_tool, count)) = pending_reflection.take() {
+            let prompt = format!(
+                "[system-injected stuck-detection]\n\n\
+                 You have produced identical results from `{stuck_tool}` in {count} consecutive \
+                 iterations (same call → same output, no progress). Continuing this approach \
+                 will not advance.\n\n\
+                 Before your next tool call, reply with EXACTLY this 4-line analysis (no extra \
+                 prose, no markdown headers):\n\n\
+                 failure_type: <one of: incomplete | blocked | misdirected | format_missed>\n\
+                 what_was_repeating: <one sentence>\n\
+                 why_stuck: <one sentence root cause>\n\
+                 alternative_approach: <a different approach that does NOT call `{stuck_tool}` \
+                 with the same arguments>\n\n\
+                 Then proceed with the alternative approach. Do NOT issue another `{stuck_tool}` \
+                 call with the same arguments — if you do, this loop will be terminated."
+            );
+            history.push(ChatMessage::user(prompt));
+            forced_reflections_used += 1;
+            consecutive_identical_results = 0;
+            last_successful_fingerprint = None;
         }
     }
 
@@ -4865,19 +4964,21 @@ mod tests {
         // by the exemption, but the repeat-result circuit breaker must still catch
         // the non-progress loop.
         //
-        // With MAX_CONSECUTIVE_IDENTICAL_RESULTS = 2:
-        //   iter 1: execute → fingerprint X → last=X, count=0
-        //   iter 2: execute → fingerprint X matches last → count=1 (< 2)
-        //   iter 3: execute → fingerprint X matches last → count=2 (>= 2) → BAIL
+        // With MAX_CONSECUTIVE_IDENTICAL_RESULTS = 2 and
+        // MAX_FORCED_REFLECTIONS_PER_TURN = 2, each reflection resets the
+        // repeat counters before retrying, so the worst-case stuck loop runs:
+        //   iter 1-3: trip detector → inject reflection #1, reflections=1
+        //   iter 4-6: trip detector → inject reflection #2, reflections=2
+        //   iter 7-9: trip detector → reflections at cap → BAIL
+        // The scripted provider returns the same tool call every iteration
+        // (simulating a model that ignores every reflection prompt), which is
+        // the worst case we want to verify terminates rather than loops forever.
         let same_call = r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
 </tool_call>"#;
         let provider = ScriptedProvider::from_text_responses(vec![
-            same_call,
-            same_call,
-            same_call,
-            same_call,
-            "should not reach",
+            same_call, same_call, same_call, same_call, same_call, same_call, same_call,
+            same_call, same_call, "should not reach",
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -4917,17 +5018,105 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "loop must bail when dedup-exempt tool repeats same output"
+            "loop must bail when dedup-exempt tool repeats same output across reflections"
         );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("identical tool outputs") || err.contains("stuck"),
             "error should mention identical outputs / stuck: {err}"
         );
+        assert!(
+            err.contains("forced reflections"),
+            "error should reference exhausted reflections: {err}"
+        );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
-            3,
-            "tool should execute 3 times (first two build the repeat count, third trips the breaker)"
+            9,
+            "tool runs 9 times: 3 iters * (1 detection + 2 reflection cycles + final bail)"
+        );
+        // Verify the reflection prompts landed in history (one user message per reflection).
+        let reflection_count = history
+            .iter()
+            .filter(|m| m.role == "user" && m.content.contains("[system-injected stuck-detection]"))
+            .count();
+        assert_eq!(
+            reflection_count, 2,
+            "exactly MAX_FORCED_REFLECTIONS_PER_TURN reflection prompts should be injected"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_forced_reflection_recovers_when_model_changes_approach() {
+        // Scenario: same call repeats 3 times to trip the repeat-result breaker.
+        // A reflection prompt is injected; the model heeds it on iter 4 by
+        // issuing a different tool call (different arguments → different output
+        // fingerprint), which resets the counters. The loop terminates cleanly
+        // on iter 5 with a "done" (no tool calls) response.
+        let same_call = r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#;
+        let different_call = r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"B"}}
+</tool_call>"#;
+        let provider = ScriptedProvider::from_text_responses(vec![
+            same_call,
+            same_call,
+            same_call,
+            different_call,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["count_tool".to_string()];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "feishu",
+            &crate::config::MultimodalConfig::default(),
+            20,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "loop must NOT bail when the model heeds the reflection and switches approach: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            4,
+            "tool runs 4 times (3 same + 1 different) before final 'done' response"
+        );
+        let reflection_count = history
+            .iter()
+            .filter(|m| m.role == "user" && m.content.contains("[system-injected stuck-detection]"))
+            .count();
+        assert_eq!(
+            reflection_count, 1,
+            "exactly one reflection should be injected before the model recovered"
         );
     }
 
