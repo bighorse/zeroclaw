@@ -712,6 +712,8 @@ fn sse_bytes_to_chunks(
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(1024);
 
     tokio::spawn(async move {
+        tracing::debug!("sse_bytes_to_chunks: entered, idle_timeout={SSE_IDLE_TIMEOUT_SECS}s");
+
         // Byte buffer (not String) — defers UTF-8 conversion to line
         // boundaries so we don't fail on mid-character chunk seams.
         let mut byte_buf: Vec<u8> = Vec::with_capacity(8192);
@@ -734,12 +736,18 @@ fn sse_bytes_to_chunks(
                     // chunks. Surface as a stream-protocol error so
                     // reliable.rs short-circuits retries on this
                     // provider and switches to the fallback chain.
+                    tracing::error!(
+                        "SSE idle timeout: no chunk received for {SSE_IDLE_TIMEOUT_SECS}s — provider silent hang"
+                    );
                     let _ = tx
                         .send(Err(StreamError::Provider(format!(
                             "unexpected eof: no SSE chunk received for {SSE_IDLE_TIMEOUT_SECS}s (provider silent hang)"
                         ))))
                         .await;
-                    return;
+                    // Break (not return) so final_chunk is sent — some
+                    // upstream consumers wait for the terminating
+                    // StreamChunk::final_chunk() to unblock recv loops.
+                    break;
                 }
             };
             match item {
@@ -1768,11 +1776,41 @@ impl Provider for OpenAiCompatibleProvider {
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
 
-            // Send request
-            let response = match req_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
+            // Send request — wrap in tokio::time::timeout to enforce
+            // an upper bound on the send→headers phase. reqwest's own
+            // .timeout() is unreliable across connection-pool reuse
+            // and HTTP/2 stream multiplexing; we've observed deepseek
+            // hanging indefinitely (no TCP connection visible, daemon
+            // futex-locked) where reqwest's 120s should have fired.
+            // 120s is enough for any reasonable provider to start
+            // responding; if the provider is unresponsive, we want to
+            // fail fast and let reliable.rs trigger the fallback chain.
+            tracing::debug!("chat_stream: send().await starting");
+            let send_fut = req_builder.send();
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                send_fut,
+            )
+            .await
+            {
+                Ok(Ok(r)) => {
+                    tracing::debug!("chat_stream: send() returned (status={})", r.status());
+                    r
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("chat_stream: send() reqwest error: {e}");
                     let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "chat_stream: send() timed out after 120s — provider unresponsive"
+                    );
+                    let _ = tx
+                        .send(Err(StreamError::Provider(
+                            "unexpected eof: send() timed out after 120s waiting for response headers (provider unresponsive)".to_string(),
+                        )))
+                        .await;
                     return;
                 }
             };
