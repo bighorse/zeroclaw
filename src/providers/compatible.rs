@@ -57,6 +57,72 @@ pub enum AuthStyle {
     Custom(String),
 }
 
+/// Run an HTTP chat completion on a brand-new isolated tokio runtime,
+/// completely bypassing the main daemon runtime's accumulated state.
+///
+/// **Why this exists** (2026-05-14 clawops policy-match daemon hang):
+/// After ~5-9 LLM iterations the multi-thread daemon runtime + reqwest
+/// shared connection pool enters a degraded "wake-lost" state where
+/// waker signals are dropped and `tokio::time::timeout` no longer
+/// fires. Each chat() call running on a fresh single-thread runtime
+/// is fully isolated from prior calls' accumulated state, so the
+/// degradation can never accumulate across calls.
+///
+/// **Why feishu/lark channel mode doesn't see this**: channels wrap
+/// `run_tool_call_loop` in `tokio::time::timeout` registered very early
+/// when the timer wheel is still healthy. Once that early-registered
+/// timer fires, the entire SOP run unwinds. Gateway mode in clawops
+/// has no such outer timeout — a hung chat() blocks the agent loop
+/// forever, so we must fix it at the source.
+///
+/// **Cost**: ~10-30ms per call to build+drop the runtime. Negligible
+/// vs typical LLM latency (1-30s for short turns, 1-3 min for large
+/// context). The blocking thread pool that runs `spawn_blocking` is
+/// separate from the worker pool, so this doesn't starve daemon
+/// agent tasks.
+fn do_http_chat_isolated(
+    url: String,
+    auth_header: AuthStyle,
+    credential: String,
+    request_body: serde_json::Value,
+    timeout_secs: u64,
+    user_agent: Option<String>,
+) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build isolated runtime: {e}"))?;
+
+    rt.block_on(async move {
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(0);
+        if let Some(ua) = user_agent {
+            if let Ok(value) = HeaderValue::from_str(&ua) {
+                let mut headers = HeaderMap::new();
+                headers.insert(USER_AGENT, value);
+                builder = builder.default_headers(headers);
+            }
+        }
+        let client = builder.build()?;
+
+        let mut req = client.post(&url).json(&request_body);
+        req = match &auth_header {
+            AuthStyle::Bearer => {
+                req.header("Authorization", format!("Bearer {}", credential))
+            }
+            AuthStyle::XApiKey => req.header("x-api-key", &credential),
+            AuthStyle::Custom(h) => req.header(h.as_str(), &credential),
+        };
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        let bytes = resp.bytes().await?;
+        Ok::<_, anyhow::Error>((status, bytes.to_vec()))
+    })
+}
+
 impl OpenAiCompatibleProvider {
     pub fn new(
         name: &str,
@@ -1620,16 +1686,30 @@ impl Provider for OpenAiCompatibleProvider {
             None => serde_json::to_value(&native_request)
                 .unwrap_or_else(|_| serde_json::Value::Null),
         };
-        let response = match self
-            .apply_auth_header(
-                self.http_client().post(&url).json(&request_body),
-                credential,
+        // 2026-05-14 isolated-runtime fix for clawops policy-match daemon
+        // hang. The HTTP call runs on a brand-new tokio runtime on a
+        // blocking thread, fully isolated from the main daemon runtime's
+        // accumulated "wake-lost" state. See do_http_chat_isolated docs.
+        let isolated_url = url.clone();
+        let isolated_auth = self.auth_header.clone();
+        let isolated_credential = credential.to_string();
+        let isolated_body = request_body.clone();
+        let isolated_timeout = self.timeout_secs;
+        let isolated_ua = self.user_agent.clone();
+        let isolated_result = tokio::task::spawn_blocking(move || {
+            do_http_chat_isolated(
+                isolated_url,
+                isolated_auth,
+                isolated_credential,
+                isolated_body,
+                isolated_timeout,
+                isolated_ua,
             )
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(chat_error) => {
+        })
+        .await;
+        let (status, body_bytes) = match isolated_result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(chat_error)) => {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
@@ -1649,13 +1729,18 @@ impl Provider for OpenAiCompatibleProvider {
                         });
                 }
 
-                return Err(chat_error.into());
+                return Err(chat_error);
+            }
+            Err(join_err) => {
+                anyhow::bail!(
+                    "{} isolated chat runtime join error: {join_err}",
+                    self.name
+                );
             }
         };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await?;
+        if !status.is_success() {
+            let error = String::from_utf8_lossy(&body_bytes).to_string();
             let sanitized = super::sanitize_api_error(&error);
 
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
@@ -1693,7 +1778,7 @@ impl Provider for OpenAiCompatibleProvider {
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let native_response: ApiChatResponse = response.json().await?;
+        let native_response: ApiChatResponse = serde_json::from_slice(&body_bytes)?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
