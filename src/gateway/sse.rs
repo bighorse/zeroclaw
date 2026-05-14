@@ -98,11 +98,14 @@ impl crate::observability::Observer for BroadcastObserver {
                 "success": success,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
-            crate::observability::ObserverEvent::ToolCallStart { tool, .. } => serde_json::json!({
-                "type": "tool_call_start",
-                "tool": tool,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
+            crate::observability::ObserverEvent::ToolCallStart { tool, arguments } => {
+                serde_json::json!({
+                    "type": "tool_call_start",
+                    "tool": tool,
+                    "arguments": arguments,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
             crate::observability::ObserverEvent::Error { component, message } => {
                 serde_json::json!({
                     "type": "error",
