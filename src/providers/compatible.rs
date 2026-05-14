@@ -88,12 +88,15 @@ fn do_http_chat_isolated(
     timeout_secs: u64,
     user_agent: Option<String>,
 ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>)> {
+    eprintln!("ISO_CHAT:1 enter, url={url}");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build isolated runtime: {e}"))?;
+    eprintln!("ISO_CHAT:2 runtime built");
 
     rt.block_on(async move {
+        eprintln!("ISO_CHAT:3 inside block_on, building client");
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -106,6 +109,7 @@ fn do_http_chat_isolated(
             }
         }
         let client = builder.build()?;
+        eprintln!("ISO_CHAT:4 client built");
 
         let mut req = client.post(&url).json(&request_body);
         req = match &auth_header {
@@ -116,9 +120,12 @@ fn do_http_chat_isolated(
             AuthStyle::Custom(h) => req.header(h.as_str(), &credential),
         };
 
+        eprintln!("ISO_CHAT:5 sending request");
         let resp = req.send().await?;
+        eprintln!("ISO_CHAT:6 got response, status={}", resp.status());
         let status = resp.status();
         let bytes = resp.bytes().await?;
+        eprintln!("ISO_CHAT:7 got bytes len={}", bytes.len());
         Ok::<_, anyhow::Error>((status, bytes.to_vec()))
     })
 }
@@ -1696,7 +1703,9 @@ impl Provider for OpenAiCompatibleProvider {
         let isolated_body = request_body.clone();
         let isolated_timeout = self.timeout_secs;
         let isolated_ua = self.user_agent.clone();
-        let isolated_result = tokio::task::spawn_blocking(move || {
+        eprintln!("CHAT_PRE_SPAWN: about to spawn_blocking");
+        let isolated_handle = tokio::task::spawn_blocking(move || {
+            eprintln!("CHAT_IN_BLOCKING: spawn_blocking closure started");
             do_http_chat_isolated(
                 isolated_url,
                 isolated_auth,
@@ -1705,8 +1714,10 @@ impl Provider for OpenAiCompatibleProvider {
                 isolated_timeout,
                 isolated_ua,
             )
-        })
-        .await;
+        });
+        eprintln!("CHAT_POST_SPAWN: handle obtained, awaiting");
+        let isolated_result = isolated_handle.await;
+        eprintln!("CHAT_POST_AWAIT: spawn_blocking returned: ok={}", isolated_result.is_ok());
         let (status, body_bytes) = match isolated_result {
             Ok(Ok(pair)) => pair,
             Ok(Err(chat_error)) => {
