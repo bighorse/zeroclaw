@@ -100,7 +100,18 @@ fn do_http_chat_isolated(
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .connect_timeout(std::time::Duration::from_secs(10))
-            .pool_max_idle_per_host(0);
+            .pool_max_idle_per_host(0)
+            // 2026-05-14 force HTTP/1.1 to bypass HTTP/2 stream state bug.
+            // V22 confirmed: TCP ESTAB to dashscope succeeded, send() returned
+            // (eprintln:5 emitted), but response-read hangs at ~iteration 6.
+            // Daemon held the ESTAB connection 5+ min in CLOSE_WAIT-like state.
+            // HTTP/2 multiplexes multiple streams over one TCP; some state
+            // accumulation across stream open/close causes a later send/recv
+            // pair to never deliver server frames to the awaiting Future.
+            // HTTP/1.1 = one request per connection, no stream multiplexing
+            // state to corrupt. pool_max_idle=0 already ensures fresh conn
+            // per call, combined with http1_only the path is fully stateless.
+            .http1_only();
         if let Some(ua) = user_agent {
             if let Ok(value) = HeaderValue::from_str(&ua) {
                 let mut headers = HeaderMap::new();
