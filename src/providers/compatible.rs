@@ -1704,51 +1704,44 @@ impl Provider for OpenAiCompatibleProvider {
             None => serde_json::to_value(&native_request)
                 .unwrap_or_else(|_| serde_json::Value::Null),
         };
-        // 2026-05-14 isolated-runtime fix for clawops policy-match daemon
-        // hang. The HTTP call runs on a brand-new tokio runtime on a
-        // blocking thread, fully isolated from the main daemon runtime's
-        // accumulated "wake-lost" state. See do_http_chat_isolated docs.
-        let isolated_url = url.clone();
-        let isolated_auth = self.auth_header.clone();
-        let isolated_credential = credential.to_string();
-        let isolated_body = request_body.clone();
-        let isolated_timeout = self.timeout_secs;
-        let isolated_ua = self.user_agent.clone();
-        // 2026-05-14 V24 confirmed: tokio runtime timer wheel itself
-        // dies after ~6-7 LLM cycles. Even tokio::time::sleep(50ms)
-        // stops firing — std::thread completes HTTP, sends via mpsc,
-        // but the async poll loop's sleep never wakes. So we cannot
-        // use ANY tokio await (JoinHandle, time::sleep, oneshot).
-        //
-        // Final fix: tokio::task::block_in_place runs a sync closure
-        // on the current worker, moving the worker out of the scheduler
-        // until the closure returns. The closure is plain sync code —
-        // no wake path, no scheduler dependency. Other tokio tasks
-        // run on remaining workers (multi-thread runtime).
-        //
-        // Inside block_in_place we build a fresh single-thread runtime
-        // and block_on the HTTP call. Both the inner runtime and the
-        // outer worker thread are independent of the main daemon
-        // runtime's degraded waker state.
-        eprintln!("CHAT_BLOCK_IN_PLACE: entering sync section");
-        let isolated_result: anyhow::Result<(reqwest::StatusCode, Vec<u8>)> =
-            tokio::task::block_in_place(|| {
-                eprintln!("CHAT_BIP_INNER: running do_http_chat_isolated");
-                do_http_chat_isolated(
-                    isolated_url,
-                    isolated_auth,
-                    isolated_credential,
-                    isolated_body,
-                    isolated_timeout,
-                    isolated_ua,
-                )
-            });
-        eprintln!(
-            "CHAT_POST_BIP: block_in_place returned, ok={}",
-            isolated_result.is_ok()
-        );
-        let (status, body_bytes) = match isolated_result {
-            Ok(pair) => pair,
+        // 2026-05-14 V27: process_message_inner now wraps the whole
+        // agent loop in block_in_place + a fresh isolated tokio
+        // runtime, so this chat() call already runs on a fresh runtime
+        // that cannot accumulate wake-lost state. Use plain reqwest
+        // async path with http1_only + pool_max_idle(0) for safety.
+        let mut client_builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
+            .http1_only();
+        if let Some(ua) = self.user_agent.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(ua) {
+                let mut headers = HeaderMap::new();
+                headers.insert(USER_AGENT, value);
+                client_builder = client_builder.default_headers(headers);
+            }
+        }
+        let direct_client = match client_builder.build() {
+            Ok(c) => c,
+            Err(e) => return Err(anyhow::anyhow!("reqwest client build failed: {e}")),
+        };
+        let mut direct_req = direct_client.post(&url).json(&request_body);
+        direct_req = match &self.auth_header {
+            AuthStyle::Bearer => {
+                direct_req.header("Authorization", format!("Bearer {}", credential))
+            }
+            AuthStyle::XApiKey => direct_req.header("x-api-key", credential),
+            AuthStyle::Custom(h) => direct_req.header(h.as_str(), credential),
+        };
+        let send_result = direct_req.send().await;
+        let (status, body_bytes) = match send_result {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.bytes().await {
+                    Ok(bytes) => (status, bytes.to_vec()),
+                    Err(e) => return Err(anyhow::anyhow!("read response body: {e}")),
+                }
+            }
             Err(chat_error) => {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
@@ -1769,7 +1762,7 @@ impl Provider for OpenAiCompatibleProvider {
                         });
                 }
 
-                return Err(chat_error);
+                return Err(chat_error.into());
             }
         };
 

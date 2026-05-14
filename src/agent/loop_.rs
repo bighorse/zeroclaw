@@ -3766,7 +3766,32 @@ pub async fn process_message_with_history(
     prior_history: Option<Vec<ChatMessage>>,
     external_observer: Option<Arc<dyn Observer>>,
 ) -> Result<(String, Vec<ChatMessage>)> {
-    process_message_inner(config, message, prior_history, external_observer).await
+    // 2026-05-14 V27 daemon hang isolation: run the entire agent loop on
+    // a brand-new single-thread tokio runtime. The main daemon
+    // multi-thread runtime degrades after ~6 LLM cycles — task wakers,
+    // timer wheel, and JoinHandle notifications all stop firing
+    // (confirmed across v8-v26: chat() block_in_place fixed one path
+    // but file_write tokio::fs::write inside the agent loop hung next).
+    // Wrapping process_message_inner here gives every user request a
+    // fresh runtime that cannot inherit accumulated wake-lost state.
+    //
+    // block_in_place moves the current worker out of the daemon's
+    // multi-thread scheduler so it can synchronously block on the
+    // isolated runtime. The current thread is the only thing dedicated
+    // to this request; other daemon tasks keep running on the
+    // remaining workers.
+    let message = message.to_string();
+    tokio::task::block_in_place(move || {
+        let isolated_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .thread_name("zc-isolated-agent")
+            .build()
+            .map_err(|e| anyhow::anyhow!("isolated agent runtime build failed: {e}"))?;
+        isolated_rt
+            .block_on(async move {
+                process_message_inner(config, &message, prior_history, external_observer).await
+            })
+    })
 }
 
 async fn process_message_inner(
