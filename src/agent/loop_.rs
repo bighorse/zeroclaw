@@ -2343,7 +2343,6 @@ pub(crate) async fn run_tool_call_loop(
         // observed daemon frozen between `tool.call success` log and
         // next iteration's `llm.request` log with no clue which await
         // hung; these markers narrow it down.
-        tracing::info!(iteration, "agent_loop_iter:A enter");
 
         if cancellation_token
             .as_ref()
@@ -2364,10 +2363,8 @@ pub(crate) async fn run_tool_call_loop(
             .into());
         }
 
-        tracing::info!(iteration, "agent_loop_iter:B before prepare_messages");
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
-        tracing::info!(iteration, "agent_loop_iter:C after prepare_messages");
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2400,12 +2397,10 @@ pub(crate) async fn run_tool_call_loop(
 
         let llm_started_at = Instant::now();
 
-        tracing::info!(iteration, "agent_loop_iter:D before fire_llm_input");
         // Fire void hook before LLM call
         if let Some(hooks) = hooks {
             hooks.fire_llm_input(history, model).await;
         }
-        tracing::info!(iteration, "agent_loop_iter:E after fire_llm_input, before chat()");
 
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -2976,11 +2971,9 @@ pub(crate) async fn run_tool_call_loop(
                     output: outcome.output.clone(),
                     error: None,
                 };
-                tracing::info!(tool = %call.name, "agent_loop_iter:F before fire_after_tool_call");
                 hooks
                     .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
                     .await;
-                tracing::info!(tool = %call.name, "agent_loop_iter:G after fire_after_tool_call");
             }
 
             // ── Failure retry: allow model to retry a failed call once ───────────
