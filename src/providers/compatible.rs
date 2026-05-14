@@ -1714,68 +1714,42 @@ impl Provider for OpenAiCompatibleProvider {
         let isolated_body = request_body.clone();
         let isolated_timeout = self.timeout_secs;
         let isolated_ua = self.user_agent.clone();
-        // 2026-05-14 V23 confirmed: tokio runtime task waker queue
-        // degrades after ~6 spawn_blocking JoinHandle.await cycles —
-        // BlockingTask completes but wake signal is lost. To bypass
-        // entirely, run HTTP on std::thread (not tokio's blocking pool)
-        // and have the async caller actively poll a std mpsc channel
-        // via tokio::time::sleep(50ms) — short timers still fire even
-        // when long timers (240s) do not, and we never await any
-        // tokio JoinHandle that could lose its wake.
-        eprintln!("CHAT_PRE_SPAWN: about to spawn std::thread");
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
-            anyhow::Result<(reqwest::StatusCode, Vec<u8>)>,
-        >(1);
-        std::thread::Builder::new()
-            .name(format!("zc-chat-{}", self.name))
-            .spawn(move || {
-                eprintln!("CHAT_IN_THREAD: std::thread started");
-                let result = do_http_chat_isolated(
+        // 2026-05-14 V24 confirmed: tokio runtime timer wheel itself
+        // dies after ~6-7 LLM cycles. Even tokio::time::sleep(50ms)
+        // stops firing — std::thread completes HTTP, sends via mpsc,
+        // but the async poll loop's sleep never wakes. So we cannot
+        // use ANY tokio await (JoinHandle, time::sleep, oneshot).
+        //
+        // Final fix: tokio::task::block_in_place runs a sync closure
+        // on the current worker, moving the worker out of the scheduler
+        // until the closure returns. The closure is plain sync code —
+        // no wake path, no scheduler dependency. Other tokio tasks
+        // run on remaining workers (multi-thread runtime).
+        //
+        // Inside block_in_place we build a fresh single-thread runtime
+        // and block_on the HTTP call. Both the inner runtime and the
+        // outer worker thread are independent of the main daemon
+        // runtime's degraded waker state.
+        eprintln!("CHAT_BLOCK_IN_PLACE: entering sync section");
+        let isolated_result: anyhow::Result<(reqwest::StatusCode, Vec<u8>)> =
+            tokio::task::block_in_place(|| {
+                eprintln!("CHAT_BIP_INNER: running do_http_chat_isolated");
+                do_http_chat_isolated(
                     isolated_url,
                     isolated_auth,
                     isolated_credential,
                     isolated_body,
                     isolated_timeout,
                     isolated_ua,
-                );
-                eprintln!("CHAT_THREAD_DONE: sending result");
-                let _ = result_tx.send(result);
-            })?;
-        eprintln!("CHAT_POST_SPAWN: thread spawned, polling rx");
-
-        // Active poll the std channel — never await JoinHandle.
-        let poll_start = std::time::Instant::now();
-        let poll_timeout = std::time::Duration::from_secs(self.timeout_secs + 30);
-        let isolated_result: Result<
-            anyhow::Result<(reqwest::StatusCode, Vec<u8>)>,
-            anyhow::Error,
-        > = loop {
-            match result_rx.try_recv() {
-                Ok(r) => {
-                    eprintln!("CHAT_POST_AWAIT: poll got result, ok={}", r.is_ok());
-                    break Ok(r);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if poll_start.elapsed() > poll_timeout {
-                        eprintln!("CHAT_POST_AWAIT: poll timeout exceeded");
-                        break Err(anyhow::anyhow!(
-                            "isolated chat thread did not respond within {} seconds",
-                            poll_timeout.as_secs()
-                        ));
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("CHAT_POST_AWAIT: rx disconnected");
-                    break Err(anyhow::anyhow!(
-                        "isolated chat thread disconnected before sending result"
-                    ));
-                }
-            }
-        };
+                )
+            });
+        eprintln!(
+            "CHAT_POST_BIP: block_in_place returned, ok={}",
+            isolated_result.is_ok()
+        );
         let (status, body_bytes) = match isolated_result {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(chat_error)) => {
+            Ok(pair) => pair,
+            Err(chat_error) => {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
@@ -1796,12 +1770,6 @@ impl Provider for OpenAiCompatibleProvider {
                 }
 
                 return Err(chat_error);
-            }
-            Err(poll_err) => {
-                anyhow::bail!(
-                    "{} isolated chat channel error: {poll_err}",
-                    self.name
-                );
             }
         };
 
