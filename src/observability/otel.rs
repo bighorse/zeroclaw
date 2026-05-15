@@ -335,6 +335,7 @@ impl Observer for OtelObserver {
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
+            ObserverEvent::ChatTurnCompleted { .. } => {}
         }
     }
 

@@ -1015,6 +1015,13 @@ pub struct GatewayConfig {
     /// HMAC secret for signing download URLs. If not set, derived from workspace path.
     #[serde(default)]
     pub download_secret: Option<String>,
+
+    /// Identifier of the user who owns this daemon instance.
+    /// Written by the provisioner; included in event webhook payloads so the
+    /// receiver can correlate events back to the originating user without
+    /// knowing the daemon's internal structure.
+    #[serde(default)]
+    pub owner_openid: Option<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1065,6 +1072,7 @@ impl Default for GatewayConfig {
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             public_url: None,
             download_secret: None,
+            owner_openid: None,
         }
     }
 }
@@ -2106,6 +2114,14 @@ impl Default for MemoryConfig {
 pub struct ObservabilityConfig {
     /// "none" | "log" | "prometheus" | "otel"
     pub backend: String,
+    /// If set, zeroclaw fires SOP lifecycle events to this URL via HTTP POST.
+    /// Any consumer (e.g. clawops) can subscribe; zeroclaw has no knowledge
+    /// of who is on the other end.
+    #[serde(default)]
+    pub event_webhook_url: Option<String>,
+    /// Optional shared secret sent as `X-Webhook-Secret` header for verification.
+    #[serde(default)]
+    pub event_webhook_secret: Option<String>,
 
     /// OTLP endpoint (e.g. "http://localhost:4318"). Only used when backend = "otel".
     #[serde(default)]
@@ -2138,6 +2154,8 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            event_webhook_url: None,
+            event_webhook_secret: None,
         }
     }
 }

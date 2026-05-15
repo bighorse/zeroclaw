@@ -1497,6 +1497,114 @@ async fn handle_sop_webhook(
     (StatusCode::OK, Json(body))
 }
 
+/// Per-request observer wrapper that intercepts `ToolCallStart { tool: "sop_execute" }`
+/// to (a) fire an event webhook and (b) signal the gateway to return early so the
+/// user gets an immediate "task started" reply while the agent loop continues in the
+/// background. Also fires a "done" webhook when `ChatTurnCompleted` is received.
+///
+/// Wraps the global observer — all other events pass through unchanged.
+struct SopStartedSignal {
+    inner: Arc<dyn crate::observability::Observer>,
+    /// Oneshot sender: fires with the SOP name when `sop_execute` is first called.
+    /// Allows the gateway to return early before the agent loop completes.
+    sop_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
+    /// Config for the outgoing event webhook (URL, secret, owner openid).
+    webhook_url: Option<String>,
+    webhook_secret: Option<String>,
+    owner_openid: Option<String>,
+    /// Tracks which SOP was started so the "done" webhook carries the same name.
+    sop_name_started: parking_lot::Mutex<Option<String>>,
+}
+
+impl SopStartedSignal {
+    fn new(
+        inner: Arc<dyn crate::observability::Observer>,
+        sop_tx: tokio::sync::oneshot::Sender<String>,
+        webhook_url: Option<String>,
+        webhook_secret: Option<String>,
+        owner_openid: Option<String>,
+    ) -> Self {
+        Self {
+            inner,
+            sop_tx: parking_lot::Mutex::new(Some(sop_tx)),
+            webhook_url,
+            webhook_secret,
+            owner_openid,
+            sop_name_started: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Fire an event payload to the configured webhook URL in a detached OS thread.
+    fn fire_webhook(&self, payload: serde_json::Value) {
+        let Some(url) = self.webhook_url.clone() else { return };
+        let secret = self.webhook_secret.clone();
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
+            let mut req = client.post(&url).json(&payload);
+            if let Some(s) = &secret {
+                req = req.header("X-Webhook-Secret", s.as_str());
+            }
+            if let Err(e) = req.send() {
+                tracing::warn!("SOP event webhook failed: {e}");
+            }
+        });
+    }
+}
+
+impl crate::observability::Observer for SopStartedSignal {
+    fn record_event(&self, event: &crate::observability::ObserverEvent) {
+        use crate::observability::ObserverEvent;
+        self.inner.record_event(event);
+        match event {
+            ObserverEvent::ToolCallStart { tool, arguments } if tool == "sop_execute" => {
+                // Parse SOP name from the tool arguments JSON string.
+                let sop_name = arguments
+                    .as_ref()
+                    .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                *self.sop_name_started.lock() = Some(sop_name.clone());
+
+                // Signal gateway to return early.
+                if let Some(tx) = self.sop_tx.lock().take() {
+                    let _ = tx.send(sop_name.clone());
+                }
+
+                // Fire "starting" webhook so consumers can create a pending task immediately.
+                self.fire_webhook(serde_json::json!({
+                    "event": "starting",
+                    "sop_name": sop_name,
+                    "openid": self.owner_openid,
+                }));
+            }
+            ObserverEvent::ChatTurnCompleted { response_text } => {
+                // Fire "done" webhook only if a SOP was started this turn.
+                if let Some(sop_name) = self.sop_name_started.lock().as_deref() {
+                    self.fire_webhook(serde_json::json!({
+                        "event": "done",
+                        "sop_name": sop_name,
+                        "openid": self.owner_openid,
+                        "response_text": response_text,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_metric(&self, metric: &crate::observability::ObserverMetric) {
+        self.inner.record_metric(metric);
+    }
+
+    fn name(&self) -> &str { "sop-started-signal" }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
 /// POST /api/chat — Bearer-authenticated chat that runs the full agent
 /// loop (tool execution, multi-turn LLM calls). Same auth/rate-limit/
 /// idempotency contract as `/webhook`, but routes through
@@ -1566,13 +1674,13 @@ async fn handle_api_chat(
         }
     }
 
-    let message = &req_body.message;
+    let message = req_body.message.clone();
 
     if state.auto_save {
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
+            .store(&key, &message, MemoryCategory::Conversation, None)
             .await;
     }
 
@@ -1597,51 +1705,110 @@ async fn handle_api_chat(
     };
 
     let config = state.config.lock().clone();
-    // process_message_with_history emits AgentStart/AgentEnd, LlmRequest/Response,
-    // ToolCall/ToolCallStart events through the supplied observer (which is the
-    // SSE broadcast observer in production), so we don't need to emit AgentStart
-    // here ourselves.
-    // Boxed: agent loop future is large; avoid clippy::large_futures.
-    let result = Box::pin(crate::agent::process_message_with_history(
-        config,
-        message,
-        prior_history,
-        Some(state.observer.clone()),
-    ))
-    .await;
+    let webhook_url = config.observability.event_webhook_url.clone();
+    let webhook_secret = config.observability.event_webhook_secret.clone();
+    let owner_openid = config.gateway.owner_openid.clone();
 
-    let duration = started_at.elapsed();
-    match result {
-        Ok((response, new_history)) => {
-            // Persist updated history (now includes user msg + assistant reply
-            // + any tool exchanges in between) for the next turn.
-            {
-                let mut guard = state.api_chat_history.lock();
-                *guard = new_history;
+    // Wrap the global observer in a per-request SopStartedSignal.  When the
+    // agent calls `sop_execute`, the signal fires immediately and lets the
+    // gateway return an early "task started" reply while the agent loop
+    // continues in a background thread (block_in_place occupies one worker).
+    let (sop_tx, sop_rx) = tokio::sync::oneshot::channel::<String>();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
+        anyhow::Result<(String, Vec<crate::providers::ChatMessage>)>,
+    >();
+
+    let signal_obs = Arc::new(SopStartedSignal::new(
+        state.observer.clone(),
+        sop_tx,
+        webhook_url,
+        webhook_secret,
+        owner_openid,
+    ));
+    let signal_obs_bg = signal_obs.clone();
+    let history_store = state.api_chat_history.clone();
+    let global_obs = state.observer.clone();
+    let model_label_clone = state.model.clone();
+
+    // Spawn the agent loop as a separate tokio task. process_message_with_history
+    // internally uses block_in_place + an isolated single-thread runtime, which
+    // is compatible with tokio::spawn on a multi-thread runtime — block_in_place
+    // moves the worker out so other tasks continue while this one blocks.
+    tokio::spawn(async move {
+        let result = crate::agent::process_message_with_history(
+            config,
+            &message,
+            prior_history,
+            Some(signal_obs_bg.clone() as Arc<dyn crate::observability::Observer>),
+        )
+        .await;
+        // Update conversation history and fire ChatTurnCompleted regardless of
+        // whether the gateway already returned early (SOP case) or is still waiting.
+        match &result {
+            Ok((response_text, new_history)) => {
+                { *history_store.lock() = new_history.clone(); }
+                crate::observability::Observer::record_event(
+                    signal_obs_bg.as_ref(),
+                    &crate::observability::ObserverEvent::ChatTurnCompleted {
+                        response_text: response_text.clone(),
+                    },
+                );
+                global_obs.record_metric(
+                    &crate::observability::ObserverMetric::RequestLatency(
+                        started_at.elapsed(),
+                    ),
+                );
             }
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            // process_message_with_history emits its own AgentEnd; we don't.
-            let _ = (provider_label, model_label);
-            let body = serde_json::json!({"response": response, "model": state.model});
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let sanitized = providers::sanitize_api_error(&e.to_string());
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::Error {
+            Err(e) => {
+                let sanitized = providers::sanitize_api_error(&e.to_string());
+                global_obs.record_event(&crate::observability::ObserverEvent::Error {
                     component: "gateway".to_string(),
-                    message: sanitized.clone(),
+                    message: sanitized,
                 });
-            let _ = (provider_label, model_label);
-            tracing::error!("/api/chat agent error: {}", sanitized);
-            let err = serde_json::json!({"error": "Chat failed", "detail": sanitized});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            }
+        }
+        let _ = result_tx.send(result);
+    });
+
+    let _ = (provider_label, model_label);
+
+    // Select: return as soon as the agent finishes (quick non-SOP path) OR as
+    // soon as a SOP is detected (early-return path — agent keeps running in bg).
+    tokio::select! {
+        res = result_rx => {
+            // Agent completed before (or without) triggering a SOP.
+            match res {
+                Ok(Ok((response, _))) => {
+                    let body = serde_json::json!({"response": response, "model": model_label_clone});
+                    (StatusCode::OK, Json(body))
+                }
+                Ok(Err(e)) => {
+                    let sanitized = providers::sanitize_api_error(&e.to_string());
+                    tracing::error!("/api/chat agent error: {}", sanitized);
+                    let err = serde_json::json!({"error": "Chat failed", "detail": sanitized});
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                }
+                Err(_) => {
+                    // Channel closed — background thread panicked
+                    let err = serde_json::json!({"error": "Chat failed", "detail": "agent thread panicked"});
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                }
+            }
+        }
+        Ok(sop_name) = sop_rx => {
+            // SOP detected — return immediately; agent loop continues in background.
+            // The SopStartedSignal will fire the "done" webhook when it finishes.
+            tracing::info!(sop_name = %sop_name, "SOP started — returning early from /api/chat");
+            let body = serde_json::json!({
+                "response": format!(
+                    "已为您发起「{}」，正在后台执行，预计约9分钟，结果将自动更新到任务列表。",
+                    sop_name
+                ),
+                "model": model_label_clone,
+                "sop_started": true,
+                "sop_name": sop_name,
+            });
+            (StatusCode::OK, Json(body))
         }
     }
 }
