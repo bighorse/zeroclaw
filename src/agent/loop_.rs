@@ -294,10 +294,30 @@ async fn auto_compact_history(
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
+///
+/// Always pins `user_profile_company_name` at the top regardless of FTS score,
+/// so skills that require the enterprise name never need to ask the user when
+/// the value is already stored in memory.
 async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
     let mut context = String::new();
 
-    // Pull relevant memories for this message
+    // Pin enterprise name unconditionally — FTS-based recall scores it low when
+    // the user message doesn't mention "company", so skills like qualification or
+    // policy-match would ask the user for a name that's already in memory.
+    let pinned_company = mem
+        .get("user_profile_company_name")
+        .await
+        .ok()
+        .flatten()
+        .filter(|e| !e.content.trim().is_empty());
+    if let Some(ref entry) = pinned_company {
+        context.push_str("[Pinned profile]\n");
+        let _ = writeln!(context, "- enterprise: {}", entry.content.trim());
+        context.push('\n');
+    }
+
+    // Pull relevant memories for this message (FTS-scored).
+    // Skip user_profile_company_name here to avoid showing it twice.
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
         let relevant: Vec<_> = entries
             .iter()
@@ -305,6 +325,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
                 Some(score) => score >= min_relevance_score,
                 None => true,
             })
+            .filter(|e| e.key != "user_profile_company_name")
             .collect();
 
         if !relevant.is_empty() {
@@ -315,8 +336,10 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
                 }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if context == "[Memory context]\n" {
-                context.clear();
+            if context.ends_with("[Memory context]\n") {
+                // All entries were filtered out; remove the header.
+                let trim_len = context.len() - "[Memory context]\n".len();
+                context.truncate(trim_len);
             } else {
                 context.push('\n');
             }
