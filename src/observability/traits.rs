@@ -61,6 +61,10 @@ pub enum ObserverEvent {
     },
     /// Periodic heartbeat tick from the runtime keep-alive loop.
     HeartbeatTick,
+    /// A chat turn (full agent loop) has produced a final response.
+    /// Fired by the gateway after `process_message_with_history` completes.
+    /// Observers that need the response text (e.g. webhook) listen for this.
+    ChatTurnCompleted { response_text: String },
     /// An error occurred in a named component.
     Error {
         /// Subsystem where the error originated (e.g., `"provider"`, `"gateway"`).

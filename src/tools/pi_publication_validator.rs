@@ -237,9 +237,7 @@ impl PiPublicationValidatorTool {
         // `authors[]` and fabricate a "last author" claim that
         // contradicted PubMed's actual ordering (DESTINY-Breast05
         // PMID:41370739: Shao Zhiming was 3rd of ~70, NOT last).
-        if positions.is_empty()
-            && Self::structured_fields_empty(paper)
-            && !paper.authors.is_empty()
+        if positions.is_empty() && Self::structured_fields_empty(paper) && !paper.authors.is_empty()
         {
             let n = paper.authors.len();
             if n >= 1 && Self::raw_author_matches(&paper.authors[0], pi_name) {
@@ -288,7 +286,10 @@ impl PiPublicationValidatorTool {
     /// `papers_field` lets PharmaClaw point to a nested array (e.g.
     /// `"all_papers"` for the SKILL output). Defaults to the JSON root
     /// being an array.
-    fn extract_papers(json: &Value, papers_field: Option<&str>) -> anyhow::Result<Vec<PaperRecord>> {
+    fn extract_papers(
+        json: &Value,
+        papers_field: Option<&str>,
+    ) -> anyhow::Result<Vec<PaperRecord>> {
         let array = match papers_field {
             Some(field) => json
                 .get(field)
@@ -310,11 +311,7 @@ impl PiPublicationValidatorTool {
         Ok(out)
     }
 
-    fn render_report(
-        pi_name: &str,
-        valid: &[PaperVerdict],
-        rejected: &[RejectedPaper],
-    ) -> String {
+    fn render_report(pi_name: &str, valid: &[PaperVerdict], rejected: &[RejectedPaper]) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let _ = writeln!(
@@ -329,7 +326,10 @@ impl PiPublicationValidatorTool {
         );
 
         if !valid.is_empty() {
-            let _ = writeln!(out, "\n## ✅ Valid representative papers (use these in `pi_intel.md`)\n");
+            let _ = writeln!(
+                out,
+                "\n## ✅ Valid representative papers (use these in `pi_intel.md`)\n"
+            );
             for p in valid {
                 let _ = writeln!(
                     out,
@@ -354,7 +354,13 @@ impl PiPublicationValidatorTool {
                  will flag this.\n"
             );
             for r in rejected {
-                let _ = writeln!(out, "- PMID:{} — {}\n  - reason: {}", r.pmid, r.title.trim_end_matches('.'), r.reason);
+                let _ = writeln!(
+                    out,
+                    "- PMID:{} — {}\n  - reason: {}",
+                    r.pmid,
+                    r.title.trim_end_matches('.'),
+                    r.reason
+                );
             }
         }
 
@@ -543,13 +549,7 @@ impl Tool for PiPublicationValidatorTool {
 mod tests {
     use super::*;
 
-    fn paper(
-        pmid: &str,
-        first: &str,
-        last: &str,
-        is_first: bool,
-        is_corr: bool,
-    ) -> PaperRecord {
+    fn paper(pmid: &str, first: &str, last: &str, is_first: bool, is_corr: bool) -> PaperRecord {
         PaperRecord {
             pmid: pmid.to_string(),
             title: format!("Paper {pmid}"),
@@ -615,7 +615,9 @@ mod tests {
         assert!(!PiPublicationValidatorTool::last_author_matches(
             "Wang Y", "Zhang Li"
         ));
-        assert!(!PiPublicationValidatorTool::last_author_matches("", "Zhang Li"));
+        assert!(!PiPublicationValidatorTool::last_author_matches(
+            "", "Zhang Li"
+        ));
     }
 
     #[test]
@@ -682,7 +684,8 @@ mod tests {
     #[test]
     fn extract_papers_errors_on_missing_field() {
         let json: Value = serde_json::json!({"some_other_key": []});
-        let err = PiPublicationValidatorTool::extract_papers(&json, Some("all_papers")).unwrap_err();
+        let err =
+            PiPublicationValidatorTool::extract_papers(&json, Some("all_papers")).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -714,10 +717,7 @@ mod tests {
         // shipped only `authors[]` raw list with no structured flags.
         // V7 fallback should accept PI as first-author when authors[0]
         // matches.
-        let p = paper_raw_authors(
-            "12345",
-            vec!["Zhang Li", "Wang Y", "Liu Z"],
-        );
+        let p = paper_raw_authors("12345", vec!["Zhang Li", "Wang Y", "Liu Z"]);
         let v = PiPublicationValidatorTool::classify(&p, "Zhang Li").unwrap();
         assert!(v.author_position.contains("first-author"));
         assert!(v.author_position.contains("from raw authors[]"));
@@ -725,10 +725,7 @@ mod tests {
 
     #[test]
     fn classify_v7_fallback_accepts_last_author_from_raw_list() {
-        let p = paper_raw_authors(
-            "12345",
-            vec!["Wang Y", "Liu Z", "Zhang Li"],
-        );
+        let p = paper_raw_authors("12345", vec!["Wang Y", "Liu Z", "Zhang Li"]);
         let v = PiPublicationValidatorTool::classify(&p, "Zhang Li").unwrap();
         assert!(v.author_position.contains("last-author"));
     }
@@ -781,9 +778,13 @@ mod tests {
             first: "Li".into(),
             affiliation: String::new(),
         };
-        assert!(PiPublicationValidatorTool::raw_author_matches(&a, "Zhang Li"));
+        assert!(PiPublicationValidatorTool::raw_author_matches(
+            &a, "Zhang Li"
+        ));
         assert!(PiPublicationValidatorTool::raw_author_matches(&a, "Zhang"));
-        assert!(!PiPublicationValidatorTool::raw_author_matches(&a, "Wang Y"));
+        assert!(!PiPublicationValidatorTool::raw_author_matches(
+            &a, "Wang Y"
+        ));
     }
 
     #[test]
@@ -846,8 +847,7 @@ mod tests {
             "total_papers": papers.len(),
             "all_papers": papers,
         });
-        std::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap())
-            .expect("write json");
+        std::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap()).expect("write json");
         path
     }
 

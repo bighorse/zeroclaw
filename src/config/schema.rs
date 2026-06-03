@@ -1015,6 +1015,13 @@ pub struct GatewayConfig {
     /// HMAC secret for signing download URLs. If not set, derived from workspace path.
     #[serde(default)]
     pub download_secret: Option<String>,
+
+    /// Identifier of the user who owns this daemon instance.
+    /// Written by the provisioner; included in event webhook payloads so the
+    /// receiver can correlate events back to the originating user without
+    /// knowing the daemon's internal structure.
+    #[serde(default)]
+    pub owner_openid: Option<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1065,6 +1072,7 @@ impl Default for GatewayConfig {
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             public_url: None,
             download_secret: None,
+            owner_openid: None,
         }
     }
 }
@@ -1799,7 +1807,18 @@ pub fn build_runtime_proxy_client_with_timeouts(
 
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        // 2026-05-13 clawops policy-match daemon deadlock fix:
+        // reqwest's default keep-alive pool was leaking half-closed
+        // sockets when the remote (dashscope/deepseek) closed
+        // connections after large SSE responses. The cached Client
+        // shared across LLM calls accumulated these dead sockets,
+        // and after 5-8 calls a new chat() request would pick a
+        // half-closed socket from the pool and hang forever in
+        // read() with no wake (5 worker futex_wait + 1 ep_poll).
+        // Force every LLM call to use a fresh TCP connection so
+        // no half-closed socket is ever reused.
+        .pool_max_idle_per_host(0);
     let builder = apply_runtime_proxy_to_builder(builder, service_key);
     let client = builder.build().unwrap_or_else(|error| {
         tracing::warn!(
@@ -2095,6 +2114,14 @@ impl Default for MemoryConfig {
 pub struct ObservabilityConfig {
     /// "none" | "log" | "prometheus" | "otel"
     pub backend: String,
+    /// If set, zeroclaw fires SOP lifecycle events to this URL via HTTP POST.
+    /// Any consumer (e.g. clawops) can subscribe; zeroclaw has no knowledge
+    /// of who is on the other end.
+    #[serde(default)]
+    pub event_webhook_url: Option<String>,
+    /// Optional shared secret sent as `X-Webhook-Secret` header for verification.
+    #[serde(default)]
+    pub event_webhook_secret: Option<String>,
 
     /// OTLP endpoint (e.g. "http://localhost:4318"). Only used when backend = "otel".
     #[serde(default)]
@@ -2127,6 +2154,8 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            event_webhook_url: None,
+            event_webhook_secret: None,
         }
     }
 }

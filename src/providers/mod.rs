@@ -1202,13 +1202,16 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
-            "Qwen",
-            qwen_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-            true,
-        ))),
+        name if qwen_base_url(name).is_some() => Ok(compat(
+            OpenAiCompatibleProvider::new_with_vision(
+                "Qwen",
+                qwen_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+                true,
+            )
+            .without_responses_fallback(),
+        )),
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(compat(OpenAiCompatibleProvider::new(

@@ -43,9 +43,7 @@ use super::traits::{Tool, ToolResult};
 /// false positives. We only match the explicit `PMID` prefix.
 fn pmid_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)PMID[:\s]\s*(\d{7,9})").expect("static regex compiles")
-    })
+    RE.get_or_init(|| Regex::new(r"(?i)PMID[:\s]\s*(\d{7,9})").expect("static regex compiles"))
 }
 
 /// Matches markdown headings (`#` through `######`).
@@ -129,14 +127,11 @@ impl PmidDedupCheckTool {
                     let truncated: String = trimmed.chars().take(140).collect();
                     format!("{truncated}…")
                 };
-                by_pmid
-                    .entry(pmid)
-                    .or_default()
-                    .push(PmidOccurrence {
-                        line_no: idx + 1,
-                        section: current_section.clone(),
-                        context,
-                    });
+                by_pmid.entry(pmid).or_default().push(PmidOccurrence {
+                    line_no: idx + 1,
+                    section: current_section.clone(),
+                    context,
+                });
             }
         }
 
@@ -214,10 +209,7 @@ impl PmidDedupCheckTool {
         }
 
         if !heavy_reuse.is_empty() {
-            let _ = writeln!(
-                out,
-                "## ⚠️ Heavy reuse (P1 — PMID cited ≥3 times)\n"
-            );
+            let _ = writeln!(out, "## ⚠️ Heavy reuse (P1 — PMID cited ≥3 times)\n");
             for (pmid, occs) in heavy_reuse {
                 let sections: std::collections::HashSet<&str> =
                     occs.iter().map(|o| o.section.as_str()).collect();

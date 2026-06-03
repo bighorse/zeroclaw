@@ -14,8 +14,42 @@ use std::time::Duration;
 // the retry loop continues, falls back to the next provider, or aborts
 // immediately — avoiding wasted latency on errors that cannot self-heal.
 
+/// Stream-layer protocol error that retrying the SAME provider almost never
+/// fixes (server-side chunked-encoding glitch / HTTP/2 stream RST / TLS
+/// framing failure / connection drop mid-stream).
+///
+/// Why "fail fast" on these (2026-05-11 PI 高原 v_gao_v6 hotfix):
+/// Real observation: PharmaClaw daemon hit `error decoding response body`
+/// from deepseek-v4-pro 4/4 consecutive retries × ~3 min each = 12 min
+/// wasted before fallback. The error reproduces because it's deepseek's
+/// own server-side streaming issue, not a transient that retry can heal.
+/// Per the v_gao_v6 monitor log, this happened twice in one hour (11:41
+/// AND 12:32) — same deterministic 12-min wall before falling back.
+///
+/// Classifying these as non-retryable causes the retry loop to `break`
+/// after attempt 1 and try the fallback provider immediately — saving
+/// ~9 min per failed call.
+fn is_stream_protocol_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    // reqwest's stringified errors when chunked/H2/TLS layer fails
+    msg.contains("error decoding response body")
+        || msg.contains("error in stream")
+        || msg.contains("stream protocol error")
+        || msg.contains("connection reset")
+        || msg.contains("broken pipe")
+        || msg.contains("transport error")
+        || msg.contains("unexpected eof")
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // Stream-protocol errors won't heal on retry against the same provider
+    // (server-side / network-layer fault). Skip the retry loop and let
+    // fallback handle them.
+    if is_stream_protocol_error(err) {
+        return true;
+    }
+
     if is_context_window_exceeded(err) {
         return true;
     }
@@ -923,7 +957,37 @@ impl Provider for ReliableProvider {
                         messages: request.messages,
                         tools: request.tools,
                     };
-                    match provider.chat(req, current_model, temperature).await {
+                    // 2026-05-13 hard outer timeout on chat() call.
+                    // reqwest's internal .timeout() and our spawn-task
+                    // SSE idle-timeout (compatible.rs) have proven
+                    // unreliable across the non-streaming chat() path
+                    // — daemon observed futex-locked with no chat
+                    // response after 4+ min on deepseek-v4-pro.
+                    // 240s = generous for reasoning models on 120K
+                    // context, firm enough to trigger fallback to
+                    // qwen before the gateway 5min timeout strands
+                    // the client.
+                    let chat_fut =
+                        provider.chat(req, current_model, temperature);
+                    let chat_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(240),
+                        chat_fut,
+                    )
+                    .await;
+                    let outcome = match chat_result {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            tracing::error!(
+                                provider = provider_name,
+                                model = *current_model,
+                                "Provider chat() exceeded 240s outer timeout — treating as unexpected eof for fallback"
+                            );
+                            Err(anyhow::anyhow!(
+                                "unexpected eof: provider chat() exceeded 240s outer timeout (provider unresponsive)"
+                            ))
+                        }
+                    };
+                    match outcome {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -1321,7 +1385,10 @@ mod tests {
         )));
         assert!(!is_non_retryable(&anyhow::anyhow!("502 Bad Gateway")));
         assert!(!is_non_retryable(&anyhow::anyhow!("timeout")));
-        assert!(!is_non_retryable(&anyhow::anyhow!("connection reset")));
+        // 2026-05-11 v_gao_v6 behavior change: "connection reset" is now
+        // a stream-protocol error → non_retryable (skip same-provider
+        // retry, jump to fallback). See is_stream_protocol_error docs.
+        assert!(is_non_retryable(&anyhow::anyhow!("connection reset")));
         assert!(!is_non_retryable(&anyhow::anyhow!(
             "model overloaded, try again later"
         )));
@@ -1768,6 +1835,56 @@ mod tests {
             !is_non_retryable(&err),
             "502 must NOT be treated as non-retryable"
         );
+    }
+
+    // ── §2.1-bis Stream-protocol fail-fast tests (2026-05-11 v_gao_v6) ──
+
+    #[test]
+    fn stream_protocol_error_detects_error_decoding_response_body() {
+        let err = anyhow::anyhow!("error decoding response body");
+        assert!(
+            is_stream_protocol_error(&err),
+            "deepseek's chunked-encoding glitch must be flagged"
+        );
+        assert!(
+            is_non_retryable(&err),
+            "stream protocol errors must short-circuit retry loop"
+        );
+    }
+
+    #[test]
+    fn stream_protocol_error_detects_connection_reset() {
+        let err = anyhow::anyhow!("Connection reset by peer");
+        assert!(is_stream_protocol_error(&err));
+        assert!(is_non_retryable(&err));
+    }
+
+    #[test]
+    fn stream_protocol_error_detects_unexpected_eof() {
+        let err = anyhow::anyhow!("Unexpected EOF in stream");
+        assert!(is_stream_protocol_error(&err));
+        assert!(is_non_retryable(&err));
+    }
+
+    #[test]
+    fn stream_protocol_error_detects_transport_error() {
+        let err =
+            anyhow::anyhow!("Qwen native chat transport error: error sending request for url");
+        assert!(is_stream_protocol_error(&err));
+        assert!(is_non_retryable(&err));
+    }
+
+    #[test]
+    fn stream_protocol_error_does_not_flag_unrelated_errors() {
+        let err = anyhow::anyhow!("Something unrelated happened");
+        assert!(!is_stream_protocol_error(&err));
+        // unrelated errors fall through to other classifier rules
+    }
+
+    #[test]
+    fn stream_protocol_error_case_insensitive() {
+        let err = anyhow::anyhow!("ERROR DECODING RESPONSE BODY");
+        assert!(is_stream_protocol_error(&err));
     }
 
     // ── §2.2 Rate limit Retry-After edge cases ───────────────

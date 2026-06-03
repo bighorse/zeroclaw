@@ -3780,6 +3780,7 @@ pub async fn start_channels(
                     runner.register(Box::new(crate::hooks::builtin::SopEnforcementHook::new(
                         config.hooks.builtin.sop_enforcement.clone(),
                         std::sync::Arc::clone(engine),
+                        workspace.clone(),
                     )));
                 } else {
                     tracing::warn!(

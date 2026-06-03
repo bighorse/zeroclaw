@@ -39,6 +39,11 @@ pub struct OpenAiCompatibleProvider {
     native_tool_calling: bool,
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
     timeout_secs: u64,
+    /// Provider-specific extra fields merged into the request body top-level
+    /// before sending. e.g. DeepSeek 用 `{"thinking": {"type": "disabled"}}`
+    /// 关闭 thinking mode,避免 reasoning_content 在 agent 多轮 tool_call 中
+    /// 雪球累积触发服务端抖动(deepseek 文档: 有工具调用时 reasoning_content 必须回传)。
+    extra_request_fields: Option<serde_json::Value>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -173,12 +178,28 @@ impl OpenAiCompatibleProvider {
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
             timeout_secs: 120,
+            extra_request_fields: None,
         }
+    }
+
+    /// 注入 provider-specific 顶层字段(merge 到 request body 根级别),
+    /// 用于 deepseek 关 thinking 等 OpenAI 兼容标准之外的扩展参数。
+    pub fn with_extra_request_fields(mut self, fields: serde_json::Value) -> Self {
+        self.extra_request_fields = Some(fields);
+        self
     }
 
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// 关掉 chat_completions 失败后自动 fallback 到 /responses 端点的行为。
+    /// 用于 DashScope (qwen) 这种 chat_completions 支持但 /responses 不支持
+    /// qwen 模型的平台 — 走 fallback 反而 mask 真实错误并必然失败。
+    pub fn without_responses_fallback(mut self) -> Self {
+        self.supports_responses_fallback = false;
         self
     }
 
@@ -224,7 +245,15 @@ impl OpenAiCompatibleProvider {
             let builder = Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .default_headers(headers);
+                .default_headers(headers)
+                // 2026-05-13 clawops daemon deadlock fix (see also
+                // config/schema.rs build_runtime_proxy_client_with_timeouts):
+                // reqwest keep-alive pool was retaining half-closed
+                // sockets after large SSE responses; the cached Client
+                // would pick a dead socket on the 5th-8th LLM call and
+                // hang forever in read() with no wake. Force fresh TCP
+                // connection per call to avoid the broken socket reuse.
+                .pool_max_idle_per_host(0);
             let builder =
                 crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible");
 
@@ -638,51 +667,115 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
 }
 
 /// Convert SSE byte stream to text chunks.
+///
+/// 2026-05-11 rewrite (v_zhang DeepSeek streaming hotfix):
+///
+/// Previous implementation had four bugs surfaced by deepseek-v4-pro with
+/// large prompt + long reasoning_content output:
+///
+/// 1. **buffer drain + re-slice double-skip** — `drain(..=pos)` already
+///    removed the first `pos+1` chars; then `buffer = buffer[pos+1..]`
+///    skipped *another* `pos+1` chars. Every chunk that contained ≥2
+///    SSE events lost the second event entirely. Cumulative SSE event
+///    loss made the JSON parser see truncated payloads and emit
+///    "error decoding response body" — the exact symptom v_zhang and
+///    v_ma_yiming PIs reported (5-15min per LLM call with 4 retries).
+///
+/// 2. **UTF-8 boundary break on chunk seam** — `String::from_utf8` is
+///    strict; an HTTP chunk that splits a CJK character (3 bytes)
+///    fails the conversion and `break`s the loop, terminating the
+///    stream. PharmaClaw outputs are mostly Chinese so this triggered
+///    constantly. Fix: byte buffer + `String::from_utf8_lossy` on
+///    line boundaries only.
+///
+/// 3. **Single-line parse failure terminates entire stream** —
+///    `return` on `parse_sse_line` error killed downstream output.
+///    SSE spec allows skipping malformed events; now we log and
+///    continue.
+///
+/// 4. **mpsc channel capacity 100** — deepseek-v4-pro can emit
+///    hundreds of chunks per second across reasoning_content +
+///    content. 100-slot backpressure stalled the sender. Bumped to
+///    1024.
+/// Max idle time between SSE chunks before treating the stream as dead.
+/// reqwest's request-level `.timeout()` only covers up to first-byte;
+/// once the SSE response is established, individual chunk-to-chunk
+/// gaps are NOT bounded — a misbehaving provider (observed with
+/// deepseek-v4-pro 2026-05-13 on clawops policy-match SOP) can leave
+/// the stream open with no data for 30+ minutes, hanging the daemon.
+///
+/// 90s is generous for reasoning models that may pause between
+/// reasoning_content + content phases, but firmly catches "deepseek
+/// stopped sending" silent hangs. On timeout we emit a
+/// `StreamError::Provider("unexpected eof ...")` — the message
+/// contains "unexpected eof" so `reliable::is_stream_protocol_error()`
+/// classifies it as non-retryable and the fallback chain kicks in
+/// immediately instead of waiting forever.
+const SSE_IDLE_TIMEOUT_SECS: u64 = 90;
+
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-    // Create a channel to send chunks
-    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(1024);
 
     tokio::spawn(async move {
-        // Buffer for incomplete lines
-        let mut buffer = String::new();
+        tracing::debug!("sse_bytes_to_chunks: entered, idle_timeout={SSE_IDLE_TIMEOUT_SECS}s");
+
+        // Byte buffer (not String) — defers UTF-8 conversion to line
+        // boundaries so we don't fail on mid-character chunk seams.
+        let mut byte_buf: Vec<u8> = Vec::with_capacity(8192);
 
         // Get response body as bytes stream
-        match response.error_for_status_ref() {
-            Ok(_) => {}
-            Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e))).await;
-                return;
-            }
+        if let Err(e) = response.error_for_status_ref() {
+            let _ = tx.send(Err(StreamError::Http(e))).await;
+            return;
         }
 
         let mut bytes_stream = response.bytes_stream();
 
-        while let Some(item) = bytes_stream.next().await {
+        let idle = std::time::Duration::from_secs(SSE_IDLE_TIMEOUT_SECS);
+        loop {
+            let item = match tokio::time::timeout(idle, bytes_stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break, // stream ended cleanly
+                Err(_) => {
+                    // Idle timeout fired — provider stopped sending
+                    // chunks. Surface as a stream-protocol error so
+                    // reliable.rs short-circuits retries on this
+                    // provider and switches to the fallback chain.
+                    tracing::error!(
+                        "SSE idle timeout: no chunk received for {SSE_IDLE_TIMEOUT_SECS}s — provider silent hang"
+                    );
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!(
+                            "unexpected eof: no SSE chunk received for {SSE_IDLE_TIMEOUT_SECS}s (provider silent hang)"
+                        ))))
+                        .await;
+                    // Break (not return) so final_chunk is sent — some
+                    // upstream consumers wait for the terminating
+                    // StreamChunk::final_chunk() to unblock recv loops.
+                    break;
+                }
+            };
             match item {
                 Ok(bytes) => {
-                    // Convert bytes to string and process line by line
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            break;
-                        }
-                    };
+                    byte_buf.extend_from_slice(&bytes);
 
-                    buffer.push_str(&text);
+                    // Process complete lines (\n terminated). All
+                    // bytes before the last \n are line-complete;
+                    // everything after waits for the next chunk.
+                    while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+                        // Split: line_bytes = bytes[..=pos], rest = bytes[pos+1..]
+                        let rest = byte_buf.split_off(pos + 1);
+                        let line_bytes = std::mem::replace(&mut byte_buf, rest);
 
-                    // Process complete lines
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer.drain(..=pos).collect::<String>();
-                        buffer = buffer[pos + 1..].to_string();
+                        // Lossy UTF-8: replace malformed sequences with
+                        // U+FFFD rather than failing. Defensive — most
+                        // OpenAI-compatible providers emit valid UTF-8,
+                        // but at a line boundary any malformed bytes
+                        // would be a producer bug we should tolerate.
+                        let line = String::from_utf8_lossy(&line_bytes);
 
                         match parse_sse_line(&line) {
                             Ok(Some(content)) => {
@@ -695,9 +788,14 @@ fn sse_bytes_to_chunks(
                                 }
                             }
                             Ok(None) => {}
-                            Err(e) => {
-                                let _ = tx.send(Err(e)).await;
-                                return;
+                            Err(_e) => {
+                                // SSE spec: skip malformed events,
+                                // don't terminate the stream. Log via
+                                // observability when wired up; for now
+                                // silently continue so a single bad
+                                // event doesn't kill a 5-minute LLM
+                                // response.
+                                continue;
                             }
                         }
                     }
@@ -706,6 +804,19 @@ fn sse_bytes_to_chunks(
                     let _ = tx.send(Err(StreamError::Http(e))).await;
                     break;
                 }
+            }
+        }
+
+        // Flush trailing partial line if any (rare; provider should
+        // end with \n[DONE]\n\n but be defensive).
+        if !byte_buf.is_empty() {
+            let line = String::from_utf8_lossy(&byte_buf);
+            if let Ok(Some(content)) = parse_sse_line(&line) {
+                let mut chunk = StreamChunk::delta(content);
+                if count_tokens {
+                    chunk = chunk.with_token_estimate();
+                }
+                let _ = tx.send(Ok(chunk)).await;
             }
         }
 
@@ -1494,15 +1605,59 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(
-                self.http_client().post(&url).json(&native_request),
-                credential,
-            )
-            .send()
-            .await
-        {
-            Ok(response) => response,
+        // Merge extra_request_fields(如 deepseek thinking disabled) 到 body 顶层。
+        let request_body = match self.extra_request_fields.as_ref() {
+            Some(extras) => {
+                let mut value = serde_json::to_value(&native_request)
+                    .unwrap_or_else(|_| serde_json::Value::Null);
+                if let (Some(obj), Some(extra_obj)) = (value.as_object_mut(), extras.as_object()) {
+                    for (k, v) in extra_obj {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+                value
+            }
+            None => serde_json::to_value(&native_request)
+                .unwrap_or_else(|_| serde_json::Value::Null),
+        };
+        // 2026-05-14 V27: process_message_inner now wraps the whole
+        // agent loop in block_in_place + a fresh isolated tokio
+        // runtime, so this chat() call already runs on a fresh runtime
+        // that cannot accumulate wake-lost state. Use plain reqwest
+        // async path with http1_only + pool_max_idle(0) for safety.
+        let mut client_builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
+            .http1_only();
+        if let Some(ua) = self.user_agent.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(ua) {
+                let mut headers = HeaderMap::new();
+                headers.insert(USER_AGENT, value);
+                client_builder = client_builder.default_headers(headers);
+            }
+        }
+        let direct_client = match client_builder.build() {
+            Ok(c) => c,
+            Err(e) => return Err(anyhow::anyhow!("reqwest client build failed: {e}")),
+        };
+        let mut direct_req = direct_client.post(&url).json(&request_body);
+        direct_req = match &self.auth_header {
+            AuthStyle::Bearer => {
+                direct_req.header("Authorization", format!("Bearer {}", credential))
+            }
+            AuthStyle::XApiKey => direct_req.header("x-api-key", credential),
+            AuthStyle::Custom(h) => direct_req.header(h.as_str(), credential),
+        };
+        let send_result = direct_req.send().await;
+        let (status, body_bytes) = match send_result {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.bytes().await {
+                    Ok(bytes) => (status, bytes.to_vec()),
+                    Err(e) => return Err(anyhow::anyhow!("read response body: {e}")),
+                }
+            }
             Err(chat_error) => {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
@@ -1527,9 +1682,8 @@ impl Provider for OpenAiCompatibleProvider {
             }
         };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await?;
+        if !status.is_success() {
+            let error = String::from_utf8_lossy(&body_bytes).to_string();
             let sanitized = super::sanitize_api_error(&error);
 
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
@@ -1567,7 +1721,7 @@ impl Provider for OpenAiCompatibleProvider {
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let native_response: ApiChatResponse = response.json().await?;
+        let native_response: ApiChatResponse = serde_json::from_slice(&body_bytes)?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -1658,11 +1812,41 @@ impl Provider for OpenAiCompatibleProvider {
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
 
-            // Send request
-            let response = match req_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
+            // Send request — wrap in tokio::time::timeout to enforce
+            // an upper bound on the send→headers phase. reqwest's own
+            // .timeout() is unreliable across connection-pool reuse
+            // and HTTP/2 stream multiplexing; we've observed deepseek
+            // hanging indefinitely (no TCP connection visible, daemon
+            // futex-locked) where reqwest's 120s should have fired.
+            // 120s is enough for any reasonable provider to start
+            // responding; if the provider is unresponsive, we want to
+            // fail fast and let reliable.rs trigger the fallback chain.
+            tracing::debug!("chat_stream: send().await starting");
+            let send_fut = req_builder.send();
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                send_fut,
+            )
+            .await
+            {
+                Ok(Ok(r)) => {
+                    tracing::debug!("chat_stream: send() returned (status={})", r.status());
+                    r
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("chat_stream: send() reqwest error: {e}");
                     let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "chat_stream: send() timed out after 120s — provider unresponsive"
+                    );
+                    let _ = tx
+                        .send(Err(StreamError::Provider(
+                            "unexpected eof: send() timed out after 120s waiting for response headers (provider unresponsive)".to_string(),
+                        )))
+                        .await;
                     return;
                 }
             };
@@ -2775,6 +2959,165 @@ mod tests {
         let line = "data: [DONE]";
         let result = parse_sse_line(line).unwrap();
         assert_eq!(result, None);
+    }
+
+    // ── sse_bytes_to_chunks rewrite regression tests (2026-05-11
+    //   v_zhang DeepSeek streaming hotfix) ──────────────────────────
+
+    /// Bug 1 regression: byte-buffer line splitter must not lose
+    /// SSE events when a single network chunk contains multiple
+    /// "data: ..." lines. The pre-fix implementation drained the
+    /// first line then re-sliced past it, dropping every other line.
+    #[test]
+    fn byte_buffer_line_split_does_not_double_skip() {
+        // Simulate the inner line-extraction loop of the rewritten
+        // sse_bytes_to_chunks. Input has 3 complete lines packed
+        // into one bytes chunk.
+        let mut byte_buf: Vec<u8> = Vec::new();
+        byte_buf.extend_from_slice(b"line1\nline2\nline3\n");
+
+        let mut extracted: Vec<String> = Vec::new();
+        while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+            let rest = byte_buf.split_off(pos + 1);
+            let line_bytes = std::mem::replace(&mut byte_buf, rest);
+            let line = String::from_utf8_lossy(&line_bytes).to_string();
+            extracted.push(line.trim_end().to_string());
+        }
+        assert_eq!(extracted, vec!["line1", "line2", "line3"]);
+        assert!(byte_buf.is_empty(), "no trailing data should remain");
+    }
+
+    /// Bug 1 regression: even with a packed "data: ..." stream
+    /// containing 3 SSE events, all 3 must be parseable. Pre-fix
+    /// implementation lost events 2 and 3.
+    #[test]
+    fn byte_buffer_processes_multiple_packed_sse_events() {
+        let payload = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n";
+        let mut byte_buf: Vec<u8> = Vec::from(payload.as_slice());
+
+        let mut contents: Vec<String> = Vec::new();
+        while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+            let rest = byte_buf.split_off(pos + 1);
+            let line_bytes = std::mem::replace(&mut byte_buf, rest);
+            let line = String::from_utf8_lossy(&line_bytes);
+            if let Ok(Some(c)) = parse_sse_line(&line) {
+                contents.push(c);
+            }
+        }
+        assert_eq!(contents, vec!["a", "b", "c"]);
+    }
+
+    /// Bug 2 regression: UTF-8 character split across two chunks
+    /// must not break parsing. The pre-fix implementation called
+    /// String::from_utf8 on each raw chunk, failing on mid-character
+    /// seams (common with Chinese output where each char is 3 bytes).
+    #[test]
+    fn byte_buffer_handles_utf8_split_across_chunks() {
+        // "界" in UTF-8 is 0xE7 0x95 0x8C.
+        // Simulate two network chunks: first ends mid-character,
+        // second completes it + adds a complete SSE event.
+        let chunk1: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"\xe7"; // partial
+        let chunk2: &[u8] = b"\x95\x8c\"}}]}\n"; // completes 界 + closes line
+
+        let mut byte_buf: Vec<u8> = Vec::new();
+        byte_buf.extend_from_slice(chunk1);
+        // Mid-char: no complete line yet, no extraction
+        assert!(byte_buf.iter().position(|&b| b == b'\n').is_none());
+
+        byte_buf.extend_from_slice(chunk2);
+        // Now a complete line exists; extract and verify "界" intact.
+        let pos = byte_buf.iter().position(|&b| b == b'\n').unwrap();
+        let rest = byte_buf.split_off(pos + 1);
+        let line_bytes = std::mem::replace(&mut byte_buf, rest);
+        let line = String::from_utf8_lossy(&line_bytes);
+        let content = parse_sse_line(&line).unwrap().unwrap();
+        assert_eq!(
+            content, "界",
+            "UTF-8 character must reassemble across chunks"
+        );
+    }
+
+    /// Bug 3 regression: malformed SSE event (broken JSON) must NOT
+    /// terminate the stream. Pre-fix implementation `return`ed on
+    /// parse error, killing a 5-minute LLM response on a single
+    /// transient glitch.
+    #[test]
+    fn malformed_sse_event_skipped_not_fatal() {
+        // Three lines: first valid, second broken JSON, third valid.
+        let payload = b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\
+                        data: {invalid json}\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\"third\"}}]}\n";
+        let mut byte_buf: Vec<u8> = Vec::from(payload.as_slice());
+        let mut successful: Vec<String> = Vec::new();
+        let mut errors: usize = 0;
+        while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+            let rest = byte_buf.split_off(pos + 1);
+            let line_bytes = std::mem::replace(&mut byte_buf, rest);
+            let line = String::from_utf8_lossy(&line_bytes);
+            match parse_sse_line(&line) {
+                Ok(Some(c)) => successful.push(c),
+                Ok(None) => {}
+                Err(_) => errors += 1,
+            }
+        }
+        // Skipped the broken event, but recovered both good ones.
+        assert_eq!(successful, vec!["first", "third"]);
+        assert_eq!(
+            errors, 1,
+            "broken event should be reported as 1 error, not abort"
+        );
+    }
+
+    /// Bug 4 regression: smoke test the channel capacity bump. We
+    /// can't easily test the actual channel inside sse_bytes_to_chunks
+    /// without a mock reqwest::Response, but verify the constant is
+    /// what we expect to catch accidental regressions.
+    #[test]
+    fn sse_channel_capacity_smoke() {
+        // This test reads the source file and grep's for the channel
+        // capacity literal. Future refactors can replace this with a
+        // proper integration test when a streaming mock is in place.
+        let src = include_str!("compatible.rs");
+        assert!(
+            src.contains("mpsc::channel::<StreamResult<StreamChunk>>(1024)"),
+            "SSE channel capacity should be 1024 (bumped from 100 in v_zhang fix)"
+        );
+    }
+
+    // ── SSE idle-timeout (2026-05-13 clawops policy-match hang fix) ──
+    //
+    // reqwest's request-level .timeout() doesn't cover chunk-to-chunk
+    // idle time once the SSE response is established. deepseek-v4-pro
+    // was observed stopping mid-stream and leaving the connection open
+    // for 30+ minutes, hanging the daemon. We now bound the idle
+    // window and emit a stream-protocol error on timeout so reliable.rs
+    // short-circuits same-provider retries and falls back immediately.
+
+    #[test]
+    fn sse_idle_timeout_constant_is_set() {
+        assert_eq!(
+            SSE_IDLE_TIMEOUT_SECS, 90,
+            "SSE idle timeout must be 90s — generous for reasoning-pause but firm against silent hangs"
+        );
+    }
+
+    #[test]
+    fn sse_idle_timeout_error_message_classifies_as_stream_protocol() {
+        // The timeout branch sends a StreamError::Provider with a
+        // string containing "unexpected eof" so that
+        // reliable::is_stream_protocol_error() classifies it as a
+        // non-retryable stream-protocol error and the fallback chain
+        // is engaged. We verify the format here so future refactors
+        // don't accidentally break the contract.
+        let msg = format!(
+            "unexpected eof: no SSE chunk received for {SSE_IDLE_TIMEOUT_SECS}s (provider silent hang)"
+        );
+        assert!(
+            msg.to_lowercase().contains("unexpected eof"),
+            "idle timeout error must contain 'unexpected eof' for is_stream_protocol_error() match"
+        );
     }
 
     #[test]

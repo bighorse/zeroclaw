@@ -47,6 +47,9 @@ impl Observer for LogObserver {
             ObserverEvent::HeartbeatTick => {
                 info!("heartbeat.tick");
             }
+            ObserverEvent::ChatTurnCompleted { .. } => {
+                // Not logged — callers that need response_text use a webhook observer.
+            }
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");
             }
