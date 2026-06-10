@@ -951,19 +951,11 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
-    [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ]
-    .iter()
-    .any(|hint| lower.contains(hint))
+    // Delegates to the shared classifier so the hint list cannot drift from
+    // the one in providers::reliable, and so errors already rewritten by the
+    // ReliableProvider wrapper ("Request exceeds model context window; ...")
+    // are recognized here too.
+    crate::providers::reliable::is_context_window_overflow_error(err)
 }
 
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {

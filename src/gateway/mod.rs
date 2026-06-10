@@ -1497,6 +1497,112 @@ async fn handle_sop_webhook(
     (StatusCode::OK, Json(body))
 }
 
+/// Hard cap for messages retained in the `/api/chat` history between turns.
+/// The agent loop appends an assistant tool-call message and a tool-result
+/// message for every iteration, so a single agentic turn can add dozens of
+/// entries; without a cap the vector grows unboundedly for the daemon's
+/// lifetime. (The channel runtime has the same guard via MAX_CHANNEL_HISTORY.)
+const MAX_API_CHAT_HISTORY_MESSAGES: usize = 60;
+
+/// Keep this many most-recent plain user/assistant messages when recovering
+/// from a context-window overflow. Mirrors the channel runtime's
+/// CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES.
+const API_CHAT_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
+
+/// Per-message content cap (chars) applied during overflow recovery. Mirrors
+/// the channel runtime's CHANNEL_HISTORY_COMPACT_CONTENT_CHARS.
+const API_CHAT_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+
+/// Trim `/api/chat` history to the hard cap, preserving the leading system
+/// message and cutting at a user-turn boundary. Cutting mid-turn could leave
+/// an orphaned `role:"tool"` message at the front, which OpenAI-compatible
+/// endpoints reject because it lacks the assistant tool_calls message that
+/// must precede it.
+fn trim_api_chat_history(history: &mut Vec<crate::providers::ChatMessage>) {
+    if history.len() <= MAX_API_CHAT_HISTORY_MESSAGES {
+        return;
+    }
+    let body_start = usize::from(history.first().is_some_and(|m| m.role == "system"));
+    let mut cut = history.len() + body_start - MAX_API_CHAT_HISTORY_MESSAGES;
+    while cut < history.len() && history[cut].role != "user" {
+        cut += 1;
+    }
+    if cut >= history.len() {
+        // No clean user boundary in range — a single heavy agentic turn can
+        // append 60+ scaffolding messages after its user message. Fall back
+        // to compaction, which keeps the most recent plain turns (including
+        // the final answer) instead of wiping the conversation.
+        compact_api_chat_history(history);
+        return;
+    }
+    history.drain(body_start..cut);
+}
+
+/// True for messages that are tool-call scaffolding rather than plain
+/// conversation: (a) assistant messages whose content is the JSON envelope
+/// the agent loop stores for native tool calls ({"content":...,
+/// "tool_calls":[...]}). Providers re-parse that JSON into a native
+/// assistant message with `tool_calls` set on resend, so keeping one
+/// without its `role:"tool"` responses produces an orphaned tool_calls
+/// message that strict OpenAI-compatible endpoints reject with 400;
+/// (b) the synthetic "[Tool results]" user messages of prompt-guided mode.
+fn is_tool_call_scaffolding(msg: &crate::providers::ChatMessage) -> bool {
+    if msg.role == "assistant" {
+        return serde_json::from_str::<serde_json::Value>(&msg.content)
+            .is_ok_and(|v| v.get("tool_calls").is_some());
+    }
+    msg.role == "user" && msg.content.starts_with("[Tool results]")
+}
+
+/// Compact `/api/chat` history after a context-window overflow: keep the
+/// leading system message plus the most recent plain user/assistant turns
+/// (content-capped), dropping tool-call scaffolding entirely. Returns true
+/// if the history changed. Parity with the channel runtime's
+/// `compact_sender_history`, which only ever stores plain turns.
+fn compact_api_chat_history(history: &mut Vec<crate::providers::ChatMessage>) -> bool {
+    if history.is_empty() {
+        return false;
+    }
+    let original_len = history.len();
+    let system = history.first().filter(|m| m.role == "system").cloned();
+    let body_start = usize::from(system.is_some());
+
+    let mut turns: Vec<crate::providers::ChatMessage> = history[body_start..]
+        .iter()
+        .filter(|m| {
+            (m.role == "user" || m.role == "assistant")
+                && !m.content.trim().is_empty()
+                && !is_tool_call_scaffolding(m)
+        })
+        .cloned()
+        .collect();
+    let keep_from = turns
+        .len()
+        .saturating_sub(API_CHAT_HISTORY_COMPACT_KEEP_MESSAGES);
+    turns.drain(..keep_from);
+
+    let mut truncated_any = false;
+    for turn in &mut turns {
+        if turn.content.chars().count() > API_CHAT_HISTORY_COMPACT_CONTENT_CHARS {
+            turn.content = crate::util::truncate_with_ellipsis(
+                &turn.content,
+                API_CHAT_HISTORY_COMPACT_CONTENT_CHARS,
+            );
+            truncated_any = true;
+        }
+    }
+
+    let mut rebuilt = Vec::with_capacity(turns.len() + 1);
+    if let Some(sys) = system {
+        rebuilt.push(sys);
+    }
+    rebuilt.extend(turns);
+
+    let changed = truncated_any || rebuilt.len() != original_len;
+    *history = rebuilt;
+    changed
+}
+
 /// Per-request observer wrapper that intercepts `ToolCallStart { tool: "sop_execute" }`
 /// to (a) fire an event webhook and (b) signal the gateway to return early so the
 /// user gets an immediate "task started" reply while the agent loop continues in the
@@ -1514,6 +1620,9 @@ struct SopStartedSignal {
     owner_openid: Option<String>,
     /// Tracks which SOP was started so the "done" webhook carries the same name.
     sop_name_started: parking_lot::Mutex<Option<String>>,
+    /// Set when any ToolCallStart is observed for this request. Tools may have
+    /// side effects, so a turn that already ran one must not be auto-retried.
+    any_tool_started: std::sync::atomic::AtomicBool,
 }
 
 impl SopStartedSignal {
@@ -1531,7 +1640,20 @@ impl SopStartedSignal {
             webhook_secret,
             owner_openid,
             sop_name_started: parking_lot::Mutex::new(None),
+            any_tool_started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// True once any tool has started executing for this request (including
+    /// `sop_execute`). Used to suppress the overflow retry: tools that
+    /// already ran may have side effects (shell commands, file writes,
+    /// outbound messages, SOP starts), and re-running the turn would execute
+    /// them a second time. The channel runtime avoids auto-retry entirely for
+    /// the same reason; here we retry only when the overflow happened on the
+    /// turn's first LLM call, before any tool ran.
+    fn any_tool_started(&self) -> bool {
+        self.any_tool_started
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Fire an event payload to the configured webhook URL in a detached OS thread.
@@ -1559,27 +1681,34 @@ impl crate::observability::Observer for SopStartedSignal {
         use crate::observability::ObserverEvent;
         self.inner.record_event(event);
         match event {
-            ObserverEvent::ToolCallStart { tool, arguments } if tool == "sop_execute" => {
-                // Parse SOP name from the tool arguments JSON string.
-                let sop_name = arguments
-                    .as_ref()
-                    .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
-                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
-                    .unwrap_or_else(|| "unknown".to_string());
+            ObserverEvent::ToolCallStart { tool, arguments } => {
+                // Any tool start makes the turn unsafe to auto-retry: tools
+                // may have side effects (shell, file writes, outbound sends).
+                self.any_tool_started
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
 
-                *self.sop_name_started.lock() = Some(sop_name.clone());
+                if tool == "sop_execute" {
+                    // Parse SOP name from the tool arguments JSON string.
+                    let sop_name = arguments
+                        .as_ref()
+                        .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .unwrap_or_else(|| "unknown".to_string());
 
-                // Signal gateway to return early.
-                if let Some(tx) = self.sop_tx.lock().take() {
-                    let _ = tx.send(sop_name.clone());
+                    *self.sop_name_started.lock() = Some(sop_name.clone());
+
+                    // Signal gateway to return early.
+                    if let Some(tx) = self.sop_tx.lock().take() {
+                        let _ = tx.send(sop_name.clone());
+                    }
+
+                    // Fire "starting" webhook so consumers can create a pending task immediately.
+                    self.fire_webhook(serde_json::json!({
+                        "event": "starting",
+                        "sop_name": sop_name,
+                        "openid": self.owner_openid,
+                    }));
                 }
-
-                // Fire "starting" webhook so consumers can create a pending task immediately.
-                self.fire_webhook(serde_json::json!({
-                    "event": "starting",
-                    "sop_name": sop_name,
-                    "openid": self.owner_openid,
-                }));
             }
             ObserverEvent::ChatTurnCompleted { response_text } => {
                 // Fire "done" webhook only if a SOP was started this turn.
@@ -1735,18 +1864,63 @@ async fn handle_api_chat(
     // is compatible with tokio::spawn on a multi-thread runtime — block_in_place
     // moves the worker out so other tasks continue while this one blocks.
     tokio::spawn(async move {
-        let result = crate::agent::process_message_with_history(
-            config,
+        let mut result = crate::agent::process_message_with_history(
+            config.clone(),
             &message,
             prior_history,
             Some(signal_obs_bg.clone() as Arc<dyn crate::observability::Observer>),
         )
         .await;
+
+        // Context-window overflow self-heal: compact the stored history to
+        // recent plain turns so the session un-wedges (the channel runtime
+        // does the same via compact_sender_history). Additionally, when the
+        // overflow happened on the turn's first LLM call — before any tool
+        // ran — retry once with the compacted context so the caller gets a
+        // normal answer instead of an error. If a tool already executed, the
+        // retry is skipped (it would re-run side-effectful tools); the error
+        // propagates, but the compacted history makes the next request work.
+        if let Err(e) = &result {
+            if crate::providers::reliable::is_context_window_overflow_error(e) {
+                let compacted = {
+                    let mut guard = history_store.lock();
+                    compact_api_chat_history(&mut guard).then(|| guard.clone())
+                };
+                match compacted {
+                    Some(prior) if !signal_obs_bg.any_tool_started() => {
+                        tracing::warn!(
+                            "/api/chat hit the model context window before any tool ran; \
+                             compacted history and retrying once"
+                        );
+                        result = crate::agent::process_message_with_history(
+                            config,
+                            &message,
+                            Some(prior),
+                            Some(signal_obs_bg.clone()
+                                as Arc<dyn crate::observability::Observer>),
+                        )
+                        .await;
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            "/api/chat hit the model context window mid-turn; compacted \
+                             stored history (no retry — tools already executed this turn)"
+                        );
+                    }
+                    None => {}
+                }
+            }
+        }
+
         // Update conversation history and fire ChatTurnCompleted regardless of
         // whether the gateway already returned early (SOP case) or is still waiting.
         match &result {
             Ok((response_text, new_history)) => {
-                { *history_store.lock() = new_history.clone(); }
+                {
+                    let mut stored = new_history.clone();
+                    trim_api_chat_history(&mut stored);
+                    *history_store.lock() = stored;
+                }
                 crate::observability::Observer::record_event(
                     signal_obs_bg.as_ref(),
                     &crate::observability::ObserverEvent::ChatTurnCompleted {
@@ -2399,6 +2573,150 @@ mod tests {
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
+    }
+
+    #[test]
+    fn trim_api_chat_history_noop_under_cap() {
+        let mut history = vec![
+            crate::providers::ChatMessage::system("sys"),
+            crate::providers::ChatMessage::user("hi"),
+            crate::providers::ChatMessage::assistant("hello"),
+        ];
+        let before = history.clone();
+        trim_api_chat_history(&mut history);
+        assert_eq!(history.len(), before.len());
+        assert_eq!(history[0].content, "sys");
+    }
+
+    #[test]
+    fn trim_api_chat_history_preserves_system_and_user_boundary() {
+        let mut history = vec![crate::providers::ChatMessage::system("sys")];
+        // 30 agentic turns × 4 messages = 120 entries, far over the cap.
+        for i in 0..30 {
+            history.push(crate::providers::ChatMessage::user(format!("question {i}")));
+            history.push(crate::providers::ChatMessage::assistant(format!(
+                "calling tool {i}"
+            )));
+            history.push(crate::providers::ChatMessage::tool(format!(
+                "{{\"tool_call_id\":\"call_{i}\",\"content\":\"result {i}\"}}"
+            )));
+            history.push(crate::providers::ChatMessage::assistant(format!(
+                "answer {i}"
+            )));
+        }
+        trim_api_chat_history(&mut history);
+        assert!(history.len() <= MAX_API_CHAT_HISTORY_MESSAGES);
+        assert_eq!(history[0].role, "system");
+        // The first retained message after the system prompt must start a
+        // clean turn — never an orphaned tool result.
+        assert_eq!(history[1].role, "user");
+    }
+
+    #[test]
+    fn trim_api_chat_history_drops_body_without_user_boundary() {
+        let mut history = vec![crate::providers::ChatMessage::system("sys")];
+        for i in 0..(MAX_API_CHAT_HISTORY_MESSAGES + 5) {
+            history.push(crate::providers::ChatMessage::tool(format!("orphan {i}")));
+        }
+        trim_api_chat_history(&mut history);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "system");
+    }
+
+    #[test]
+    fn compact_api_chat_history_keeps_recent_plain_turns() {
+        let long_text = "x".repeat(5 * API_CHAT_HISTORY_COMPACT_CONTENT_CHARS);
+        let mut history = vec![crate::providers::ChatMessage::system("sys")];
+        for i in 0..20 {
+            history.push(crate::providers::ChatMessage::user(format!("q{i} {long_text}")));
+            history.push(crate::providers::ChatMessage::assistant(format!(
+                "tool call {i}"
+            )));
+            history.push(crate::providers::ChatMessage::tool(long_text.clone()));
+            history.push(crate::providers::ChatMessage::assistant(format!(
+                "a{i} {long_text}"
+            )));
+        }
+
+        assert!(compact_api_chat_history(&mut history));
+        assert_eq!(history[0].role, "system");
+        assert!(history.len() <= API_CHAT_HISTORY_COMPACT_KEEP_MESSAGES + 1);
+        assert!(history.iter().all(|m| m.role != "tool"));
+        // truncate_with_ellipsis appends "..." (3 chars) after the cap.
+        assert!(history.iter().all(
+            |m| m.content.chars().count() <= API_CHAT_HISTORY_COMPACT_CONTENT_CHARS + 3
+        ));
+        // Most recent turn must survive compaction.
+        assert!(history.iter().any(|m| m.content.starts_with("a19")));
+    }
+
+    #[test]
+    fn compact_api_chat_history_drops_native_tool_call_scaffolding() {
+        // Native-tools mode stores assistant tool-call turns as a JSON
+        // envelope; keeping it without its role:"tool" responses produces an
+        // orphaned tool_calls message that strict endpoints reject with 400.
+        let scaffolding = r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#;
+        let mut history = vec![
+            crate::providers::ChatMessage::system("sys"),
+            crate::providers::ChatMessage::user("question"),
+            crate::providers::ChatMessage::assistant(scaffolding),
+            crate::providers::ChatMessage::tool(
+                r#"{"tool_call_id":"call_1","content":"result"}"#,
+            ),
+            crate::providers::ChatMessage::user("[Tool results]\nraw dump"),
+            crate::providers::ChatMessage::assistant("final answer"),
+        ];
+
+        assert!(compact_api_chat_history(&mut history));
+        assert!(history
+            .iter()
+            .all(|m| !m.content.contains("tool_calls") && m.role != "tool"));
+        assert!(history
+            .iter()
+            .all(|m| !m.content.starts_with("[Tool results]")));
+        assert!(history.iter().any(|m| m.content == "question"));
+        assert!(history.iter().any(|m| m.content == "final answer"));
+    }
+
+    #[test]
+    fn trim_api_chat_history_heavy_turn_falls_back_to_compaction() {
+        // A single agentic turn appending 60+ scaffolding messages after its
+        // user message must not wipe the conversation: the fallback compacts
+        // to recent plain turns, preserving the final answer.
+        let scaffolding = r#"{"content":null,"tool_calls":[{"id":"c","name":"shell","arguments":"{}"}]}"#;
+        let mut history = vec![
+            crate::providers::ChatMessage::system("sys"),
+            crate::providers::ChatMessage::user("the question"),
+        ];
+        for _ in 0..35 {
+            history.push(crate::providers::ChatMessage::assistant(scaffolding));
+            history.push(crate::providers::ChatMessage::tool(
+                r#"{"tool_call_id":"c","content":"r"}"#,
+            ));
+        }
+        history.push(crate::providers::ChatMessage::assistant("final answer"));
+
+        trim_api_chat_history(&mut history);
+        assert_eq!(history[0].role, "system");
+        assert!(history.iter().any(|m| m.content == "the question"));
+        assert!(history.iter().any(|m| m.content == "final answer"));
+        assert!(history
+            .iter()
+            .all(|m| m.role != "tool" && !m.content.contains("tool_calls")));
+    }
+
+    #[test]
+    fn compact_api_chat_history_false_when_empty_or_already_small() {
+        let mut empty: Vec<crate::providers::ChatMessage> = Vec::new();
+        assert!(!compact_api_chat_history(&mut empty));
+
+        let mut small = vec![
+            crate::providers::ChatMessage::system("sys"),
+            crate::providers::ChatMessage::user("hi"),
+            crate::providers::ChatMessage::assistant("hello"),
+        ];
+        assert!(!compact_api_chat_history(&mut small));
+        assert_eq!(small.len(), 3);
     }
 
     #[test]

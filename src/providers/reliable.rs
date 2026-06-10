@@ -157,6 +157,22 @@ fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| lower.contains(hint))
 }
 
+/// Classify a context-window overflow error anywhere downstream of this
+/// module's retry wrapper. The wrapper rewrites overflow failures into
+/// "Request exceeds model context window; retries and fallbacks were
+/// skipped. Attempts: ..." with the raw provider message truncated, so the
+/// raw phrasings above may no longer appear. Callers that inspect errors
+/// after the wrapper (channel runtime, gateway /api/chat) must use this
+/// instead of matching raw provider hints.
+pub fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
+    if is_context_window_exceeded(err) {
+        return true;
+    }
+    err.to_string()
+        .to_lowercase()
+        .contains("exceeds model context window")
+}
+
 /// Check if an error is a rate-limit (429) error.
 fn is_rate_limited(err: &anyhow::Error) -> bool {
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
@@ -1394,6 +1410,24 @@ mod tests {
         )));
         assert!(is_non_retryable(&anyhow::anyhow!(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
+        )));
+    }
+
+    #[test]
+    fn overflow_classifier_matches_wrapped_and_raw_errors() {
+        // Wrapped form produced by this module's retry loop — the inner
+        // provider message is truncated, so only the wrapper prefix matches.
+        assert!(is_context_window_overflow_error(&anyhow::anyhow!(
+            "Request exceeds model context window; retries and fallbacks were skipped. \
+             Attempts:\nprovider=custom model=m attempt 1/3: non_retryable; error=Custom API er..."
+        )));
+        // Raw provider form (vLLM / OpenAI-compatible).
+        assert!(is_context_window_overflow_error(&anyhow::anyhow!(
+            "Custom API error (400 Bad Request): This model's maximum context length is \
+             250000 tokens. However, your request has 250819 input tokens."
+        )));
+        assert!(!is_context_window_overflow_error(&anyhow::anyhow!(
+            "connection refused"
         )));
     }
 
