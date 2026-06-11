@@ -6995,6 +6995,7 @@ channel_id = "C123"
             idempotency_max_keys: 4096,
             public_url: None,
             download_secret: None,
+            owner_openid: None,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
