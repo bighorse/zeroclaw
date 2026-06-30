@@ -1210,7 +1210,8 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
                 true,
             )
-            .without_responses_fallback(),
+            .without_responses_fallback()
+            .with_extra_request_fields(serde_json::json!({ "enable_thinking": false })),
         )),
 
         // ── Extended ecosystem (community favorites) ─────────
