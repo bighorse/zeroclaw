@@ -3881,6 +3881,13 @@ async fn process_message_inner(
     } else {
         (None, None)
     };
+    // SOP robustness: own the SOP engine so we can detect a run left Running
+    // (model ended the turn mid-SOP) and nudge it to completion below.
+    let sop_engine = {
+        let mut e = crate::sop::SopEngine::new(config.sop.clone());
+        e.reload(&config.workspace_dir);
+        std::sync::Arc::new(std::sync::Mutex::new(e))
+    };
     let mut tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -3895,7 +3902,7 @@ async fn process_message_inner(
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        None,
+        Some(std::sync::Arc::clone(&sop_engine)),
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
@@ -4059,7 +4066,7 @@ async fn process_message_inner(
         ],
     };
 
-    let response = agent_turn(
+    let mut response = agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -4072,6 +4079,39 @@ async fn process_message_inner(
         config.agent.max_tool_iterations,
     )
     .await?;
+    // If the model ended the turn with no tool call while a SOP run is still
+    // Running (not at its terminal step), it abandoned mid-flow. Nudge it to
+    // keep driving the SOP to completion. Bounded to avoid loops; only fires
+    // when an active SOP run exists, so normal turns are untouched.
+    for _ in 0..3usize {
+        let sop_still_running = sop_engine
+            .lock()
+            .map(|e| {
+                e.active_runs()
+                    .values()
+                    .any(|r| r.status == crate::sop::types::SopRunStatus::Running)
+            })
+            .unwrap_or(false);
+        if !sop_still_running {
+            break;
+        }
+        history.push(ChatMessage::user(
+            "[系统] 你上一条回复没有调用任何工具，但当前 SOP 仍在进行中、还没到最后一步。请立即继续：调用 sop_advance 或当前步骤所需的工具，把 SOP 推进到最终步骤（含写库/save 步骤）后再结束；不要用纯文本提前收尾。",
+        ));
+        response = agent_turn(
+        provider.as_ref(),
+        &mut history,
+        &tools_registry,
+        observer.as_ref(),
+        provider_name,
+        &model_name,
+        config.default_temperature,
+        true,
+        &config.multimodal,
+        config.agent.max_tool_iterations,
+    )
+    .await?;
+    }
     Ok((response, history))
 }
 
