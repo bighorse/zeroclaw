@@ -733,6 +733,7 @@ pub async fn run_gateway(
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route("/api/sop/runs", get(api::handle_api_sop_runs))
         .route("/api/config", get(api::handle_api_config_get))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
@@ -1858,6 +1859,8 @@ async fn handle_api_chat(
     let history_store = state.api_chat_history.clone();
     let global_obs = state.observer.clone();
     let model_label_clone = state.model.clone();
+    // 共享 daemon SopEngine：/api/chat 里启动的 SOP run 才能被 /sop/approve 批到
+    let sop_engine_shared = state.sop_engine.clone();
 
     // Spawn the agent loop as a separate tokio task. process_message_with_history
     // internally uses block_in_place + an isolated single-thread runtime, which
@@ -1869,6 +1872,7 @@ async fn handle_api_chat(
             &message,
             prior_history,
             Some(signal_obs_bg.clone() as Arc<dyn crate::observability::Observer>),
+            Some(sop_engine_shared.clone()),
         )
         .await;
 
@@ -1898,6 +1902,7 @@ async fn handle_api_chat(
                             Some(prior),
                             Some(signal_obs_bg.clone()
                                 as Arc<dyn crate::observability::Observer>),
+                            Some(sop_engine_shared.clone()),
                         )
                         .await;
                     }

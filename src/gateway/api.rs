@@ -1022,6 +1022,38 @@ fn hydrate_config_for_save(
     incoming
 }
 
+
+/// GET /api/sop/runs — SOP run 列表（进行中/等待审批/近期完成），供龙虾前台审批箱直读，
+/// 免去从对话文本收割 run 编号的脆弱路径。
+pub async fn handle_api_sop_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let runs: Vec<serde_json::Value> = {
+        let engine = state.sop_engine.lock().unwrap();
+        engine
+            .active_runs()
+            .values()
+            .map(|r| {
+                serde_json::json!({
+                    "run_id": r.run_id,
+                    "sop_name": r.sop_name,
+                    "status": r.status,
+                    "current_step": r.current_step,
+                    "total_steps": r.total_steps,
+                    "started_at": r.started_at,
+                    "waiting_since": r.waiting_since,
+                    "completed_at": r.completed_at,
+                })
+            })
+            .collect()
+    };
+    Json(serde_json::json!({ "runs": runs })).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
