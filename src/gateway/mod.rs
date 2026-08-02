@@ -1357,15 +1357,18 @@ async fn handle_sop_approve(
 
 /// POST /sop/reject/{run_id} — Channel-only SOP step rejection.
 ///
-/// Counterpart to `/sop/approve/{run_id}`. The current `SopEngine` does
-/// not yet have a first-class reject API, so this implementation simply
-/// returns 501 with a clear message until that lands. Wired now so the
-/// LarkChannel parser has a stable URL to point at.
+/// Counterpart to `/sop/approve/{run_id}`: terminates a run that is waiting
+/// on a human decision, marking it `Cancelled` so it leaves `active_runs`.
+/// Optional JSON body `{"reason": "..."}` is recorded on the finished run.
+///
+/// Like approve, this is intentionally NOT exposed to the LLM — the
+/// dual-sign quality gate would be trivially defeated by self-service.
 async fn handle_sop_reject(
     State(state): State<AppState>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
 ) -> impl IntoResponse {
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
@@ -1386,12 +1389,50 @@ async fn handle_sop_reject(
         }
     }
 
-    tracing::warn!(run_id = %run_id, "SOP reject called but not yet implemented in engine");
-    let body = serde_json::json!({
-        "error": "SopEngine does not yet support rejection. The run remains in WaitingApproval. Restart the SOP or wait for a future engine update.",
-        "run_id": run_id,
-    });
-    (StatusCode::NOT_IMPLEMENTED, Json(body))
+    let reason = body
+        .and_then(|Json(v)| {
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .map(|s| s.trim().chars().take(500).collect::<String>())
+        })
+        .filter(|s| !s.is_empty());
+
+    let result = {
+        let mut engine = match state.sop_engine.lock() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("SOP reject: engine lock poisoned: {e}");
+                let err = serde_json::json!({"error":"engine lock poisoned"});
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+            }
+        };
+        engine.reject_step(&run_id, reason.clone())
+    };
+
+    match result {
+        Ok(()) => {
+            tracing::info!(run_id = %run_id, "SOP reject: run cancelled");
+            let body = serde_json::json!({
+                "status": "rejected",
+                "run_id": run_id,
+                "reason": reason.unwrap_or_else(|| "rejected by user".to_string()),
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            tracing::warn!(run_id = %run_id, error = %e, "SOP reject failed");
+            let msg = e.to_string();
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::CONFLICT
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": msg, "run_id": run_id})),
+            )
+        }
+    }
 }
 
 /// POST /sop/{*rest} — SOP-only event endpoint.
