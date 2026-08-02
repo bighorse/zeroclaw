@@ -213,8 +213,16 @@ impl SopEngine {
         // the run back to `Running` via `approve_step`. That defeats the
         // entire supervised-approval flow.
         if run.status == SopRunStatus::WaitingApproval {
+            // Message is written *for the LLM*: `approve_step` is deliberately not in its
+            // toolset (self-approval would defeat the dual-sign gate), so naming that tool
+            // sends the agent into a retry loop it can never win. Tell it to stop and hand
+            // the decision back to the human instead.
             bail!(
-                "Run {run_id} is waiting for approval at step {}; call approve_step before advance_step",
+                "Run {run_id} is waiting for approval by a human at step {}. \
+                 You cannot approve it yourself — no such tool exists, and retrying will keep failing. \
+                 Stop calling sop_advance for this run, tell the user it is waiting for their \
+                 confirmation, and let them approve or reject it from the approvals page \
+                 (or via POST /sop/approve/{run_id} · POST /sop/reject/{run_id}).",
                 run.current_step
             );
         }
@@ -272,6 +280,39 @@ impl SopEngine {
         }
         self.finish_run(run_id, SopRunStatus::Cancelled, None);
         info!("SOP run {run_id} cancelled");
+        Ok(())
+    }
+
+    /// Reject a step that is waiting for approval (or parked at a checkpoint).
+    ///
+    /// Counterpart to [`Self::approve_step`]. The run is terminated with
+    /// `Cancelled` and moved to the finished list, so it stops showing up in
+    /// `active_runs` — otherwise a rejected run stays `WaitingApproval`
+    /// forever and every client keeps re-surfacing it as a pending decision.
+    ///
+    /// Like `approve_step`, this is deliberately **not** exposed to the LLM:
+    /// the decision belongs to the human, via the gateway endpoint.
+    pub fn reject_step(&mut self, run_id: &str, reason: Option<String>) -> Result<()> {
+        let run = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::anyhow!("Active run not found: {run_id}"))?;
+
+        if !matches!(
+            run.status,
+            SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+        ) {
+            bail!(
+                "Run {run_id} is not awaiting a decision (status: {}); use cancel_run to abort a running SOP",
+                run.status
+            );
+        }
+
+        let reason = reason
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| "rejected by user".to_string());
+        self.finish_run(run_id, SopRunStatus::Cancelled, Some(reason.clone()));
+        info!("SOP run {run_id} rejected: {reason}");
         Ok(())
     }
 
@@ -1696,6 +1737,61 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn reject_cancels_waiting_run() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            engine.active_runs().get(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval
+        );
+
+        engine
+            .reject_step(&run_id, Some("not needed".into()))
+            .unwrap();
+
+        // Critical: a rejected run must leave active_runs, otherwise every client keeps
+        // re-surfacing it as a pending decision forever.
+        assert!(engine.active_runs().get(&run_id).is_none());
+        let finished = engine
+            .finished_runs(None)
+            .into_iter()
+            .find(|r| r.run_id == run_id)
+            .expect("rejected run should be archived");
+        assert_eq!(finished.status, SopRunStatus::Cancelled);
+        assert!(finished.completed_at.is_some());
+    }
+
+    #[test]
+    fn reject_unknown_run_fails() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )]);
+        let err = engine.reject_step("run-does-not-exist", None).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn reject_non_waiting_run_fails() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        // Auto mode never enters WaitingApproval → reject must be refused
+        assert!(engine.reject_step(&run_id, None).is_err());
+        assert!(engine.active_runs().contains_key(&run_id));
     }
 
     #[test]
