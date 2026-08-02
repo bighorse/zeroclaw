@@ -37,8 +37,18 @@ pub async fn handle_sse_events(
         }
     }
 
+    // 先补发最近的 SOP 汇报，再接实时流。
+    // SOP 结果只在完成那一刻广播一次，用户批准后关页面/锁屏/刷新都会错过它；
+    // 客户端按事件 id 去重，重复补发不会在对话里刷出第二条。
+    let replay: Vec<serde_json::Value> = state.recent_sop_results.lock().iter().cloned().collect();
+    let replay_stream = tokio_stream::iter(
+        replay
+            .into_iter()
+            .map(|v| Ok::<_, Infallible>(Event::default().data(v.to_string()))),
+    );
+
     let rx = state.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(
+    let live = BroadcastStream::new(rx).filter_map(
         |result: Result<
             serde_json::Value,
             tokio_stream::wrappers::errors::BroadcastStreamRecvError,
@@ -52,7 +62,7 @@ pub async fn handle_sse_events(
         },
     );
 
-    Sse::new(stream)
+    Sse::new(replay_stream.chain(live))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
