@@ -322,6 +322,13 @@ pub struct AppState {
     /// One daemon serves at most one user (by design), so a single global
     /// history vector is sufficient — no session id needed.
     pub api_chat_history: Arc<Mutex<Vec<crate::providers::ChatMessage>>>,
+    /// Recent `sop_result` events, replayed to SSE clients on (re)connect.
+    ///
+    /// A SOP's final report is broadcast exactly once, at the moment it finishes.
+    /// Users routinely approve a step and then close the tab, lock the phone, or
+    /// just refresh — with no listener attached at that instant the report is gone
+    /// for good and the chat shows nothing at all. This keeps a short replay window.
+    pub recent_sop_results: Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>,
     /// Shared SOP engine. Used by `POST /sop/*` to dispatch events
     /// directly into the engine, and shared with the agent loop's tool
     /// list so runs are visible to in-agent `sop_status` / `sop_advance`
@@ -701,6 +708,7 @@ pub async fn run_gateway(
         event_tx,
         shutdown_tx,
         api_chat_history: Arc::new(Mutex::new(Vec::new())),
+        recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         sop_engine: Arc::clone(&sop_engine),
     };
 
@@ -1300,6 +1308,7 @@ async fn handle_sop_approve(
                 let history = Arc::clone(&state.api_chat_history);
                 let engine = Arc::clone(&state.sop_engine);
                 let event_tx = state.event_tx.clone();
+                let recent = Arc::clone(&state.recent_sop_results);
                 let rid = run_id.clone();
                 tokio::spawn(async move {
                     let wake = format!(
@@ -1317,13 +1326,18 @@ async fn handle_sop_approve(
                     {
                         Ok((resp, new_hist)) => {
                             *history.lock() = new_hist;
-                            // 续跑结果实时推给前台（对话里直接显示汇报）
-                            let _ = event_tx.send(serde_json::json!({
+                            // 续跑结果实时推给前台（对话里直接显示汇报），同时留一份供补发：
+                            // 用户批准后往往就切走了，这一刻没有 SSE 监听者的话结果会凭空消失。
+                            let ts = chrono::Utc::now().timestamp();
+                            let ev = serde_json::json!({
                                 "type": "sop_result",
+                                "id": format!("{rid}:{ts}"),
                                 "run_id": rid,
                                 "response": resp,
-                                "timestamp": chrono::Utc::now().timestamp(),
-                            }));
+                                "timestamp": ts,
+                            });
+                            push_recent_sop_result(&recent, ev.clone());
+                            let _ = event_tx.send(ev);
                             tracing::info!(run_id = %rid, "SOP auto-resume finished");
                         }
                         Err(e) => {
@@ -1353,6 +1367,25 @@ async fn handle_sop_approve(
             )
         }
     }
+}
+
+/// Store one `sop_result` in the replay buffer: newest 20, nothing older than 12h.
+///
+/// Two caps on purpose — the count keeps memory bounded, the age keeps a user who
+/// returns the next day from being flooded with stale reports.
+pub(crate) fn push_recent_sop_result(
+    buf: &Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>,
+    ev: serde_json::Value,
+) {
+    const MAX_ITEMS: usize = 20;
+    const MAX_AGE_SECS: i64 = 12 * 3600;
+    let cutoff = chrono::Utc::now().timestamp() - MAX_AGE_SECS;
+    let mut q = buf.lock();
+    q.push_back(ev);
+    while q.len() > MAX_ITEMS {
+        q.pop_front();
+    }
+    q.retain(|e| e.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0) >= cutoff);
 }
 
 /// POST /sop/reject/{run_id} — Channel-only SOP step rejection.
@@ -2887,6 +2920,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -2941,6 +2975,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -3320,6 +3355,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -3389,6 +3425,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -3470,6 +3507,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -3523,6 +3561,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -3581,6 +3620,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -3644,6 +3684,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -3703,6 +3744,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
                 crate::config::SopConfig::default(),
             ))),
@@ -4140,5 +4182,43 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod sop_result_replay_tests {
+    use super::push_recent_sop_result;
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    fn ev(id: &str, ts: i64) -> serde_json::Value {
+        serde_json::json!({"type": "sop_result", "id": id, "timestamp": ts})
+    }
+
+    #[test]
+    fn keeps_newest_and_caps_at_20() {
+        let buf = Arc::new(Mutex::new(VecDeque::new()));
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..25 {
+            push_recent_sop_result(&buf, ev(&format!("r{i}"), now));
+        }
+        let q = buf.lock();
+        assert_eq!(q.len(), 20, "buffer must stay bounded");
+        // 最早的 5 条被挤掉，留下的是最新的 r5..r24
+        assert_eq!(q.front().unwrap()["id"], "r5");
+        assert_eq!(q.back().unwrap()["id"], "r24");
+    }
+
+    #[test]
+    fn drops_entries_older_than_12h() {
+        let buf = Arc::new(Mutex::new(VecDeque::new()));
+        let now = chrono::Utc::now().timestamp();
+        push_recent_sop_result(&buf, ev("stale", now - 13 * 3600));
+        push_recent_sop_result(&buf, ev("fresh", now));
+        let q = buf.lock();
+        // 隔天回来不该被灌陈年汇报
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.front().unwrap()["id"], "fresh");
     }
 }
