@@ -502,9 +502,17 @@ pub async fn handle_api_cost(
         return e.into_response();
     }
 
+    let (daily_limit, monthly_limit) = {
+        let c = state.config.lock();
+        (c.cost.daily_limit_usd, c.cost.monthly_limit_usd)
+    };
     if let Some(ref tracker) = state.cost_tracker {
         match tracker.get_summary() {
-            Ok(summary) => Json(serde_json::json!({"cost": summary})).into_response(),
+            Ok(summary) => Json(serde_json::json!({
+                "cost": summary,
+                "limits": { "daily": daily_limit, "monthly": monthly_limit },
+            }))
+            .into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Cost summary failed: {e}")})),
@@ -1038,7 +1046,28 @@ pub async fn handle_api_sop_runs(
             .active_runs()
             .values()
             .map(|r| {
+                // 当前步骤的标题/内容：审批时用户要看到"批的是什么"
+                let step_info = engine
+                    .get_sop(&r.sop_name)
+                    .and_then(|sop| sop.steps.iter().find(|st| st.number == r.current_step))
+                    .map(|st| serde_json::json!({ "title": st.title, "body": st.body }));
+                // 审批者要看的是"这一单的实际内容"（前序步骤的产出），不只是步骤说明
+                let last_output = r
+                    .step_results
+                    .iter()
+                    .rev()
+                    .find(|sr| !sr.output.trim().is_empty())
+                    .map(|sr| sr.output.chars().take(2000).collect::<String>());
+                // 发起时的任务参数（坐标/对象等确定性输入）——审批判断的核心依据
+                let trigger_payload = r
+                    .trigger_event
+                    .payload
+                    .as_ref()
+                    .map(|p| p.chars().take(1500).collect::<String>());
                 serde_json::json!({
+                    "current_step_info": step_info,
+                    "last_output": last_output,
+                    "trigger_payload": trigger_payload,
                     "run_id": r.run_id,
                     "sop_name": r.sop_name,
                     "status": r.status,

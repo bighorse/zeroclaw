@@ -192,7 +192,7 @@ impl Tool for PublishFileTool {
         }
 
         // ── 2. Cheap security prefilter (traversal, absolute, etc.) ─
-        if !self.security.is_path_allowed(path) {
+        if !self.security.is_write_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

@@ -91,7 +91,7 @@ impl Tool for FileWriteTool {
         }
 
         // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
+        if !self.security.is_write_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

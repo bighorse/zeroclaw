@@ -852,7 +852,7 @@ async fn handle_workspace_download(
         }
         _ => {
             tracing::warn!(path = %file_path, expires = ?query.expires, sig = ?query.sig, "download: missing expires or sig — returning 403");
-            return (StatusCode::FORBIDDEN, "Signed URL required").into_response();
+            return (StatusCode::FORBIDDEN, "链接缺少签名参数，无法直接下载。请回到对话里让龙虾重新发一次下载链接（它会生成带签名的完整链接）。").into_response();
         }
     }
 
@@ -1293,6 +1293,45 @@ async fn handle_sop_approve(
     match result {
         Ok(action) => {
             tracing::info!(run_id = %run_id, "SOP approve: run advanced");
+            // 批准即续跑：唤醒 LLM 执行后续步骤（与 Lark 通道的 wake_msg 同构）。
+            // 不阻塞本响应；进展经 /api/sop/runs 轮询可见，结果并入 /api/chat 会话历史。
+            {
+                let config = state.config.lock().clone();
+                let history = Arc::clone(&state.api_chat_history);
+                let engine = Arc::clone(&state.sop_engine);
+                let event_tx = state.event_tx.clone();
+                let rid = run_id.clone();
+                tokio::spawn(async move {
+                    let wake = format!(
+                        "[系统] SOP run {rid} 的等待审批步骤【已经获得用户批准，审批已完成，不要再向用户请求任何批准或确认】。请立即用 sop_advance 推进并执行该流程的后续步骤，直到全部完成或到达下一个真正需要审批的新步骤。最后用面向用户的口吻简要汇报执行结果（不要提系统消息或内部指令）。"
+                    );
+                    let prior = { history.lock().clone() };
+                    match crate::agent::process_message_with_history(
+                        config,
+                        &wake,
+                        Some(prior),
+                        None,
+                        Some(engine),
+                    )
+                    .await
+                    {
+                        Ok((resp, new_hist)) => {
+                            *history.lock() = new_hist;
+                            // 续跑结果实时推给前台（对话里直接显示汇报）
+                            let _ = event_tx.send(serde_json::json!({
+                                "type": "sop_result",
+                                "run_id": rid,
+                                "response": resp,
+                                "timestamp": chrono::Utc::now().timestamp(),
+                            }));
+                            tracing::info!(run_id = %rid, "SOP auto-resume finished");
+                        }
+                        Err(e) => {
+                            tracing::warn!(run_id = %rid, "SOP auto-resume failed: {e:#}");
+                        }
+                    }
+                });
+            }
             let body = serde_json::json!({
                 "status": "approved",
                 "run_id": run_id,
@@ -1624,6 +1663,8 @@ struct SopStartedSignal {
     /// Set when any ToolCallStart is observed for this request. Tools may have
     /// side effects, so a turn that already ran one must not be auto-retried.
     any_tool_started: std::sync::atomic::AtomicBool,
+    /// SSE broadcast：把 SOP 执行结果实时推给前台客户端（sop_result 事件）。
+    event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 }
 
 impl SopStartedSignal {
@@ -1633,6 +1674,7 @@ impl SopStartedSignal {
         webhook_url: Option<String>,
         webhook_secret: Option<String>,
         owner_openid: Option<String>,
+        event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
     ) -> Self {
         Self {
             inner,
@@ -1642,6 +1684,7 @@ impl SopStartedSignal {
             owner_openid,
             sop_name_started: parking_lot::Mutex::new(None),
             any_tool_started: std::sync::atomic::AtomicBool::new(false),
+            event_tx,
         }
     }
 
@@ -1690,10 +1733,15 @@ impl crate::observability::Observer for SopStartedSignal {
 
                 if tool == "sop_execute" {
                     // Parse SOP name from the tool arguments JSON string.
+                    // LLM 对参数名不忠实：name / sop_name / sop 都见过
                     let sop_name = arguments
                         .as_ref()
                         .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
-                        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .and_then(|v| {
+                            ["name", "sop_name", "sop"]
+                                .iter()
+                                .find_map(|k| v.get(k).and_then(|n| n.as_str()).map(String::from))
+                        })
                         .unwrap_or_else(|| "unknown".to_string());
 
                     *self.sop_name_started.lock() = Some(sop_name.clone());
@@ -1720,6 +1768,15 @@ impl crate::observability::Observer for SopStartedSignal {
                         "openid": self.owner_openid,
                         "response_text": response_text,
                     }));
+                    // 前台客户端经 SSE 实时收到执行结果（否则早返回后结果无人接收）
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(serde_json::json!({
+                            "type": "sop_result",
+                            "sop_name": sop_name,
+                            "response": response_text,
+                            "timestamp": chrono::Utc::now().timestamp(),
+                        }));
+                    }
                 }
             }
             _ => {}
@@ -1854,6 +1911,7 @@ async fn handle_api_chat(
         webhook_url,
         webhook_secret,
         owner_openid,
+        Some(state.event_tx.clone()),
     ));
     let signal_obs_bg = signal_obs.clone();
     let history_store = state.api_chat_history.clone();
@@ -1979,10 +2037,11 @@ async fn handle_api_chat(
             // The SopStartedSignal will fire the "done" webhook when it finishes.
             tracing::info!(sop_name = %sop_name, "SOP started — returning early from /api/chat");
             let body = serde_json::json!({
-                "response": format!(
-                    "已为您发起「{}」，正在后台执行，预计约9分钟，结果将自动更新到任务列表。",
-                    sop_name
-                ),
+                "response": if sop_name == "unknown" {
+                    "已为您发起流程，正在后台执行；执行结果和需要你确认的步骤都会自动出现。".to_string()
+                } else {
+                    format!("已为您发起「{sop_name}」，正在后台执行；执行结果和需要你确认的步骤都会自动出现。")
+                },
                 "model": model_label_clone,
                 "sop_started": true,
                 "sop_name": sop_name,

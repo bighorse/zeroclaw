@@ -2043,6 +2043,9 @@ pub(crate) async fn agent_turn(
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
 ) -> Result<String> {
+    // gateway /api/chat 路径此前不记账（tracker 恒 None）——用量页永远是 0。
+    // 取进程级共享 tracker（daemon 启动时已初始化；未初始化则行为不变）。
+    let tracker = crate::cost::shared_tracker_peek();
     run_tool_call_loop(
         provider,
         history,
@@ -2061,7 +2064,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         &[],
-        None,
+        tracker.as_ref(),
     )
     .await
 }
@@ -2319,13 +2322,16 @@ pub(crate) async fn run_tool_call_loop(
         period,
     }) = crate::cost::pre_call_budget_state(cost_tracker)
     {
+        let period_cn = match period {
+            crate::cost::UsagePeriod::Day => "今日",
+            crate::cost::UsagePeriod::Month => "本月",
+            crate::cost::UsagePeriod::Session => "本次会话",
+        };
         anyhow::bail!(
-            "Cost budget already exceeded at turn start: ${:.4} / ${:.2} USD ({:?}). \
-             Refusing to send the request. Raise the limit in [cost], enable \
-             `allow_override` for soft budgeting, or wait for the period to reset.",
+            "{period_cn}额度已用完（已用 ¥{:.2} / 上限 ¥{:.2}）。请联系管理员提升额度，或等{}重置后再用。",
             current_usd,
             limit_usd,
-            period,
+            if matches!(period, crate::cost::UsagePeriod::Day) {"次日零点"} else {"下月初"},
         );
     }
 
@@ -3805,7 +3811,7 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
-    let (response, _) = process_message_inner(config, message, None, None).await?;
+    let (response, _) = process_message_inner(config, message, None, None, None).await?;
     Ok(response)
 }
 
@@ -3823,6 +3829,7 @@ pub async fn process_message_with_history(
     message: &str,
     prior_history: Option<Vec<ChatMessage>>,
     external_observer: Option<Arc<dyn Observer>>,
+    external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
 ) -> Result<(String, Vec<ChatMessage>)> {
     // 2026-05-14 V27 daemon hang isolation: run the entire agent loop on
     // a brand-new single-thread tokio runtime. The main daemon
@@ -3847,7 +3854,7 @@ pub async fn process_message_with_history(
             .map_err(|e| anyhow::anyhow!("isolated agent runtime build failed: {e}"))?;
         isolated_rt
             .block_on(async move {
-                process_message_inner(config, &message, prior_history, external_observer).await
+                process_message_inner(config, &message, prior_history, external_observer, external_sop_engine).await
             })
     })
 }
@@ -3857,7 +3864,12 @@ async fn process_message_inner(
     message: &str,
     prior_history: Option<Vec<ChatMessage>>,
     external_observer: Option<Arc<dyn Observer>>,
+    // daemon 共享 SopEngine：gateway /api/chat 传入后，SOP run 与 /sop/approve
+    // 读的是同一个 engine（否则每请求新建 → 审批永远 404 的 split-brain）
+    external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
 ) -> Result<(String, Vec<ChatMessage>)> {
+    // 确保共享 CostTracker 已初始化（幂等）：gateway-only 部署也能记账
+    let _ = crate::cost::shared_tracker(&config.cost, &config.workspace_dir);
     let observer: Arc<dyn Observer> = external_observer
         .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3883,11 +3895,11 @@ async fn process_message_inner(
     };
     // SOP robustness: own the SOP engine so we can detect a run left Running
     // (model ended the turn mid-SOP) and nudge it to completion below.
-    let sop_engine = {
+    let sop_engine = external_sop_engine.unwrap_or_else(|| {
         let mut e = crate::sop::SopEngine::new(config.sop.clone());
         e.reload(&config.workspace_dir);
         std::sync::Arc::new(std::sync::Mutex::new(e))
-    };
+    });
     let mut tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,

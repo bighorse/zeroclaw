@@ -1,7 +1,7 @@
 use super::types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod};
 use crate::config::schema::CostConfig;
 use anyhow::{anyhow, Context, Result};
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -241,7 +241,26 @@ struct CostStorage {
     cached_month: u32,
 }
 
+/// 计费日/月边界采用的业务时区（北京 UTC+8）。中国场景固定；
+/// 将来多时区需求可提到 config。用它把 UTC 时间戳归到"本地自然日"，
+/// 否则用 UTC 边界会让北京用户在早上 8 点前看到昨天的量赖在今天。
+fn biz_tz() -> FixedOffset {
+    FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset")
+}
+
+/// 一个 UTC 时间戳在业务时区下属于哪个自然日。
+fn biz_date(ts: DateTime<Utc>) -> NaiveDate {
+    ts.with_timezone(&biz_tz()).date_naive()
+}
+
+/// 业务时区下的 (日, 年, 月)。
+fn biz_now_parts() -> (NaiveDate, i32, u32) {
+    let n = Utc::now().with_timezone(&biz_tz());
+    (n.date_naive(), n.year(), n.month())
+}
+
 impl CostStorage {
+
     /// Create or open cost storage.
     fn new(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -249,14 +268,14 @@ impl CostStorage {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
 
-        let now = Utc::now();
+        let (day, year, month) = biz_now_parts();
         let mut storage = Self {
             path: path.to_path_buf(),
             daily_cost_usd: 0.0,
             monthly_cost_usd: 0.0,
-            cached_day: now.date_naive(),
-            cached_year: now.year(),
-            cached_month: now.month(),
+            cached_day: day,
+            cached_year: year,
+            cached_month: month,
         };
 
         storage.rebuild_aggregates(
@@ -314,13 +333,13 @@ impl CostStorage {
         let mut monthly_cost = 0.0;
 
         self.for_each_record(|record| {
-            let timestamp = record.usage.timestamp.naive_utc();
+            let local = record.usage.timestamp.with_timezone(&biz_tz());
 
-            if timestamp.date() == day {
+            if local.date_naive() == day {
                 daily_cost += record.usage.cost_usd;
             }
 
-            if timestamp.year() == year && timestamp.month() == month {
+            if local.year() == year && local.month() == month {
                 monthly_cost += record.usage.cost_usd;
             }
         })?;
@@ -335,10 +354,7 @@ impl CostStorage {
     }
 
     fn ensure_period_cache_current(&mut self) -> Result<()> {
-        let now = Utc::now();
-        let day = now.date_naive();
-        let year = now.year();
-        let month = now.month();
+        let (day, year, month) = biz_now_parts();
 
         if day != self.cached_day || year != self.cached_year || month != self.cached_month {
             self.rebuild_aggregates(day, year, month)?;
@@ -362,11 +378,11 @@ impl CostStorage {
 
         self.ensure_period_cache_current()?;
 
-        let timestamp = record.usage.timestamp.naive_utc();
-        if timestamp.date() == self.cached_day {
+        let local = record.usage.timestamp.with_timezone(&biz_tz());
+        if local.date_naive() == self.cached_day {
             self.daily_cost_usd += record.usage.cost_usd;
         }
-        if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
+        if local.year() == self.cached_year && local.month() == self.cached_month {
             self.monthly_cost_usd += record.usage.cost_usd;
         }
 
@@ -409,6 +425,20 @@ impl CostStorage {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn biz_date_uses_beijing_boundary() {
+        use chrono::TimeZone;
+        // 2026-07-24 23:22 UTC = 2026-07-25 07:22 北京 → 业务日应是 25 号
+        let ts = Utc.with_ymd_and_hms(2026, 7, 24, 23, 22, 0).unwrap();
+        assert_eq!(biz_date(ts), NaiveDate::from_ymd_opt(2026, 7, 25).unwrap());
+        // 2026-07-24 15:59 UTC = 23:59 北京 → 仍是 24 号
+        let ts2 = Utc.with_ymd_and_hms(2026, 7, 24, 15, 59, 0).unwrap();
+        assert_eq!(biz_date(ts2), NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
+        // 2026-07-24 16:00 UTC = 次日 00:00 北京 → 跨到 25 号（清零点）
+        let ts3 = Utc.with_ymd_and_hms(2026, 7, 24, 16, 0, 0).unwrap();
+        assert_eq!(biz_date(ts3), NaiveDate::from_ymd_opt(2026, 7, 25).unwrap());
+    }
     use super::*;
     use tempfile::TempDir;
 

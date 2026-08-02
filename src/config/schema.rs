@@ -2466,6 +2466,20 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Workspace-relative path prefixes the agent may READ but never WRITE via
+    /// file_write / file_edit / publish_file. Protects the agent's own skills
+    /// and persona files from self-modification (skills/, AGENTS.md, etc.).
+    /// Matched against the workspace-relative path AND its basename.
+    #[serde(default)]
+    pub readonly_prefixes: Vec<String>,
+
+    /// Workspace-relative path prefixes the agent may neither READ nor WRITE via
+    /// file_read / file_write / shell read-commands (cat/head/…). Protects skill
+    /// source and persona internals from being exfiltrated to end users. The
+    /// daemon still loads these at startup via direct fs (not the agent tools).
+    #[serde(default)]
+    pub noread_prefixes: Vec<String>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -2533,6 +2547,8 @@ impl Default for AutonomyConfig {
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
+            readonly_prefixes: Vec::new(),
+            noread_prefixes: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
         }
     }
@@ -6050,6 +6066,8 @@ default_temperature = 0.7
                 ..ObservabilityConfig::default()
             },
             autonomy: AutonomyConfig {
+                noread_prefixes: Vec::new(),
+                readonly_prefixes: Vec::new(),
                 level: AutonomyLevel::Full,
                 workspace_only: false,
                 allowed_commands: vec!["docker".into()],
