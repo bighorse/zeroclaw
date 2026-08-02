@@ -290,6 +290,15 @@ impl Tool for ShellTool {
             }
         }
 
+        if let Some(path) = self.security.noread_command_argument(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "禁止读取受保护路径 {path}（技能与人格文件不对外开放）"
+                )),
+            });
+        }
         if let Some(path) = self.security.forbidden_path_argument(command) {
             return Ok(ToolResult {
                 success: false,

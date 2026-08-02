@@ -108,7 +108,7 @@ impl Tool for FileEditTool {
         }
 
         // ── 4. Path pre-validation ─────────────────────────────────
-        if !self.security.is_path_allowed(path) {
+        if !self.security.is_write_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

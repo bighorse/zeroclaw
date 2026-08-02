@@ -85,6 +85,8 @@ pub struct SecurityPolicy {
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
+    pub readonly_prefixes: Vec<String>,
+    pub noread_prefixes: Vec<String>,
     pub allowed_roots: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
@@ -115,6 +117,8 @@ impl Default for SecurityPolicy {
                 "tail".into(),
                 "date".into(),
             ],
+            readonly_prefixes: Vec::new(),
+            noread_prefixes: Vec::new(),
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
                 "/etc".into(),
@@ -823,6 +827,51 @@ impl SecurityPolicy {
     ///
     /// This is best-effort token parsing for shell commands and is intended
     /// as a safety gate before command execution.
+    /// If `command` is a plain read command (cat/head/…) touching a
+    /// `noread_prefixes` path, return that path so the caller can block it.
+    /// Execution commands (python/sh/bash + script path) are NOT blocked here —
+    /// they run the script, they don't dump its source.
+    pub fn noread_command_argument(&self, command: &str) -> Option<String> {
+        if self.noread_prefixes.is_empty() {
+            return None;
+        }
+        const READERS: &[&str] = &[
+            "cat", "head", "tail", "less", "more", "nl", "tac", "od", "xxd",
+            "hexdump", "strings", "base64", "cut", "paste", "sort", "uniq",
+            "grep", "egrep", "fgrep", "awk", "sed", "rev", "fold", "expand",
+        ];
+        let first = command.split_whitespace().next().unwrap_or("");
+        let first = first.rsplit('/').next().unwrap_or(first);
+        // 解释器内联代码读（python3 -c "open('skills/..')" / bash -c "cat .."）：
+        // 带 -c/-e 内联标志且命令文本里明文出现受保护前缀 → 拒。
+        // 执行脚本文件（python3 skills/x/y.py，无 -c）不受影响。
+        const INTERP: &[&str] = &[
+            "python", "python3", "perl", "ruby", "node", "php", "bash", "sh", "zsh",
+        ];
+        if INTERP.contains(&first)
+            && command
+                .split_whitespace()
+                .any(|t| t == "-c" || t == "-e" || t == "-E")
+        {
+            for pref in &self.noread_prefixes {
+                let pref = pref.trim_start_matches("./");
+                if command.contains(pref) {
+                    return Some(pref.to_string());
+                }
+            }
+        }
+        if !READERS.contains(&first) {
+            return None;
+        }
+        for tok in command.split_whitespace().skip(1) {
+            let cand = tok.trim_matches(|c| c == '"' || c == '\'');
+            if looks_like_path(cand) && self.matches_prefix(cand, &self.noread_prefixes) {
+                return Some(cand.to_string());
+            }
+        }
+        None
+    }
+
     pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
@@ -893,6 +942,55 @@ impl SecurityPolicy {
     // technique; together they enforce workspace confinement.
 
     /// Check if a file path is allowed (no path traversal, within workspace)
+    /// Write-time path check: everything `is_path_allowed` requires, PLUS the
+    /// path must not fall under any configured `readonly_prefixes`. Used by
+    /// file_write / file_edit / publish_file so the agent can read but never
+    /// rewrite its own skills/persona (self-modification guard).
+    /// True if `path` (workspace-relative) matches any of `prefixes` (dir
+    /// prefix, exact file, or basename). Shared by read/write guards.
+    fn matches_prefix(&self, path: &str, prefixes: &[String]) -> bool {
+        if prefixes.is_empty() {
+            return false;
+        }
+        // 归一化到"相对 workspace 根"的形式，覆盖 LLM 尝试的所有绕过写法：
+        // 绝对路径、workspace/ 前缀、./ 前缀、反斜杠。
+        let expanded = expand_user_path(path);
+        let mut rel = if expanded.is_absolute() {
+            expanded
+                .strip_prefix(&self.workspace_dir)
+                .map(|r| r.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string())
+        } else {
+            path.to_string()
+        };
+        rel = rel.trim_start_matches("./").replace('\\', "/");
+        if let Some(stripped) = rel.strip_prefix("workspace/") {
+            rel = stripped.to_string();
+        }
+        let base = rel.rsplit('/').next().unwrap_or(&rel);
+        for pref in prefixes {
+            let pref: &str = pref.trim_start_matches("./");
+            if rel == *pref || rel.starts_with(pref) || base == pref {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Read-time path check: `is_path_allowed` PLUS not under `noread_prefixes`.
+    /// Used by file_read so the agent cannot dump its own skills/persona to a
+    /// user. Reads outside the noread set are unaffected.
+    pub fn is_read_path_allowed(&self, path: &str) -> bool {
+        self.is_path_allowed(path) && !self.matches_prefix(path, &self.noread_prefixes)
+    }
+
+        pub fn is_write_path_allowed(&self, path: &str) -> bool {
+        if !self.is_path_allowed(path) {
+            return false;
+        }
+        !self.matches_prefix(path, &self.readonly_prefixes)
+    }
+
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
         if path.contains('\0') {
@@ -1072,6 +1170,8 @@ impl SecurityPolicy {
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
+            readonly_prefixes: autonomy_config.readonly_prefixes.clone(),
+            noread_prefixes: autonomy_config.noread_prefixes.clone(),
             allowed_roots: autonomy_config
                 .allowed_roots
                 .iter()
