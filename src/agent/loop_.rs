@@ -1993,6 +1993,29 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
+/// Combine text the model emitted alongside tool calls in earlier iterations
+/// with the final post-tool response. Segments already contained in the final
+/// text (or in an earlier segment) are skipped so a model that repeats itself
+/// after tool results doesn't produce a duplicated reply.
+fn merge_interleaved_display(interleaved: &[String], final_text: &str) -> String {
+    let final_trimmed = final_text.trim();
+    let mut parts: Vec<String> = Vec::new();
+    for segment in interleaved {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() || final_trimmed.contains(trimmed) {
+            continue;
+        }
+        if parts.iter().any(|kept| kept.contains(trimmed)) {
+            continue;
+        }
+        parts.push(trimmed.to_string());
+    }
+    if !final_trimmed.is_empty() {
+        parts.push(final_trimmed.to_string());
+    }
+    parts.join("\n\n")
+}
+
 fn resolve_display_text(response_text: &str, parsed_text: &str, has_tool_calls: bool) -> String {
     if has_tool_calls {
         return parsed_text.to_string();
@@ -2367,6 +2390,12 @@ pub(crate) async fn run_tool_call_loop(
     // Carries the fully-formatted reflection prompt body so each detector can
     // tailor its own wording (deduped-loop vs identical-output-loop).
     let mut pending_reflection: Option<String> = None;
+    // Text the model emitted alongside tool calls in earlier iterations of this
+    // turn. Channels only ever see the loop's return value, so without this any
+    // substantive answer written before a trailing tool call (e.g. the model
+    // presents its analysis and then calls memory_store) would be silently
+    // dropped — the user would only receive the short post-tool closer.
+    let mut interleaved_texts: Vec<String> = Vec::new();
 
     for iteration in 0..max_iterations {
         // 2026-05-14 daemon hang diagnostic markers — emit at each
@@ -2552,6 +2581,11 @@ pub(crate) async fn run_tool_call_loop(
                         parsed_text = fallback_text;
                     }
                     calls = fallback_calls;
+                } else {
+                    // Native tool calls arrive in a separate field, so any
+                    // content text is narration/analysis meant for the user —
+                    // surface it instead of dropping it.
+                    parsed_text = response_text.clone();
                 }
 
                 if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls) {
@@ -2693,6 +2727,10 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // Merge any text emitted alongside earlier tool calls into the
+            // final reply so the substantive answer isn't lost when the model
+            // wrote it before a trailing tool call.
+            let final_text = merge_interleaved_display(&interleaved_texts, &display_text);
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -2703,7 +2741,7 @@ pub(crate) async fn run_tool_call_loop(
                 None,
                 serde_json::json!({
                     "iteration": iteration + 1,
-                    "text": scrub_credentials(&display_text),
+                    "text": scrub_credentials(&final_text),
                 }),
             );
             // No tool calls — this is the final response.
@@ -2715,7 +2753,7 @@ pub(crate) async fn run_tool_call_loop(
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
-                for word in display_text.split_inclusive(char::is_whitespace) {
+                for word in final_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token
                         .as_ref()
                         .is_some_and(CancellationToken::is_cancelled)
@@ -2734,13 +2772,19 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            return Ok(final_text);
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+        // Text produced alongside tool calls: print immediately in CLI mode;
+        // in channel mode (silent) keep it so the final reply includes it —
+        // see merge_interleaved_display above.
+        if !display_text.is_empty() {
+            if silent {
+                interleaved_texts.push(display_text.clone());
+            } else {
+                print!("{display_text}");
+                let _ = std::io::stdout().flush();
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
@@ -4110,19 +4154,29 @@ async fn process_message_inner(
         history.push(ChatMessage::user(
             "[系统] 你上一条回复没有调用任何工具，但当前 SOP 仍在进行中、还没到最后一步。请立即继续：调用 sop_advance 或当前步骤所需的工具，把 SOP 推进到最终步骤（含写库/save 步骤）后再结束；不要用纯文本提前收尾。",
         ));
-        response = agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        config.default_temperature,
-        true,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-    )
-    .await?;
+        let nudge_response = agent_turn(
+            provider.as_ref(),
+            &mut history,
+            &tools_registry,
+            observer.as_ref(),
+            provider_name,
+            &model_name,
+            config.default_temperature,
+            true,
+            &config.multimodal,
+            config.agent.max_tool_iterations,
+        )
+        .await?;
+        // Append rather than overwrite: the pre-nudge response may already
+        // hold the substantive answer the user should see.
+        let nudge_trimmed = nudge_response.trim();
+        if !nudge_trimmed.is_empty() && !response.contains(nudge_trimmed) {
+            if response.trim().is_empty() {
+                response = nudge_response;
+            } else {
+                response = format!("{}\n\n{}", response.trim_end(), nudge_trimmed);
+            }
+        }
     }
     Ok((response, history))
 }
@@ -5469,7 +5523,10 @@ mod tests {
         .await
         .expect("native fallback id flow should complete");
 
-        assert_eq!(result, "done");
+        assert_eq!(
+            result, "Need to call tool\n\ndone",
+            "text alongside tool calls should be preserved in the final reply"
+        );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
             history.iter().any(|msg| {
@@ -5509,6 +5566,100 @@ mod tests {
     fn resolve_display_text_uses_response_text_for_final_turns() {
         let display = resolve_display_text("Final answer", "", false);
         assert_eq!(display, "Final answer");
+    }
+
+    #[test]
+    fn merge_interleaved_display_prepends_tool_turn_text() {
+        let interleaved = vec!["这是完整的企业分析正文。".to_string()];
+        let merged = merge_interleaved_display(&interleaved, "以上是分析，随时说。");
+        assert_eq!(merged, "这是完整的企业分析正文。\n\n以上是分析，随时说。");
+    }
+
+    #[test]
+    fn merge_interleaved_display_skips_segments_repeated_in_final() {
+        let interleaved = vec!["重复的段落".to_string()];
+        let merged = merge_interleaved_display(&interleaved, "重复的段落，以及结尾。");
+        assert_eq!(merged, "重复的段落，以及结尾。");
+    }
+
+    #[test]
+    fn merge_interleaved_display_handles_empty_final() {
+        let interleaved = vec!["only body".to_string()];
+        assert_eq!(merge_interleaved_display(&interleaved, "  "), "only body");
+        assert_eq!(merge_interleaved_display(&[], "final"), "final");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_text_alongside_native_tool_calls() {
+        // Mirrors the deepseek-style pattern: the substantive answer arrives
+        // in the same response as a trailing memory_store call, and the
+        // post-tool response is only a short closer.
+        let scripted = VecDeque::from(vec![
+            ChatResponse {
+                text: Some("万思医疗核心竞争力分析：拿到国内首张NMPA证。".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: "{\"value\":\"X\"}".to_string(),
+                }],
+                usage: None,
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: Some("以上是完整分析，随时说。".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(scripted)),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("重点分析这家企业"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "gateway",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+        )
+        .await
+        .expect("native narration flow should complete");
+
+        assert_eq!(
+            result,
+            "万思医疗核心竞争力分析：拿到国内首张NMPA证。\n\n以上是完整分析，随时说。"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     #[test]
