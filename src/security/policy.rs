@@ -865,7 +865,11 @@ impl SecurityPolicy {
         }
         for tok in command.split_whitespace().skip(1) {
             let cand = tok.trim_matches(|c| c == '"' || c == '\'');
-            if looks_like_path(cand) && self.matches_prefix(cand, &self.noread_prefixes) {
+            // flags 跳过；其余任何 token 命中 noread 前缀即拦（basename 也算）
+            if cand.starts_with('-') || cand.is_empty() {
+                continue;
+            }
+            if self.matches_prefix(cand, &self.noread_prefixes) {
                 return Some(cand.to_string());
             }
         }
@@ -1542,6 +1546,58 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn noread_prefixes_block_reads() {
+        use crate::config::AutonomyConfig;
+        let mut cfg = AutonomyConfig::default();
+        cfg.workspace_only = true;
+        cfg.noread_prefixes = vec!["skills/".into(), "AGENTS.md".into()];
+        let p = SecurityPolicy::from_config(&cfg, std::path::Path::new("/tmp/ws"));
+        // file_read 被拒
+        assert!(!p.is_read_path_allowed("skills/x/SKILL.md"));
+        // 三种绕过形式全拦（绝对/workspace前缀/./）
+        assert!(!p.is_read_path_allowed("/tmp/ws/skills/x/SKILL.md"));
+        assert!(!p.is_read_path_allowed("workspace/skills/x/SKILL.md"));
+        assert!(!p.is_read_path_allowed("./skills/x/SKILL.md"));
+        assert!(!p.is_read_path_allowed("AGENTS.md"));
+        // 正常路径可读
+        assert!(p.is_read_path_allowed("产物/report.md"));
+        assert!(p.is_read_path_allowed("state/data.json"));
+        // shell 读命令拦截
+        assert!(p.noread_command_argument("cat skills/x/SKILL.md").is_some());
+        assert!(p.noread_command_argument("head -5 AGENTS.md").is_some());
+        // shell 执行命令放行（python 跑脚本不是读源码）
+        assert!(p.noread_command_argument("python3 skills/x/scripts/y.py list").is_none());
+        // 解释器内联读被拦；执行脚本放行
+        assert!(p.noread_command_argument("python3 -c \"print(open('skills/x/SKILL.md').read())\"").is_some());
+        assert!(p.noread_command_argument("bash -c \"cat skills/x/SKILL.md\"").is_some());
+        assert!(p.noread_command_argument("python3 skills/x/scripts/y.py --arg AGENTS.md").is_none());
+        // 读正常文件放行
+        assert!(p.noread_command_argument("cat 产物/report.md").is_none());
+    }
+
+    #[test]
+    fn readonly_prefixes_block_writes() {
+        use crate::config::AutonomyConfig;
+        let mut cfg = AutonomyConfig::default();
+        cfg.workspace_only = true;
+        cfg.readonly_prefixes = vec![
+            "skills/".into(), "AGENTS.md".into(), "IDENTITY.md".into(),
+        ];
+        let p = SecurityPolicy::from_config(&cfg, std::path::Path::new("/tmp/ws"));
+        // 写被拒
+        assert!(!p.is_write_path_allowed("AGENTS.md"));
+        assert!(!p.is_write_path_allowed("./AGENTS.md"));
+        assert!(!p.is_write_path_allowed("skills/foo/SKILL.md"));
+        assert!(!p.is_write_path_allowed("IDENTITY.md"));
+        // 读不受影响
+        assert!(p.is_path_allowed("AGENTS.md"));
+        assert!(p.is_path_allowed("skills/foo/SKILL.md"));
+        // 正常产物路径可写
+        assert!(p.is_write_path_allowed("产物/report.md"));
+        assert!(p.is_write_path_allowed("state/contacts.json"));
     }
 
     #[test]
