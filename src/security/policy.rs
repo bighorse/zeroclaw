@@ -1569,11 +1569,19 @@ mod tests {
         assert!(p.noread_command_argument("cat skills/x/SKILL.md").is_some());
         assert!(p.noread_command_argument("head -5 AGENTS.md").is_some());
         // shell 执行命令放行（python 跑脚本不是读源码）
-        assert!(p.noread_command_argument("python3 skills/x/scripts/y.py list").is_none());
+        assert!(p
+            .noread_command_argument("python3 skills/x/scripts/y.py list")
+            .is_none());
         // 解释器内联读被拦；执行脚本放行
-        assert!(p.noread_command_argument("python3 -c \"print(open('skills/x/SKILL.md').read())\"").is_some());
-        assert!(p.noread_command_argument("bash -c \"cat skills/x/SKILL.md\"").is_some());
-        assert!(p.noread_command_argument("python3 skills/x/scripts/y.py --arg AGENTS.md").is_none());
+        assert!(p
+            .noread_command_argument("python3 -c \"print(open('skills/x/SKILL.md').read())\"")
+            .is_some());
+        assert!(p
+            .noread_command_argument("bash -c \"cat skills/x/SKILL.md\"")
+            .is_some());
+        assert!(p
+            .noread_command_argument("python3 skills/x/scripts/y.py --arg AGENTS.md")
+            .is_none());
         // 读正常文件放行
         assert!(p.noread_command_argument("cat 产物/report.md").is_none());
     }
@@ -1583,9 +1591,7 @@ mod tests {
         use crate::config::AutonomyConfig;
         let mut cfg = AutonomyConfig::default();
         cfg.workspace_only = true;
-        cfg.readonly_prefixes = vec![
-            "skills/".into(), "AGENTS.md".into(), "IDENTITY.md".into(),
-        ];
+        cfg.readonly_prefixes = vec!["skills/".into(), "AGENTS.md".into(), "IDENTITY.md".into()];
         let p = SecurityPolicy::from_config(&cfg, std::path::Path::new("/tmp/ws"));
         // 写被拒
         assert!(!p.is_write_path_allowed("AGENTS.md"));
