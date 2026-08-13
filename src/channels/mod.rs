@@ -3063,6 +3063,9 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+// external_sop_engine is only read inside `#[cfg(feature = "channel-lark")]`
+// blocks, so it is genuinely unused in a build without that feature.
+#[cfg_attr(not(feature = "channel-lark"), allow(unused_variables))]
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,

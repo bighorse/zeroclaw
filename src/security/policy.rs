@@ -836,9 +836,9 @@ impl SecurityPolicy {
             return None;
         }
         const READERS: &[&str] = &[
-            "cat", "head", "tail", "less", "more", "nl", "tac", "od", "xxd",
-            "hexdump", "strings", "base64", "cut", "paste", "sort", "uniq",
-            "grep", "egrep", "fgrep", "awk", "sed", "rev", "fold", "expand",
+            "cat", "head", "tail", "less", "more", "nl", "tac", "od", "xxd", "hexdump", "strings",
+            "base64", "cut", "paste", "sort", "uniq", "grep", "egrep", "fgrep", "awk", "sed",
+            "rev", "fold", "expand",
         ];
         let first = command.split_whitespace().next().unwrap_or("");
         let first = first.rsplit('/').next().unwrap_or(first);
@@ -988,7 +988,7 @@ impl SecurityPolicy {
         self.is_path_allowed(path) && !self.matches_prefix(path, &self.noread_prefixes)
     }
 
-        pub fn is_write_path_allowed(&self, path: &str) -> bool {
+    pub fn is_write_path_allowed(&self, path: &str) -> bool {
         if !self.is_path_allowed(path) {
             return false;
         }

@@ -2731,10 +2731,12 @@ mod tests {
     /// (previously only the *primary* provider could be re-pointed via
     /// `apply_named_model_provider_profile`). Config:
     ///
-    ///   [reliability]
-    ///   fallback_providers = ["qwen"]
-    ///   [model_providers.qwen]
-    ///   base_url = "https://my-self-hosted-qwen.example.com/v1"
+    /// ```toml
+    /// [reliability]
+    /// fallback_providers = ["qwen"]
+    /// [model_providers.qwen]
+    /// base_url = "https://my-self-hosted-qwen.example.com/v1"
+    /// ```
     ///
     /// must produce a fallback provider pointing at the custom URL, not
     /// at qwen's built-in default.

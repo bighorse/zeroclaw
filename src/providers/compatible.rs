@@ -702,6 +702,7 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
 ///    hundreds of chunks per second across reasoning_content +
 ///    content. 100-slot backpressure stalled the sender. Bumped to
 ///    1024.
+///
 /// Max idle time between SSE chunks before treating the stream as dead.
 /// reqwest's request-level `.timeout()` only covers up to first-byte;
 /// once the SSE response is established, individual chunk-to-chunk
@@ -800,7 +801,6 @@ fn sse_bytes_to_chunks(
                                 // silently continue so a single bad
                                 // event doesn't kill a 5-minute LLM
                                 // response.
-                                continue;
                             }
                         }
                     }
@@ -3065,7 +3065,7 @@ mod tests {
         let mut byte_buf: Vec<u8> = Vec::new();
         byte_buf.extend_from_slice(chunk1);
         // Mid-char: no complete line yet, no extraction
-        assert!(byte_buf.iter().position(|&b| b == b'\n').is_none());
+        assert!(!byte_buf.contains(&b'\n'));
 
         byte_buf.extend_from_slice(chunk2);
         // Now a complete line exists; extract and verify "界" intact.
