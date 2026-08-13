@@ -189,6 +189,11 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn extra_request_fields(&self) -> Option<&serde_json::Value> {
+        self.extra_request_fields.as_ref()
+    }
+
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
@@ -876,6 +881,23 @@ fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<Resp
     };
 
     (instructions, input)
+}
+
+/// Merge provider-specific top-level fields into a serialized request body.
+/// Extras win on key collisions; a non-object body is returned untouched.
+fn merge_extra_request_fields(
+    mut body: serde_json::Value,
+    extras: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(extras) = extras.and_then(serde_json::Value::as_object) else {
+        return body;
+    };
+    if let Some(obj) = body.as_object_mut() {
+        for (key, value) in extras {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+    body
 }
 
 fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
@@ -1606,20 +1628,10 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         // Merge extra_request_fields(如 deepseek thinking disabled) 到 body 顶层。
-        let request_body = match self.extra_request_fields.as_ref() {
-            Some(extras) => {
-                let mut value = serde_json::to_value(&native_request)
-                    .unwrap_or_else(|_| serde_json::Value::Null);
-                if let (Some(obj), Some(extra_obj)) = (value.as_object_mut(), extras.as_object()) {
-                    for (k, v) in extra_obj {
-                        obj.insert(k.clone(), v.clone());
-                    }
-                }
-                value
-            }
-            None => serde_json::to_value(&native_request)
-                .unwrap_or_else(|_| serde_json::Value::Null),
-        };
+        let request_body = merge_extra_request_fields(
+            serde_json::to_value(&native_request).unwrap_or(serde_json::Value::Null),
+            self.extra_request_fields.as_ref(),
+        );
         // 2026-05-14 V27: process_message_inner now wraps the whole
         // agent loop in block_in_place + a fresh isolated tokio
         // runtime, so this chat() call already runs on a fresh runtime
@@ -1792,13 +1804,20 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
         let client = self.http_client();
         let auth_header = self.auth_header.clone();
+        // Same merge as the non-streaming path — without it a provider-specific
+        // field like deepseek's thinking switch would apply to chat() only, and
+        // streamed replies would keep leaking reasoning.
+        let request_body = merge_extra_request_fields(
+            serde_json::to_value(&request).unwrap_or(serde_json::Value::Null),
+            self.extra_request_fields.as_ref(),
+        );
 
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         tokio::spawn(async move {
             // Build request with auth
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = client.post(&url).json(&request_body);
 
             // Apply auth header
             req_builder = match &auth_header {
@@ -1901,6 +1920,31 @@ mod tests {
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    }
+
+    #[test]
+    fn extra_request_fields_land_at_body_top_level() {
+        let body = merge_extra_request_fields(
+            serde_json::json!({"model": "deepseek-v4-pro", "stream": false}),
+            Some(&serde_json::json!({"thinking": {"type": "disabled"}})),
+        );
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["model"], "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn extra_request_fields_override_existing_keys() {
+        let body = merge_extra_request_fields(
+            serde_json::json!({"temperature": 0.7}),
+            Some(&serde_json::json!({"temperature": 0.0})),
+        );
+        assert_eq!(body["temperature"], 0.0);
+    }
+
+    #[test]
+    fn merge_without_extras_leaves_body_untouched() {
+        let original = serde_json::json!({"model": "gpt-4"});
+        assert_eq!(merge_extra_request_fields(original.clone(), None), original);
     }
 
     #[test]

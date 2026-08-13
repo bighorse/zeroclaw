@@ -979,6 +979,40 @@ fn parse_custom_provider_url(
     }
 }
 
+/// Build the DeepSeek provider, disabling thinking mode unless the user opted in.
+///
+/// DeepSeek V4 turns thinking on by default: the whole answer lands in
+/// `reasoning_content` and `content` comes back empty. Callers that only read
+/// `content` therefore see an empty reply, and callers that fall back to
+/// `reasoning_content` leak raw English chain-of-thought to end users.
+///
+/// Only two request fields actually turn it off — the other plausible spellings
+/// are accepted and silently ignored, which makes this easy to get wrong:
+///
+/// | field                             | effect on `deepseek-v4-pro`     |
+/// |-----------------------------------|---------------------------------|
+/// | `{"thinking":{"type":"disabled"}}`| off — used here                 |
+/// | `{"reasoning_effort":"none"}`     | off                             |
+/// | `{"reasoning":{"enabled":false}}` | **silently ignored**            |
+/// | `{"enable_thinking":false}`       | **silently ignored**            |
+/// | `{"thinking":false}`              | API rejects it (type error)     |
+fn deepseek_provider(
+    key: Option<&str>,
+    reasoning_enabled: Option<bool>,
+) -> OpenAiCompatibleProvider {
+    let provider = OpenAiCompatibleProvider::new(
+        "DeepSeek",
+        "https://api.deepseek.com",
+        key,
+        AuthStyle::Bearer,
+    );
+    if reasoning_enabled == Some(true) {
+        provider
+    } else {
+        provider.with_extra_request_fields(serde_json::json!({"thinking": {"type": "disabled"}}))
+    }
+}
+
 /// Factory: create the right provider from config (without custom URL)
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
     create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
@@ -1223,9 +1257,7 @@ fn create_provider_with_url_and_options(
         "xai" | "grok" => Ok(compat(OpenAiCompatibleProvider::new(
             "xAI", "https://api.x.ai", key, AuthStyle::Bearer,
         ))),
-        "deepseek" => Ok(compat(OpenAiCompatibleProvider::new(
-            "DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer,
-        ))),
+        "deepseek" => Ok(compat(deepseek_provider(key, options.reasoning_enabled))),
         "together" | "together-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Together AI", "https://api.together.xyz", key, AuthStyle::Bearer,
         ))),
@@ -2427,6 +2459,32 @@ mod tests {
         let provider =
             create_provider("deepseek", Some("key")).expect("deepseek provider should build");
         assert!(!provider.supports_vision());
+    }
+
+    #[test]
+    fn deepseek_disables_thinking_by_default() {
+        let provider = deepseek_provider(Some("key"), None);
+        assert_eq!(
+            provider.extra_request_fields(),
+            Some(&serde_json::json!({"thinking": {"type": "disabled"}})),
+            "without an explicit opt-in DeepSeek must be told to disable thinking, \
+             otherwise `content` comes back empty and the reasoning leaks to users"
+        );
+    }
+
+    #[test]
+    fn deepseek_disables_thinking_when_reasoning_turned_off() {
+        let provider = deepseek_provider(Some("key"), Some(false));
+        assert!(provider.extra_request_fields().is_some());
+    }
+
+    #[test]
+    fn deepseek_keeps_thinking_when_reasoning_enabled() {
+        let provider = deepseek_provider(Some("key"), Some(true));
+        assert!(
+            provider.extra_request_fields().is_none(),
+            "runtime.reasoning_enabled = true must leave DeepSeek's thinking mode alone"
+        );
     }
 
     #[test]
