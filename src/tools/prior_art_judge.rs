@@ -902,7 +902,7 @@ mod tests {
         // Construct papers in mixed order; render_report does NOT
         // sort, but execute() does — so verify via direct sort
         // simulation that newest papers end up first in the slice.
-        let mut papers = vec![
+        let mut papers = [
             PaperRecord {
                 pmid: "OLD1".into(),
                 year: "2018".into(),
