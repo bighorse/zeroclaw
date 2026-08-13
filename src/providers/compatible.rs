@@ -1842,11 +1842,8 @@ impl Provider for OpenAiCompatibleProvider {
             // fail fast and let reliable.rs trigger the fallback chain.
             tracing::debug!("chat_stream: send().await starting");
             let send_fut = req_builder.send();
-            let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                send_fut,
-            )
-            .await
+            let response = match tokio::time::timeout(std::time::Duration::from_secs(120), send_fut)
+                .await
             {
                 Ok(Ok(r)) => {
                     tracing::debug!("chat_stream: send() returned (status={})", r.status());
