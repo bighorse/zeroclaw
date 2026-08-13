@@ -138,20 +138,40 @@ credential is not reused for fallback providers.
 - Cross-region inference profiles supported (e.g., `us.anthropic.claude-*`).
 - Model IDs use Bedrock format: `anthropic.claude-sonnet-4-6`, `anthropic.claude-opus-4-6-v1`, etc.
 
-### Ollama Reasoning Toggle
+### Reasoning Toggle
 
-You can control Ollama reasoning/thinking behavior from `config.toml`:
+You can control reasoning/thinking behavior from `config.toml`:
 
 ```toml
 [runtime]
 reasoning_enabled = false
 ```
 
-Behavior:
+Ollama:
 
 - `false`: sends `think: false` to Ollama `/api/chat` requests.
 - `true`: sends `think: true`.
 - Unset: omits `think` and keeps Ollama/model defaults.
+
+DeepSeek:
+
+- `true`: leaves thinking mode alone.
+- `false` or unset: sends `{"thinking": {"type": "disabled"}}`.
+
+DeepSeek defaults to thinking **on** from V4, and when it is on the whole
+answer is returned in `reasoning_content` while `content` comes back empty —
+so leaving it enabled produces blank replies unless your integration reads
+`reasoning_content` itself. That is why unset disables it here rather than
+deferring to the provider default.
+
+### DeepSeek Notes
+
+- Provider ID: `deepseek`
+- Endpoint: `https://api.deepseek.com`
+- Thinking mode is disabled by default; see [Reasoning Toggle](#reasoning-toggle).
+- Note that `{"reasoning": {"enabled": false}}` and `{"enable_thinking": false}`
+  are accepted by the API and then ignored — only `{"thinking": {"type": "disabled"}}`
+  and `{"reasoning_effort": "none"}` actually turn thinking off.
 
 ### Kimi Code Notes
 
