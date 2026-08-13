@@ -1776,7 +1776,9 @@ impl SopStartedSignal {
 
     /// Fire an event payload to the configured webhook URL in a detached OS thread.
     fn fire_webhook(&self, payload: serde_json::Value) {
-        let Some(url) = self.webhook_url.clone() else { return };
+        let Some(url) = self.webhook_url.clone() else {
+            return;
+        };
         let secret = self.webhook_secret.clone();
         std::thread::spawn(move || {
             let client = reqwest::blocking::Client::builder()
@@ -1861,9 +1863,13 @@ impl crate::observability::Observer for SopStartedSignal {
         self.inner.record_metric(metric);
     }
 
-    fn name(&self) -> &str { "sop-started-signal" }
+    fn name(&self) -> &str {
+        "sop-started-signal"
+    }
 
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// POST /api/chat — Bearer-authenticated chat that runs the full agent
@@ -2032,8 +2038,7 @@ async fn handle_api_chat(
                             config,
                             &message,
                             Some(prior),
-                            Some(signal_obs_bg.clone()
-                                as Arc<dyn crate::observability::Observer>),
+                            Some(signal_obs_bg.clone() as Arc<dyn crate::observability::Observer>),
                             Some(sop_engine_shared.clone()),
                         )
                         .await;
@@ -2064,11 +2069,9 @@ async fn handle_api_chat(
                         response_text: response_text.clone(),
                     },
                 );
-                global_obs.record_metric(
-                    &crate::observability::ObserverMetric::RequestLatency(
-                        started_at.elapsed(),
-                    ),
-                );
+                global_obs.record_metric(&crate::observability::ObserverMetric::RequestLatency(
+                    started_at.elapsed(),
+                ));
             }
             Err(e) => {
                 let sanitized = providers::sanitize_api_error(&e.to_string());
@@ -2766,7 +2769,9 @@ mod tests {
         let long_text = "x".repeat(5 * API_CHAT_HISTORY_COMPACT_CONTENT_CHARS);
         let mut history = vec![crate::providers::ChatMessage::system("sys")];
         for i in 0..20 {
-            history.push(crate::providers::ChatMessage::user(format!("q{i} {long_text}")));
+            history.push(crate::providers::ChatMessage::user(format!(
+                "q{i} {long_text}"
+            )));
             history.push(crate::providers::ChatMessage::assistant(format!(
                 "tool call {i}"
             )));
@@ -2781,9 +2786,9 @@ mod tests {
         assert!(history.len() <= API_CHAT_HISTORY_COMPACT_KEEP_MESSAGES + 1);
         assert!(history.iter().all(|m| m.role != "tool"));
         // truncate_with_ellipsis appends "..." (3 chars) after the cap.
-        assert!(history.iter().all(
-            |m| m.content.chars().count() <= API_CHAT_HISTORY_COMPACT_CONTENT_CHARS + 3
-        ));
+        assert!(history
+            .iter()
+            .all(|m| m.content.chars().count() <= API_CHAT_HISTORY_COMPACT_CONTENT_CHARS + 3));
         // Most recent turn must survive compaction.
         assert!(history.iter().any(|m| m.content.starts_with("a19")));
     }
@@ -2793,14 +2798,13 @@ mod tests {
         // Native-tools mode stores assistant tool-call turns as a JSON
         // envelope; keeping it without its role:"tool" responses produces an
         // orphaned tool_calls message that strict endpoints reject with 400.
-        let scaffolding = r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#;
+        let scaffolding =
+            r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#;
         let mut history = vec![
             crate::providers::ChatMessage::system("sys"),
             crate::providers::ChatMessage::user("question"),
             crate::providers::ChatMessage::assistant(scaffolding),
-            crate::providers::ChatMessage::tool(
-                r#"{"tool_call_id":"call_1","content":"result"}"#,
-            ),
+            crate::providers::ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"result"}"#),
             crate::providers::ChatMessage::user("[Tool results]\nraw dump"),
             crate::providers::ChatMessage::assistant("final answer"),
         ];
@@ -2821,7 +2825,8 @@ mod tests {
         // A single agentic turn appending 60+ scaffolding messages after its
         // user message must not wipe the conversation: the fallback compacts
         // to recent plain turns, preserving the final answer.
-        let scaffolding = r#"{"content":null,"tool_calls":[{"id":"c","name":"shell","arguments":"{}"}]}"#;
+        let scaffolding =
+            r#"{"content":null,"tool_calls":[{"id":"c","name":"shell","arguments":"{}"}]}"#;
         let mut history = vec![
             crate::providers::ChatMessage::system("sys"),
             crate::providers::ChatMessage::user("the question"),

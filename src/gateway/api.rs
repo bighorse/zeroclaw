@@ -1030,7 +1030,6 @@ fn hydrate_config_for_save(
     incoming
 }
 
-
 /// GET /api/sop/runs — SOP run 列表（进行中/等待审批/近期完成），供龙虾前台审批箱直读，
 /// 免去从对话文本收割 run 编号的脆弱路径。
 pub async fn handle_api_sop_runs(

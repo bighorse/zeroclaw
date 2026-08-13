@@ -983,13 +983,9 @@ impl Provider for ReliableProvider {
                     // context, firm enough to trigger fallback to
                     // qwen before the gateway 5min timeout strands
                     // the client.
-                    let chat_fut =
-                        provider.chat(req, current_model, temperature);
-                    let chat_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(240),
-                        chat_fut,
-                    )
-                    .await;
+                    let chat_fut = provider.chat(req, current_model, temperature);
+                    let chat_result =
+                        tokio::time::timeout(std::time::Duration::from_secs(240), chat_fut).await;
                     let outcome = match chat_result {
                         Ok(inner) => inner,
                         Err(_) => {

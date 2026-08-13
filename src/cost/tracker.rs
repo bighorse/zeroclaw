@@ -260,7 +260,6 @@ fn biz_now_parts() -> (NaiveDate, i32, u32) {
 }
 
 impl CostStorage {
-
     /// Create or open cost storage.
     fn new(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {

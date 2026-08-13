@@ -3896,10 +3896,16 @@ pub async fn process_message_with_history(
             .thread_name("zc-isolated-agent")
             .build()
             .map_err(|e| anyhow::anyhow!("isolated agent runtime build failed: {e}"))?;
-        isolated_rt
-            .block_on(async move {
-                process_message_inner(config, &message, prior_history, external_observer, external_sop_engine).await
-            })
+        isolated_rt.block_on(async move {
+            process_message_inner(
+                config,
+                &message,
+                prior_history,
+                external_observer,
+                external_sop_engine,
+            )
+            .await
+        })
     })
 }
 
@@ -4974,7 +4980,13 @@ mod tests {
 {"name":"count_tool","arguments":{"value":"A"}}
 </tool_call>"#;
         let provider = ScriptedProvider::from_text_responses(vec![
-            same_call, same_call, same_call, same_call, same_call, same_call, same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
             "should not reach",
         ]);
 
@@ -5012,7 +5024,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "loop must bail after exhausted reflections");
+        assert!(
+            result.is_err(),
+            "loop must bail after exhausted reflections"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("stuck") || err.contains("dedup"),
@@ -5189,8 +5204,15 @@ mod tests {
 {"name":"always_fail","arguments":{"value":"A"}}
 </tool_call>"#;
         let provider = ScriptedProvider::from_text_responses(vec![
-            same_call, same_call, same_call, same_call, same_call, same_call, same_call,
-            same_call, "should not reach",
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            "should not reach",
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -5264,8 +5286,16 @@ mod tests {
 {"name":"count_tool","arguments":{"value":"A"}}
 </tool_call>"#;
         let provider = ScriptedProvider::from_text_responses(vec![
-            same_call, same_call, same_call, same_call, same_call, same_call, same_call,
-            same_call, same_call, "should not reach",
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            "should not reach",
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
