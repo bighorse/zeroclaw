@@ -2617,6 +2617,31 @@ pub fn build_system_prompt_with_mode(
         );
     }
 
+    // Narration discipline — must reach EVERY surface (channels, gateway /api/chat, CLI),
+    // so it lives here rather than in `channel_specific_prompt`.
+    //
+    // Text a model writes *alongside* tool calls is deliberately surfaced to the user
+    // (`agent::loop_::resolve_display_text` + `merge_interleaved_display`), because a model
+    // may put the real answer there before a trailing bookkeeping call. The side effect is
+    // that play-by-play ("let me check the DB") accumulates into the final reply.
+    //
+    // With DeepSeek this was invisible until recently: thinking mode parked that prose in
+    // `reasoning_content`. Once thinking was disabled to stop empty replies, the same prose
+    // landed in `content` and became user-visible. An equivalent instruction already existed
+    // but only in the Telegram-specific prompt, so Feishu and the web frontdesk never got it.
+    if !tools.is_empty() {
+        prompt.push_str(
+            "### Output discipline\n\n\
+             When you emit tool calls, do not narrate what you are about to do \
+             (\"let me check…\", \"next I'll fetch…\", \"got it, continuing…\"). \
+             The user cannot see tool execution, so that text only clutters the reply.\n\
+             Save your prose for the turn where you stop calling tools: give the complete \
+             answer there, or state plainly what is blocking you and what you need.\n\
+             This restricts play-by-play only — substantive content (analysis, findings, a \
+             drafted report) is always welcome, wherever you write it.\n\n",
+        );
+    }
+
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
     prompt.push_str(
