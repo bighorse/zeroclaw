@@ -7127,6 +7127,66 @@ Let me check the result."#;
         );
     }
 
+    /// Narration discipline must reach every surface, not just Telegram.
+    ///
+    /// Regression guard for: DeepSeek with thinking disabled writes play-by-play
+    /// ("先查一下库…") into `content` alongside tool calls; that text is surfaced and
+    /// accumulates into the reply. The instruction lived only in the Telegram-specific
+    /// prompt, so Feishu and the gateway (`/api/chat`) never received it.
+    #[test]
+    fn system_prompt_carries_narration_discipline_in_both_modes() {
+        use crate::channels::build_system_prompt_with_mode;
+
+        let tools: Vec<(&str, &str)> = vec![("shell", "Execute shell commands")];
+        for native in [true, false] {
+            let prompt = build_system_prompt_with_mode(
+                std::path::Path::new("/tmp"),
+                "test-model",
+                &tools,
+                &[],
+                None,
+                None,
+                native,
+                crate::config::SkillsPromptInjectionMode::Full,
+            );
+            assert!(
+                prompt.contains("Output discipline"),
+                "native_tools={native}: prompt must carry the narration rule"
+            );
+            assert!(
+                prompt.contains("do not narrate what you are about to do"),
+                "native_tools={native}: rule text missing"
+            );
+            // Must not over-reach: real content is still wanted, only play-by-play is barred.
+            assert!(
+                prompt.contains("substantive content"),
+                "native_tools={native}: rule must exempt substantive content so the \
+                 'answer written alongside a trailing tool call' fix is not undone"
+            );
+        }
+    }
+
+    /// No tools → no tool calls → the rule would be noise.
+    #[test]
+    fn system_prompt_omits_narration_discipline_without_tools() {
+        use crate::channels::build_system_prompt_with_mode;
+
+        let prompt = build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            true,
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+        assert!(
+            !prompt.contains("Output discipline"),
+            "toolless prompt should not carry a rule about tool calls"
+        );
+    }
+
     // ── Cross-Alias & GLM Shortened Body Tests ──────────────────────────
 
     #[test]
