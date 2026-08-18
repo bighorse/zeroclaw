@@ -276,7 +276,18 @@ impl Provider for OllamaProvider {
 Memory backends provide pluggable persistence for the agent's knowledge.
 
 **Required methods**: `name()`, `store()`, `recall()`, `get()`, `list()`, `forget()`, `count()`, `health_check()`.
-Both `store()` and `recall()` accept an optional `session_id` for scoping.
+
+`store()`, `recall()`, and `list()` all take an optional `session_id`, but it means
+two different things and backends must honour both:
+
+- `store(.., session_id)` — `None` is long-term memory every conversation should
+  see; `Some(sid)` is conversation-scoped content (auto-saved turns).
+- `recall(.., Some(sid))` — a **visibility view**: return unscoped entries *plus*
+  the session's own, never another session's. Filtering on strict equality here
+  is a common mistake; it hides all long-term memory from every scoped read.
+  Use `memory::is_visible_in_session` so the rule stays in one place.
+- `list(.., Some(sid))` — a **strict ownership filter**: only entries stored under
+  `sid`, so administrative callers can enumerate exactly one session.
 
 Register your backend in `src/memory/mod.rs`.
 
@@ -338,12 +349,13 @@ impl Memory for InMemoryBackend {
         let store = self.store.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let query_lower = query.to_lowercase();
 
+        // Visibility view, not equality: unscoped entries stay visible to
+        // every session, other sessions' entries never leak in.
         let mut results: Vec<MemoryEntry> = store
             .values()
             .filter(|e| e.content.to_lowercase().contains(&query_lower))
-            .filter(|e| match session_id {
-                Some(sid) => e.session_id.as_deref() == Some(sid),
-                None => true,
+            .filter(|e| {
+                zeroclaw::memory::is_visible_in_session(e.session_id.as_deref(), session_id)
             })
             .cloned()
             .collect();
@@ -369,6 +381,7 @@ impl Memory for InMemoryBackend {
                 Some(cat) => &e.category == cat,
                 None => true,
             })
+            // Strict ownership filter — `list` is the administrative view.
             .filter(|e| match session_id {
                 Some(sid) => e.session_id.as_deref() == Some(sid),
                 None => true,

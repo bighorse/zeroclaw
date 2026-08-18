@@ -57,7 +57,11 @@ pub trait Memory: Send + Sync {
     /// Backend name
     fn name(&self) -> &str;
 
-    /// Store a memory entry, optionally scoped to a session
+    /// Store a memory entry, optionally scoped to a session.
+    ///
+    /// Pass `None` for long-term memory that every conversation should see.
+    /// Pass `Some(session_id)` for conversation-scoped content (auto-saved
+    /// turns), so it stays out of other conversations' recalled context.
     async fn store(
         &self,
         key: &str,
@@ -66,7 +70,14 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// Recall memories matching a query (keyword search), optionally scoped to a session
+    /// Recall memories matching a query, as seen from `session_id`.
+    ///
+    /// `session_id` is a *view*, not an equality filter: `Some(sid)` returns
+    /// unscoped (long-term) entries plus the session's own, and never another
+    /// session's. `None` is an unscoped read and sees everything.
+    ///
+    /// This differs from [`Memory::list`], which filters by ownership so that
+    /// administrative callers can enumerate exactly one session's entries.
     async fn recall(
         &self,
         query: &str,
@@ -77,7 +88,11 @@ pub trait Memory: Send + Sync {
     /// Get a specific memory by key
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>>;
 
-    /// List all memory keys, optionally filtered by category and/or session
+    /// List all memory keys, optionally filtered by category and/or session.
+    ///
+    /// The session filter is a strict ownership filter: `Some(sid)` returns only
+    /// entries stored under `sid`, excluding unscoped ones. Contrast with
+    /// [`Memory::recall`], whose session argument is a visibility view.
     async fn list(
         &self,
         category: Option<&MemoryCategory>,

@@ -1049,12 +1049,16 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
-async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+async fn run_gateway_chat_with_tools(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<String> {
     // process_message future is large (~20KB stack); box it to keep the
     // gateway task stack from blowing up when this is awaited inside a
     // long async chain (clippy::large_futures).
     let config = state.config.lock().clone();
-    Box::pin(crate::agent::process_message(config, message)).await
+    Box::pin(crate::agent::process_message(config, message, session_id)).await
 }
 
 /// Webhook request body
@@ -1151,7 +1155,12 @@ async fn handle_webhook(
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
+            .store(
+                &key,
+                message,
+                MemoryCategory::Conversation,
+                Some(crate::memory::GATEWAY_WEBHOOK_SESSION_ID),
+            )
             .await;
     }
 
@@ -1321,6 +1330,7 @@ async fn handle_sop_approve(
                         Some(prior),
                         None,
                         Some(engine),
+                        Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
                     )
                     .await
                     {
@@ -1947,7 +1957,12 @@ async fn handle_api_chat(
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, &message, MemoryCategory::Conversation, None)
+            .store(
+                &key,
+                &message,
+                MemoryCategory::Conversation,
+                Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
+            )
             .await;
     }
 
@@ -1961,7 +1976,8 @@ async fn handle_api_chat(
     let started_at = Instant::now();
 
     // Persistent multi-turn history: clone out, call agent, store back.
-    // One daemon = one user, no session id needed.
+    // One daemon = one user, so /api/chat is a single memory scope
+    // (`GATEWAY_API_CHAT_SESSION_ID`) shared by every caller of this endpoint.
     let prior_history = {
         let guard = state.api_chat_history.lock();
         if guard.is_empty() {
@@ -2011,6 +2027,7 @@ async fn handle_api_chat(
             prior_history,
             Some(signal_obs_bg.clone() as Arc<dyn crate::observability::Observer>),
             Some(sop_engine_shared.clone()),
+            Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
         )
         .await;
 
@@ -2040,6 +2057,7 @@ async fn handle_api_chat(
                             Some(prior),
                             Some(signal_obs_bg.clone() as Arc<dyn crate::observability::Observer>),
                             Some(sop_engine_shared.clone()),
+                            Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
                         )
                         .await;
                     }
@@ -2252,16 +2270,31 @@ async fn handle_whatsapp_message(
             truncate_with_ellipsis(&msg.content, 50)
         );
 
+        // Memory scope for this conversation — shared by the auto-save below
+        // and the agent turn, so a conversation only ever recalls its own turns.
+        let session_id = crate::channels::conversation_history_key(msg);
+
         // Auto-save to memory
         if state.auto_save {
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
-        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -2359,17 +2392,32 @@ async fn handle_linq_webhook(
             truncate_with_ellipsis(&msg.content, 50)
         );
 
+        // Memory scope for this conversation — shared by the auto-save below
+        // and the agent turn, so a conversation only ever recalls its own turns.
+        let session_id = crate::channels::conversation_history_key(msg);
+
         // Auto-save to memory
         if state.auto_save {
             let key = linq_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
         // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -2451,17 +2499,32 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
             truncate_with_ellipsis(&msg.content, 50)
         );
 
+        // Memory scope for this conversation — shared by the auto-save below
+        // and the agent turn, so a conversation only ever recalls its own turns.
+        let session_id = crate::channels::conversation_history_key(msg);
+
         // Auto-save to memory
         if state.auto_save {
             let key = wati_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
         // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 // Send reply via WATI
                 if let Err(e) = wati
@@ -2557,15 +2620,30 @@ async fn handle_nextcloud_talk_webhook(
             truncate_with_ellipsis(&msg.content, 50)
         );
 
+        // Memory scope for this conversation — shared by the auto-save below
+        // and the agent turn, so a conversation only ever recalls its own turns.
+        let session_id = crate::channels::conversation_history_key(msg);
+
         if state.auto_save {
             let key = nextcloud_talk_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
-        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))

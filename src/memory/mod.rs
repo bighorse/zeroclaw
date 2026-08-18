@@ -89,6 +89,36 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
 }
 
+/// Memory session id for CLI surfaces (`run` one-shot and the interactive REPL).
+///
+/// The CLI has no per-conversation identity of its own, so every CLI turn shares
+/// one scope: CLI turns keep recalling each other (unchanged behaviour) but no
+/// longer leak into channel conversations.
+pub const CLI_SESSION_ID: &str = "cli";
+
+/// Memory session id for gateway webhook endpoints that carry no sender identity.
+pub const GATEWAY_WEBHOOK_SESSION_ID: &str = "gateway_webhook";
+
+/// Memory session id for the gateway `/api/chat` surface, which keeps one
+/// shared history across its callers.
+pub const GATEWAY_API_CHAT_SESSION_ID: &str = "gateway_api_chat";
+
+/// Whether a stored entry is visible to a session-scoped [`Memory::recall`].
+///
+/// A `None` scope is an unscoped read and sees everything. A `Some(sid)` scope
+/// sees entries stored without a session (long-term memories written by the
+/// `memory_store` tool, the memory CLI, or the gateway memory API) plus its own
+/// entries, and never entries owned by another session.
+///
+/// This is what keeps one conversation's auto-saved turns out of another
+/// conversation's context while long-term memory stays shared.
+pub fn is_visible_in_session(entry_session: Option<&str>, scope: Option<&str>) -> bool {
+    match scope {
+        None => true,
+        Some(sid) => entry_session.is_none() || entry_session == Some(sid),
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct ResolvedEmbeddingConfig {
     provider: String,
@@ -683,5 +713,26 @@ mod tests {
             Some("gemini-key-must-not-be-used"),
             "default_provider key must not leak to the embedding provider"
         );
+    }
+
+    #[test]
+    fn unscoped_read_sees_every_entry() {
+        assert!(is_visible_in_session(None, None));
+        assert!(is_visible_in_session(Some("sess-a"), None));
+    }
+
+    #[test]
+    fn scoped_read_sees_globals_and_own_session() {
+        assert!(is_visible_in_session(None, Some("sess-a")));
+        assert!(is_visible_in_session(Some("sess-a"), Some("sess-a")));
+    }
+
+    #[test]
+    fn scoped_read_hides_other_sessions() {
+        assert!(!is_visible_in_session(Some("sess-b"), Some("sess-a")));
+        assert!(!is_visible_in_session(
+            Some(CLI_SESSION_ID),
+            Some("telegram_42")
+        ));
     }
 }
