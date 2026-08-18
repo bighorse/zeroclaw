@@ -230,7 +230,7 @@ impl Memory for PostgresMemory {
                          CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
                        ) AS score
                 FROM {qualified_table}
-                WHERE ($2::TEXT IS NULL OR session_id = $2)
+                WHERE ($2::TEXT IS NULL OR session_id = $2 OR session_id IS NULL)
                   AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
                 ORDER BY score DESC, updated_at DESC
                 LIMIT $3

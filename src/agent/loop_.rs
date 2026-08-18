@@ -298,7 +298,12 @@ async fn auto_compact_history(
 /// Always pins `user_profile_company_name` at the top regardless of FTS score,
 /// so skills that require the enterprise name never need to ask the user when
 /// the value is already stored in memory.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+async fn build_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_id: Option<&str>,
+) -> String {
     let mut context = String::new();
 
     // Pin enterprise name unconditionally — FTS-based recall scores it low when
@@ -318,7 +323,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
 
     // Pull relevant memories for this message (FTS-scored).
     // Skip user_profile_company_name here to avoid showing it twice.
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| match e.score {
@@ -3622,13 +3627,23 @@ pub async fn run(
         if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
+                .store(
+                    &user_key,
+                    &msg,
+                    MemoryCategory::Conversation,
+                    Some(memory::CLI_SESSION_ID),
+                )
                 .await;
         }
 
         // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+        let mem_context = build_context(
+            mem.as_ref(),
+            &msg,
+            config.memory.min_relevance_score,
+            Some(memory::CLI_SESSION_ID),
+        )
+        .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -3712,9 +3727,12 @@ pub async fn run(
                 }
                 "/clear" | "/new" => {
                     println!(
-                        "This will clear the current conversation and delete all session memory."
+                        "This will clear the current conversation and delete this CLI session's saved turns."
                     );
-                    println!("Core memories (long-term facts/preferences) will be preserved.");
+                    println!(
+                        "Core memories (long-term facts/preferences) and other conversations \
+                         (channels, gateway) are preserved."
+                    );
                     print!("Continue? [y/N] ");
                     let _ = std::io::stdout().flush();
 
@@ -3739,7 +3757,13 @@ pub async fn run(
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                        let entries = mem.list(Some(&category), None).await.unwrap_or_default();
+                        // Ownership filter: only what this CLI session stored, so
+                        // `/clear` in a terminal cannot wipe a running daemon's
+                        // channel conversations.
+                        let entries = mem
+                            .list(Some(&category), Some(memory::CLI_SESSION_ID))
+                            .await
+                            .unwrap_or_default();
                         for entry in entries {
                             if mem.forget(&entry.key).await.unwrap_or(false) {
                                 cleared += 1;
@@ -3760,13 +3784,23 @@ pub async fn run(
             if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
+                    .store(
+                        &user_key,
+                        &user_input,
+                        MemoryCategory::Conversation,
+                        Some(memory::CLI_SESSION_ID),
+                    )
                     .await;
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context(
+                mem.as_ref(),
+                &user_input,
+                config.memory.min_relevance_score,
+                Some(memory::CLI_SESSION_ID),
+            )
+            .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -3854,8 +3888,16 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(config: Config, message: &str) -> Result<String> {
-    let (response, _) = process_message_inner(config, message, None, None, None).await?;
+///
+/// `session_id` scopes memory: the turn recalls long-term memory plus that
+/// conversation's own auto-saved turns, and nothing from other conversations.
+pub async fn process_message(
+    config: Config,
+    message: &str,
+    session_id: Option<&str>,
+) -> Result<String> {
+    let (response, _) =
+        process_message_inner(config, message, None, None, None, session_id).await?;
     Ok(response)
 }
 
@@ -3874,6 +3916,7 @@ pub async fn process_message_with_history(
     prior_history: Option<Vec<ChatMessage>>,
     external_observer: Option<Arc<dyn Observer>>,
     external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    session_id: Option<&str>,
 ) -> Result<(String, Vec<ChatMessage>)> {
     // 2026-05-14 V27 daemon hang isolation: run the entire agent loop on
     // a brand-new single-thread tokio runtime. The main daemon
@@ -3890,6 +3933,7 @@ pub async fn process_message_with_history(
     // to this request; other daemon tasks keep running on the
     // remaining workers.
     let message = message.to_string();
+    let session_id = session_id.map(str::to_string);
     tokio::task::block_in_place(move || {
         let isolated_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3903,6 +3947,7 @@ pub async fn process_message_with_history(
                 prior_history,
                 external_observer,
                 external_sop_engine,
+                session_id.as_deref(),
             )
             .await
         })
@@ -3917,6 +3962,7 @@ async fn process_message_inner(
     // daemon 共享 SopEngine：gateway /api/chat 传入后，SOP run 与 /sop/approve
     // 读的是同一个 engine（否则每请求新建 → 审批永远 404 的 split-brain）
     external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    session_id: Option<&str>,
 ) -> Result<(String, Vec<ChatMessage>)> {
     // 确保共享 CostTracker 已初始化（幂等）：gateway-only 部署也能记账
     let _ = crate::cost::shared_tracker(&config.cost, &config.workspace_dir);
@@ -4097,7 +4143,13 @@ async fn process_message_inner(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+    let mem_context = build_context(
+        mem.as_ref(),
+        message,
+        config.memory.min_relevance_score,
+        session_id,
+    )
+    .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
@@ -6386,7 +6438,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0).await;
+        let context = build_context(&mem, "status updates", 0.0, None).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));

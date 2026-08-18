@@ -330,7 +330,13 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     }
 }
 
-fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
+/// Identity of the conversation a message belongs to.
+///
+/// Doubles as the memory `session_id`, so a conversation's auto-saved turns are
+/// recalled only by that same conversation. Forum topics / threads get their own
+/// identity, which is what lets one user run several independent conversations
+/// side by side on a single chat.
+pub(crate) fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // Include thread_ts for per-topic session isolation in forum groups
     match &msg.thread_ts {
         Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
@@ -856,6 +862,32 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .remove(sender_key);
 }
 
+/// Drop the auto-saved turns this conversation owns.
+///
+/// Clearing the in-process history alone does not start a fresh conversation:
+/// the next message finds no prior history and therefore re-seeds context from
+/// memory, pulling the just-cleared turns straight back in. Only entries stored
+/// under this conversation's session are removed — long-term memory written
+/// deliberately (`memory_store`, memory CLI, gateway API) is unscoped and stays.
+async fn forget_sender_autosaves(ctx: &ChannelRuntimeContext, sender_key: &str) -> usize {
+    let entries = ctx
+        .memory
+        .list(
+            Some(&crate::memory::MemoryCategory::Conversation),
+            Some(sender_key),
+        )
+        .await
+        .unwrap_or_default();
+
+    let mut cleared = 0usize;
+    for entry in entries {
+        if ctx.memory.forget(&entry.key).await.unwrap_or(false) {
+            cleared += 1;
+        }
+    }
+    cleared
+}
+
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     let mut histories = ctx
         .conversation_histories
@@ -1189,7 +1221,14 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            let cleared = forget_sender_autosaves(ctx, &sender_key).await;
+            if cleared > 0 {
+                format!(
+                    "Conversation history cleared ({cleared} saved turns dropped).                      Long-term memory kept. Starting fresh."
+                )
+            } else {
+                "Conversation history cleared. Starting fresh.".to_string()
+            }
         }
     };
 
@@ -1206,14 +1245,22 @@ async fn handle_runtime_command_if_needed(
     true
 }
 
+/// Seed a fresh conversation with recalled memory.
+///
+/// `session_id` is the conversation's [`conversation_history_key`]: the recall
+/// returns long-term memory plus this conversation's own auto-saved turns, and
+/// never another conversation's. Without it, starting a new topic would pull the
+/// previous one's transcript straight back in — this function only runs on a
+/// conversation's first turn, which is exactly when that hurts most.
 async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
+    session_id: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -1794,7 +1841,7 @@ async fn process_channel_message(
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                Some(&history_key),
             )
             .await;
     }
@@ -1825,8 +1872,13 @@ async fn process_channel_message(
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            ctx.min_relevance_score,
+            Some(&history_key),
+        )
+        .await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{}", msg.content);
@@ -4068,6 +4120,86 @@ mod tests {
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
+    }
+
+    /// `/new` must leave nothing behind that the next turn would re-seed from
+    /// memory, but must not touch deliberately stored long-term memory.
+    #[tokio::test]
+    async fn forget_sender_autosaves_drops_only_this_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let sender = "telegram_topic_a_u1".to_string();
+
+        mem.store(
+            "telegram_topic_a_u1_msg1",
+            "deck brief about Q3 revenue",
+            MemoryCategory::Conversation,
+            Some(&sender),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "telegram_topic_b_u1_msg1",
+            "deck brief about hiring plan",
+            MemoryCategory::Conversation,
+            Some("telegram_topic_b_u1"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "brand_style",
+            "deck slides never use emoji",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: mem.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            cost_tracker: None,
+        };
+
+        assert_eq!(forget_sender_autosaves(&ctx, &sender).await, 1);
+
+        assert!(
+            mem.get("telegram_topic_a_u1_msg1").await.unwrap().is_none(),
+            "this conversation's auto-saved turn should be gone"
+        );
+        assert!(
+            mem.get("telegram_topic_b_u1_msg1").await.unwrap().is_some(),
+            "another conversation's turns must survive /new"
+        );
+        assert!(
+            mem.get("brand_style").await.unwrap().is_some(),
+            "long-term memory must survive /new"
+        );
     }
 
     #[test]
@@ -6332,9 +6464,73 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age", 0.0).await;
+        let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
+    }
+
+    /// Two forum topics from the same user are two conversations. Auto-saved
+    /// turns from one must not seed the other's context, while long-term memory
+    /// stored without a session stays visible to both.
+    #[tokio::test]
+    async fn build_memory_context_isolates_sibling_conversations() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let deck_a = traits::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            reply_target: "C456".into(),
+            content: "build a deck about the Q3 revenue plan".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: Some("topic_a".into()),
+        };
+        let deck_b = traits::ChannelMessage {
+            thread_ts: Some("topic_b".into()),
+            id: "msg_2".into(),
+            ..deck_a.clone()
+        };
+        let scope_a = conversation_history_key(&deck_a);
+        let scope_b = conversation_history_key(&deck_b);
+        assert_ne!(scope_a, scope_b, "topics must be distinct conversations");
+
+        // Topic A auto-saves its deck brief.
+        mem.store(
+            &conversation_memory_key(&deck_a),
+            &deck_a.content,
+            MemoryCategory::Conversation,
+            Some(&scope_a),
+        )
+        .await
+        .unwrap();
+        // A long-term fact, stored deliberately and unscoped.
+        mem.store(
+            "brand_style",
+            "deck slides never use emoji",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Topic B starts fresh: it sees the shared style rule but not topic A.
+        let context = build_memory_context(&mem, "build a deck", 0.0, Some(&scope_b)).await;
+        assert!(
+            !context.contains("Q3 revenue"),
+            "sibling conversation leaked into a fresh topic: {context}"
+        );
+        assert!(
+            context.contains("never use emoji"),
+            "long-term memory should stay shared across conversations: {context}"
+        );
+
+        // Topic A still recalls its own brief.
+        let own = build_memory_context(&mem, "build a deck", 0.0, Some(&scope_a)).await;
+        assert!(
+            own.contains("Q3 revenue"),
+            "conversation lost its own auto-saved context: {own}"
+        );
     }
 
     /// Auto-saved photo messages must not surface through memory context,
@@ -6364,7 +6560,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .unwrap();
 
-        let context = build_memory_context(&mem, "screenshot", 0.0).await;
+        let context = build_memory_context(&mem, "screenshot", 0.0, None).await;
 
         // The image-marker entry must be excluded to prevent duplication.
         assert!(

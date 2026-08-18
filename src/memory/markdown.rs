@@ -9,6 +9,12 @@ use tokio::fs;
 /// Layout:
 ///   workspace/MEMORY.md          — curated long-term memory (core)
 ///   workspace/memory/YYYY-MM-DD.md — daily logs (append-only)
+///
+/// **No session scoping.** The flat-file layout carries no per-entry
+/// `session_id`, so every entry reads back as unscoped and `recall` returns the
+/// same rows for every session. Conversations sharing this backend therefore
+/// see each other's auto-saved turns. Use the `sqlite` backend (the default)
+/// when conversations must not bleed into one another.
 pub struct MarkdownMemory {
     workspace_dir: PathBuf,
 }

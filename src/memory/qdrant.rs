@@ -169,6 +169,37 @@ impl QdrantMemory {
         }
     }
 
+    /// Qdrant filter for the recall session *view*: the session's own points
+    /// plus unscoped ones, never another session's.
+    ///
+    /// `is_empty` (not `is_null`) is what matches unscoped points: their
+    /// payload omits `session_id` entirely, because [`MemoryPayload`] skips
+    /// the field when it is `None`.
+    fn recall_session_filter(session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "should": [
+                { "key": "session_id", "match": { "value": session_id } },
+                { "is_empty": { "key": "session_id" } }
+            ]
+        })
+    }
+
+    /// Scroll every entry and keep the ones visible to `session_id`.
+    ///
+    /// Used by the recall fallbacks (empty query, embeddings unavailable).
+    /// Delegating straight to `list(None, session_id)` would apply that
+    /// method's strict ownership filter and silently hide long-term memory
+    /// from a scoped read.
+    async fn list_visible_in_session(&self, session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
+        let entries = self.list(None, None).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                crate::memory::is_visible_in_session(entry.session_id.as_deref(), session_id)
+            })
+            .collect())
+    }
+
     fn parse_category(value: &str) -> MemoryCategory {
         match value {
             "core" => MemoryCategory::Core,
@@ -293,7 +324,7 @@ impl Memory for QdrantMemory {
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         if query.trim().is_empty() {
-            return self.list(None, session_id).await;
+            return self.list_visible_in_session(session_id).await;
         }
 
         self.ensure_initialized().await?;
@@ -303,18 +334,11 @@ impl Memory for QdrantMemory {
 
         if embedding.is_empty() {
             // Fallback to listing if embeddings aren't available
-            return self.list(None, session_id).await;
+            return self.list_visible_in_session(session_id).await;
         }
 
-        // Build filter for session_id if provided
-        let filter = session_id.map(|sid| {
-            serde_json::json!({
-                "must": [{
-                    "key": "session_id",
-                    "match": { "value": sid }
-                }]
-            })
-        });
+        // Scope the search to what this session may see.
+        let filter = session_id.map(Self::recall_session_filter);
 
         let mut search_body = serde_json::json!({
             "vector": embedding,
@@ -624,6 +648,19 @@ mod tests {
         assert!(json.contains("test_key"));
         assert!(json.contains("test content"));
         assert!(json.contains("session-1"));
+    }
+
+    #[test]
+    fn recall_session_filter_matches_own_session_or_unscoped() {
+        let filter = QdrantMemory::recall_session_filter("sess-a");
+        let should = filter["should"].as_array().expect("should clause");
+        assert_eq!(should.len(), 2);
+        assert_eq!(should[0]["key"], "session_id");
+        assert_eq!(should[0]["match"]["value"], "sess-a");
+        // Unscoped points omit the payload key entirely, so `is_empty` (not
+        // `is_null`) is the condition that matches them.
+        assert_eq!(should[1]["is_empty"]["key"], "session_id");
+        assert!(filter.get("must").is_none());
     }
 
     #[test]

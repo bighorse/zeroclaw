@@ -330,7 +330,12 @@ impl SqliteMemory {
     /// Vector similarity search: scan embeddings and compute cosine similarity.
     ///
     /// Optional `category` and `session_id` filters reduce full-table scans
-    /// when the caller already knows the scope of relevant memories.
+    /// when the caller already knows the scope of relevant memories. The
+    /// session filter is the recall *view*: it keeps unscoped (long-term)
+    /// rows alongside the session's own and drops other sessions', matching
+    /// [`crate::memory::is_visible_in_session`]. Applying it in SQL rather
+    /// than after ranking is what stops a busy session from crowding
+    /// long-term memories out of the top-`limit` window.
     fn vector_search(
         conn: &Connection,
         query_embedding: &[f32],
@@ -348,7 +353,7 @@ impl SqliteMemory {
             idx += 1;
         }
         if let Some(sid) = session_id {
-            let _ = write!(sql, " AND session_id = ?{idx}");
+            let _ = write!(sql, " AND (session_id = ?{idx} OR session_id IS NULL)");
             param_values.push(Box::new(sid.to_string()));
         }
 
@@ -577,10 +582,11 @@ impl Memory for SqliteMemory {
                             session_id: sid,
                             score: Some(f64::from(scored.final_score)),
                         };
-                        if let Some(filter_sid) = session_ref {
-                            if entry.session_id.as_deref() != Some(filter_sid) {
-                                continue;
-                            }
+                        if !crate::memory::is_visible_in_session(
+                            entry.session_id.as_deref(),
+                            session_ref,
+                        ) {
+                            continue;
                         }
                         results.push(entry);
                     }
@@ -636,10 +642,11 @@ impl Memory for SqliteMemory {
                     })?;
                     for row in rows {
                         let entry = row?;
-                        if let Some(sid) = session_ref {
-                            if entry.session_id.as_deref() != Some(sid) {
-                                continue;
-                            }
+                        if !crate::memory::is_visible_in_session(
+                            entry.session_id.as_deref(),
+                            session_ref,
+                        ) {
+                            continue;
                         }
                         results.push(entry);
                     }
@@ -1685,11 +1692,52 @@ mod tests {
             .await
             .unwrap();
 
-        // Recall with session-a filter returns only session-a entry
+        // Recall from session A sees its own entry plus the unscoped one, and
+        // never session B's.
         let results = mem.recall("fact", 10, Some("sess-a")).await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].key, "k1");
-        assert_eq!(results[0].session_id.as_deref(), Some("sess-a"));
+        let keys: Vec<&str> = results.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(results.len(), 2, "expected own + unscoped, got {keys:?}");
+        assert!(keys.contains(&"k1"), "own session entry missing: {keys:?}");
+        assert!(keys.contains(&"k3"), "unscoped entry missing: {keys:?}");
+        assert!(!keys.contains(&"k2"), "other session leaked: {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn scoped_recall_keeps_long_term_memory_visible() {
+        let (_tmp, mem) = temp_sqlite();
+        // Long-term memory written without a session (memory_store tool, CLI,
+        // gateway memory API) must stay visible from every conversation.
+        mem.store(
+            "user_profile_company",
+            "company is Acme deck fact",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        // Another conversation's auto-saved turn must not.
+        mem.store(
+            "telegram_7_9_deck",
+            "deck fact about quarterly revenue",
+            MemoryCategory::Conversation,
+            Some("telegram_7_9"),
+        )
+        .await
+        .unwrap();
+
+        let results = mem
+            .recall("deck fact", 10, Some("telegram_1_2"))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = results.iter().map(|e| e.key.as_str()).collect();
+        assert!(
+            keys.contains(&"user_profile_company"),
+            "long-term memory hidden from session: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"telegram_7_9_deck"),
+            "other conversation leaked into session: {keys:?}"
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,9 @@ pub struct Agent {
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
+    /// Memory scope for this agent's turns. `None` writes and reads long-term
+    /// (unscoped) memory, which is what an embedding caller gets by default.
+    session_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -55,6 +58,7 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
+    session_id: Option<String>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
@@ -78,6 +82,7 @@ impl AgentBuilder {
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
+            session_id: None,
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
@@ -162,6 +167,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Scope this agent's memory reads and auto-saves to one conversation.
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
     pub fn classification_config(
         mut self,
         classification_config: crate::config::QueryClassificationConfig,
@@ -219,6 +230,7 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
+            session_id: self.session_id,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -474,16 +486,23 @@ impl Agent {
                 )));
         }
 
+        let session_id = self.session_id.as_deref();
+
         if self.auto_save {
             let _ = self
                 .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    session_id,
+                )
                 .await;
         }
 
         let context = self
             .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
+            .load_context(self.memory.as_ref(), user_message, session_id)
             .await
             .unwrap_or_default();
 
