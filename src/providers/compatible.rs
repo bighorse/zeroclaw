@@ -194,6 +194,11 @@ impl OpenAiCompatibleProvider {
         self.extra_request_fields.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn supports_responses_fallback(&self) -> bool {
+        self.supports_responses_fallback
+    }
+
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
