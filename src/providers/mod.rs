@@ -996,6 +996,10 @@ fn parse_custom_provider_url(
 /// | `{"reasoning":{"enabled":false}}` | **silently ignored**            |
 /// | `{"enable_thinking":false}`       | **silently ignored**            |
 /// | `{"thinking":false}`              | API rejects it (type error)     |
+///
+/// Note the first row of that "ignored" pair: `enable_thinking` is DashScope's
+/// switch, not DeepSeek's, and the two are not interchangeable. See
+/// [`qwen_provider`] before attempting to unify them.
 fn deepseek_provider(
     key: Option<&str>,
     reasoning_enabled: Option<bool>,
@@ -1010,6 +1014,38 @@ fn deepseek_provider(
         provider
     } else {
         provider.with_extra_request_fields(serde_json::json!({"thinking": {"type": "disabled"}}))
+    }
+}
+
+/// Build the Qwen/DashScope provider, disabling thinking mode unless the user opted in.
+///
+/// Qwen3 models reason by default. On SOP-matching prompts a single turn has
+/// produced tens of thousands of reasoning tokens; decode then overruns the
+/// outer request timeout and the turn dies with no reply at all — the user sees
+/// silence rather than an error.
+///
+/// The field is `enable_thinking`, which is DashScope's own switch. It is not
+/// DeepSeek's — see [`deepseek_provider`], where that spelling is accepted and
+/// silently ignored. Each provider needs its own field; one flag cannot serve
+/// both.
+///
+/// An earlier attempt at this injected the field unconditionally and was
+/// reverted. Honour `runtime.reasoning_enabled = true` here: on Qwen the
+/// thinking models are chosen *for* their reasoning, so hard-disabling it
+/// removes the reason to run them.
+fn qwen_provider(
+    base_url: &str,
+    key: Option<&str>,
+    reasoning_enabled: Option<bool>,
+) -> OpenAiCompatibleProvider {
+    let provider =
+        OpenAiCompatibleProvider::new_with_vision("Qwen", base_url, key, AuthStyle::Bearer, true)
+            // DashScope has no /v1/responses; probing for it costs a 404 per call.
+            .without_responses_fallback();
+    if reasoning_enabled == Some(true) {
+        provider
+    } else {
+        provider.with_extra_request_fields(serde_json::json!({"enable_thinking": false}))
     }
 }
 
@@ -1236,16 +1272,11 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if qwen_base_url(name).is_some() => Ok(compat(
-            OpenAiCompatibleProvider::new_with_vision(
-                "Qwen",
-                qwen_base_url(name).expect("checked in guard"),
-                key,
-                AuthStyle::Bearer,
-                true,
-            )
-            .without_responses_fallback(),
-        )),
+        name if qwen_base_url(name).is_some() => Ok(compat(qwen_provider(
+            qwen_base_url(name).expect("checked in guard"),
+            key,
+            options.reasoning_enabled,
+        ))),
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(compat(OpenAiCompatibleProvider::new(
@@ -2485,6 +2516,59 @@ mod tests {
             provider.extra_request_fields().is_none(),
             "runtime.reasoning_enabled = true must leave DeepSeek's thinking mode alone"
         );
+    }
+
+    #[test]
+    fn qwen_disables_thinking_by_default() {
+        let provider = qwen_provider(QWEN_CN_BASE_URL, Some("key"), None);
+        assert_eq!(
+            provider.extra_request_fields(),
+            Some(&serde_json::json!({"enable_thinking": false})),
+            "Qwen3 reasons by default; an unbounded reasoning burst overruns the \
+             request timeout and the turn returns nothing at all"
+        );
+    }
+
+    #[test]
+    fn qwen_disables_thinking_when_reasoning_turned_off() {
+        let provider = qwen_provider(QWEN_CN_BASE_URL, Some("key"), Some(false));
+        assert!(provider.extra_request_fields().is_some());
+    }
+
+    #[test]
+    fn qwen_keeps_thinking_when_reasoning_enabled() {
+        let provider = qwen_provider(QWEN_CN_BASE_URL, Some("key"), Some(true));
+        assert!(
+            provider.extra_request_fields().is_none(),
+            "runtime.reasoning_enabled = true must leave Qwen's thinking mode alone — \
+             the thinking models are chosen for their reasoning"
+        );
+    }
+
+    /// The two providers disagree on the field name and neither accepts the
+    /// other's. Unifying them would silently re-enable thinking on one side.
+    #[test]
+    fn qwen_and_deepseek_use_different_thinking_fields() {
+        let qwen = qwen_provider(QWEN_CN_BASE_URL, Some("key"), Some(false));
+        let deepseek = deepseek_provider(Some("key"), Some(false));
+        assert_ne!(
+            qwen.extra_request_fields(),
+            deepseek.extra_request_fields(),
+            "enable_thinking is DashScope's switch and is ignored by DeepSeek"
+        );
+    }
+
+    /// Guards the behaviour PR #26 added: DashScope has no `/v1/responses`,
+    /// so probing for it costs a 404 on every call.
+    #[test]
+    fn qwen_keeps_responses_fallback_disabled() {
+        for reasoning in [None, Some(false), Some(true)] {
+            let provider = qwen_provider(QWEN_CN_BASE_URL, Some("key"), reasoning);
+            assert!(
+                !provider.supports_responses_fallback(),
+                "qwen must not probe /v1/responses (reasoning_enabled = {reasoning:?})"
+            );
+        }
     }
 
     #[test]

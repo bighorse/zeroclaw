@@ -158,6 +158,15 @@ DeepSeek:
 - `true`: leaves thinking mode alone.
 - `false` or unset: sends `{"thinking": {"type": "disabled"}}`.
 
+Qwen / DashScope (`qwen`, `dashscope`, and the `-intl` / `-us` aliases):
+
+- `true`: leaves thinking mode alone.
+- `false` or unset: sends `{"enable_thinking": false}`.
+
+The two providers do **not** share a field. `enable_thinking` is DashScope's
+switch and DeepSeek ignores it; `thinking.type` is DeepSeek's and is not
+DashScope's. One setting drives both, but it is sent differently per provider.
+
 DeepSeek defaults to thinking **on** from V4, and when it is on the whole
 answer is returned in `reasoning_content` while `content` comes back empty —
 so leaving it enabled produces blank replies unless your integration reads
@@ -172,6 +181,21 @@ deferring to the provider default.
 - Note that `{"reasoning": {"enabled": false}}` and `{"enable_thinking": false}`
   are accepted by the API and then ignored — only `{"thinking": {"type": "disabled"}}`
   and `{"reasoning_effort": "none"}` actually turn thinking off.
+
+### Qwen / DashScope Notes
+
+- Provider IDs: `qwen`, `dashscope` (plus `qwen-intl` / `qwen-us` and their
+  `dashscope-` spellings)
+- Endpoint: `https://dashscope.aliyuncs.com/compatible-mode/v1` (region aliases
+  point at the `-intl` and `-us` hosts)
+- Thinking mode is disabled by default; see [Reasoning Toggle](#reasoning-toggle).
+- Qwen3 models reason by default. Left on, a single turn can emit tens of
+  thousands of reasoning tokens; decode then overruns the request timeout and
+  the turn returns nothing at all — which reads as a hang, not an error. Set
+  `reasoning_enabled = true` only when you are running a thinking model on
+  purpose and your timeouts allow for it.
+- The `/v1/responses` fallback is disabled for these providers — DashScope does
+  not serve that route, so probing it costs a 404 on every call.
 
 ### Kimi Code Notes
 
