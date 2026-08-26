@@ -282,10 +282,34 @@ fn extract_docx_text(bytes: &[u8]) -> anyhow::Result<String> {
                 }
             }
             Ok(Event::Text(t)) if in_text_run => {
+                // `unescape()` was removed in quick-xml 0.41; `xml_content`
+                // decodes the bytes and normalizes line endings. Entities are
+                // no longer inlined here — they arrive as `Event::GeneralRef`,
+                // handled below.
                 let decoded = t
-                    .unescape()
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
                     .map_err(|e| anyhow::anyhow!("malformed XML text: {e}"))?;
                 out.push_str(&decoded);
+            }
+            // quick-xml 0.41 emits entity references as their own event rather
+            // than inlining them into the surrounding text. Without this arm
+            // they fall through to `_` and every `&`, `<` and `>` silently
+            // vanishes from the extracted document.
+            Ok(Event::GeneralRef(r)) if in_text_run => {
+                let name = r
+                    .decode()
+                    .map_err(|e| anyhow::anyhow!("malformed XML entity: {e}"))?;
+                match quick_xml::escape::resolve_predefined_entity(&name) {
+                    Some(resolved) => out.push_str(resolved),
+                    // Numeric references (`&#38;`) and anything a DOCX defines
+                    // itself are not predefined; keep the source form rather
+                    // than dropping the character.
+                    None => {
+                        out.push('&');
+                        out.push_str(&name);
+                        out.push(';');
+                    }
+                }
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(anyhow::anyhow!("XML parse error: {e}")),
@@ -426,6 +450,45 @@ mod tests {
             zipw.start_file("word/document.xml", opts).unwrap();
             zipw.write_all(doc.as_bytes()).unwrap();
             zipw.finish().unwrap().into_inner()
+        }
+
+        /// The XML text path must resolve entities, not just decode bytes.
+        /// quick-xml 0.41 split `unescape()` into `xml_content()` + `unescape()`;
+        /// keeping only the first half compiles fine and silently emits
+        /// `&amp;` where the document says `&`.
+        #[tokio::test]
+        async fn extracts_text_resolves_xml_entities() {
+            let tmp = TempDir::new().unwrap();
+            let docx_path = tmp.path().join("entities.docx");
+            tokio::fs::write(
+                &docx_path,
+                make_docx_bytes(&["Tom & Jerry", "a < b", "R&D <tag>"]),
+            )
+            .await
+            .unwrap();
+
+            let tool = DocxReadTool::new(test_security(tmp.path().to_path_buf()));
+            let result = tool
+                .execute(json!({"path": "entities.docx"}))
+                .await
+                .unwrap();
+
+            assert!(result.success, "error: {:?}", result.error);
+            assert!(
+                result.output.contains("Tom & Jerry"),
+                "ampersand entity was not resolved: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains("a < b") && result.output.contains("R&D <tag>"),
+                "entities left literal in output: {}",
+                result.output
+            );
+            assert!(
+                !result.output.contains("&amp;") && !result.output.contains("&lt;"),
+                "raw XML entities leaked into extracted text: {}",
+                result.output
+            );
         }
 
         #[tokio::test]
