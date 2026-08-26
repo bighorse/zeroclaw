@@ -50,7 +50,74 @@ use serde::{Deserialize, Serialize};
 /// Fields are deliberately minimal: anything channel-layer specific
 /// (Lark file_key, Telegram file_id, …) is computed *during* upload, not
 /// stored here.
+/// Media semantics of an [`Artifact`], independent of its concrete MIME type.
+///
+/// Channels render the same bytes differently depending on this: an image
+/// belongs inline (Lark `msg_type=image`, Telegram `sendPhoto`), a document
+/// belongs in a download card. Deciding this once, where the file is
+/// produced, keeps every channel from re-deriving (and disagreeing about)
+/// the classification.
+///
+/// ## Why all four variants ship together
+///
+/// The variant set is part of the sentinel wire format. Unknown *fields* are
+/// ignored by serde, but an unknown *variant* is a hard parse error, and
+/// [`extract_artifacts`] then drops **every** artifact in that block. Adding
+/// `Audio`/`Video` later would be a breaking change for rollbacks and
+/// mixed-version fleets; adding them now costs two match arms. Lark's own
+/// upload classifier (`lark_file_type_for`) already speaks `opus` and `mp4`,
+/// so they are not hypothetical - merely unreachable from
+/// [`mime_for_extension`] today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactKind {
+    /// Chat clients render this inline (png/jpeg/webp/gif/svg).
+    Image,
+    /// Anything the user downloads and opens elsewhere. The conservative
+    /// default: it reproduces the pre-`kind` behaviour (a file attachment),
+    /// so an unclassifiable artifact degrades to exactly today's UX.
+    #[default]
+    Document,
+    /// Playable audio (voice notes, recordings).
+    Audio,
+    /// Playable video.
+    Video,
+}
+
+impl ArtifactKind {
+    /// Classify by MIME top-level type. Returns `None` for top-level types
+    /// that carry no media semantics (`application/*`, `text/*`), leaving
+    /// the decision to the caller's fallback.
+    pub fn from_mime(mime: &str) -> Option<Self> {
+        match mime.split('/').next()?.trim().to_ascii_lowercase().as_str() {
+            "image" => Some(Self::Image),
+            "audio" => Some(Self::Audio),
+            "video" => Some(Self::Video),
+            _ => None,
+        }
+    }
+
+    /// Best-effort classification, in decreasing order of confidence: the
+    /// explicit `mime`, then a MIME re-derived from the path extension, then
+    /// [`ArtifactKind::Document`].
+    ///
+    /// The path fallback is not redundant: `mime` is
+    /// `skip_serializing_if = "Option::is_none"`, so a sentinel can legitimately
+    /// carry a path and no MIME at all.
+    pub fn infer(mime: Option<&str>, path: &str) -> Self {
+        if let Some(kind) = mime.and_then(Self::from_mime) {
+            return kind;
+        }
+        let from_path = mime_for_extension(path);
+        from_path
+            .as_deref()
+            .and_then(Self::from_mime)
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ArtifactWire")]
 pub struct Artifact {
     /// Workspace-relative path. Always uses `/` as separator.
     pub path: String,
@@ -67,6 +134,13 @@ pub struct Artifact {
     /// file by reading it from `path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download_url: Option<String>,
+    /// How the artifact should be presented. Always serialized (unlike the
+    /// `Option` fields) so a producer's explicit classification is never
+    /// silently re-derived on the consumer side.
+    ///
+    /// Declared last on purpose: `serde_json` emits fields in declaration
+    /// order, so every pre-existing key keeps its position in the sentinel.
+    pub kind: ArtifactKind,
 }
 
 impl Artifact {
@@ -90,13 +164,68 @@ impl Artifact {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| relative_path.to_string());
         let mime = mime_for_extension(relative_path);
+        let kind = ArtifactKind::infer(mime.as_deref(), relative_path);
         Some(Self {
             path: relative_path.replace('\\', "/"),
             name,
             mime,
             size_bytes: meta.len(),
             download_url,
+            kind,
         })
+    }
+}
+
+/// On-the-wire mirror of [`Artifact`], used only for deserialization.
+///
+/// ## Why not `#[serde(default)]` on `Artifact::kind`
+///
+/// A field-level `default` supplies a constant - it cannot see sibling
+/// fields - so every sentinel written before `kind` existed would decode to
+/// `ArtifactKind::Document`, including images replayed from persisted
+/// history. Routing through this struct makes "`kind` absent" mean "infer it
+/// from `mime`/`path`", which is what the field means, while still meeting
+/// the hard requirement that a missing `kind` must never fail the parse:
+/// [`extract_artifacts`] discards the entire artifact list on any
+/// deserialization error, so a non-tolerant field would silently delete
+/// every attachment produced by an older binary.
+///
+/// Unknown extra fields are ignored (deliberately no `deny_unknown_fields`)
+/// so a future field is likewise non-breaking. The exhaustive destructuring
+/// in `From<ArtifactWire> for Artifact` is the drift guard: adding a field to
+/// either struct without updating the other fails to compile.
+#[derive(Deserialize)]
+struct ArtifactWire {
+    path: String,
+    name: String,
+    #[serde(default)]
+    mime: Option<String>,
+    size_bytes: u64,
+    #[serde(default)]
+    download_url: Option<String>,
+    #[serde(default)]
+    kind: Option<ArtifactKind>,
+}
+
+impl From<ArtifactWire> for Artifact {
+    fn from(wire: ArtifactWire) -> Self {
+        let ArtifactWire {
+            path,
+            name,
+            mime,
+            size_bytes,
+            download_url,
+            kind,
+        } = wire;
+        let kind = kind.unwrap_or_else(|| ArtifactKind::infer(mime.as_deref(), &path));
+        Self {
+            path,
+            name,
+            mime,
+            size_bytes,
+            download_url,
+            kind,
+        }
     }
 }
 
@@ -249,7 +378,148 @@ mod tests {
             ),
             size_bytes: 12_345,
             download_url: Some("https://gw/download/reports%2Fq1.docx?expires=1&sig=abc".into()),
+            kind: ArtifactKind::Document,
         }
+    }
+
+    /// CORE BACK-COMPAT GUARD. A sentinel produced before `kind` existed has
+    /// no `kind` key. It must still parse: `extract_artifacts` drops the
+    /// whole artifact list on any parse error, so a field that is not
+    /// tolerant of absence silently deletes every attachment produced by an
+    /// older binary or replayed from persisted history.
+    #[test]
+    fn legacy_sentinel_without_kind_parses_and_infers_from_mime() {
+        let json = serde_json::json!([{
+            "path": "charts/chart.png",
+            "name": "chart.png",
+            "mime": "image/png",
+            "size_bytes": 42
+        }])
+        .to_string();
+        let text = format!("Wrote chart.png\n\n<!--zeroclaw-artifacts:{json}-->");
+
+        let (cleaned, arts) = extract_artifacts(&text);
+        assert_eq!(cleaned, "Wrote chart.png");
+        assert_eq!(arts.len(), 1, "legacy sentinel must not be dropped");
+        assert_eq!(arts[0].path, "charts/chart.png");
+        assert_eq!(arts[0].size_bytes, 42);
+        assert_eq!(arts[0].download_url, None);
+        assert_eq!(
+            arts[0].kind,
+            ArtifactKind::Image,
+            "kind must be inferred from mime, not defaulted to Document"
+        );
+    }
+    /// Second legacy shape: `mime` is `skip_serializing_if = "Option::is_none"`,
+    /// so artifacts built by literals with `mime: None` (the shape used across
+    /// the channel tests) serialize without a `mime` key either. Inference
+    /// must then fall back to the path extension.
+    #[test]
+    fn legacy_sentinel_without_mime_infers_kind_from_path() {
+        let json = serde_json::json!([
+            { "path": "a/b.webp", "name": "b.webp", "size_bytes": 7 },
+            { "path": "a/b.docx", "name": "b.docx", "size_bytes": 8 }
+        ])
+        .to_string();
+        let text = format!("x\n\n<!--zeroclaw-artifacts:{json}-->");
+
+        let (cleaned, arts) = extract_artifacts(&text);
+        assert_eq!(cleaned, "x");
+        assert_eq!(arts.len(), 2);
+        assert_eq!(arts[0].mime, None);
+        assert_eq!(arts[0].kind, ArtifactKind::Image);
+        assert_eq!(arts[1].kind, ArtifactKind::Document);
+    }
+    /// An explicit `kind` must win over what the MIME implies. This is the
+    /// reason `kind` is a stored field rather than a method on `Artifact`:
+    /// a producer that knows better than the extension can say so, and the
+    /// consumer must honour it.
+    #[test]
+    fn explicit_kind_overrides_mime_inference() {
+        let json = serde_json::json!([{
+            "path": "a.pdf",
+            "name": "a.pdf",
+            "mime": "application/pdf",
+            "size_bytes": 1,
+            "kind": "image"
+        }])
+        .to_string();
+        let text = format!("x\n\n<!--zeroclaw-artifacts:{json}-->");
+
+        let (_, arts) = extract_artifacts(&text);
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].kind, ArtifactKind::Image);
+    }
+    /// The sentinel must carry `kind` explicitly so a producer's
+    /// classification is not silently re-derived (and possibly re-derived
+    /// differently) on the consumer side.
+    #[test]
+    fn append_emits_kind_and_roundtrips() {
+        let mut art = sample_artifact();
+        art.path = "charts/q1.png".into();
+        art.name = "q1.png".into();
+        art.mime = Some("image/png".into());
+        art.kind = ArtifactKind::Image;
+
+        let mut out = "chart".to_string();
+        append_artifacts(&mut out, std::slice::from_ref(&art));
+        assert!(
+            out.contains("\"kind\":\"image\""),
+            "sentinel must serialize kind: {out}"
+        );
+
+        let (cleaned, arts) = extract_artifacts(&out);
+        assert_eq!(cleaned, "chart");
+        assert_eq!(arts, vec![art]);
+    }
+    #[test]
+    fn infer_kind_table() {
+        let cases: &[(Option<&str>, &str, ArtifactKind)] = &[
+            (Some("image/png"), "a.png", ArtifactKind::Image),
+            (Some("image/svg+xml"), "a.svg", ArtifactKind::Image),
+            (Some("IMAGE/PNG"), "a.png", ArtifactKind::Image),
+            (Some("audio/opus"), "a.opus", ArtifactKind::Audio),
+            (Some("video/mp4"), "a.mp4", ArtifactKind::Video),
+            (Some("application/pdf"), "a.pdf", ArtifactKind::Document),
+            (Some("application/zip"), "a.zip", ArtifactKind::Document),
+            (
+                Some("text/csv; charset=utf-8"),
+                "a.csv",
+                ArtifactKind::Document,
+            ),
+            // mime absent (older sentinels omit it): fall back to the path.
+            (None, "a.jpeg", ArtifactKind::Image),
+            (None, "a.webp", ArtifactKind::Image),
+            (None, "a.docx", ArtifactKind::Document),
+            // Neither mime nor a known extension: conservative default.
+            (None, "a.unknown_ext", ArtifactKind::Document),
+            (None, "no_extension", ArtifactKind::Document),
+        ];
+        for &(mime, path, expected) in cases {
+            assert_eq!(
+                ArtifactKind::infer(mime, path),
+                expected,
+                "infer(mime={mime:?}, path={path})"
+            );
+        }
+    }
+    /// The producer path must classify, not just the deserializer: a PNG
+    /// written into the workspace has to arrive at the channel as
+    /// [`ArtifactKind::Image`] or PR-3c's inline rendering never triggers.
+    #[test]
+    fn from_workspace_path_classifies_image_and_document() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_artifact_kind");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("chart.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        std::fs::write(dir.join("report.docx"), "x").unwrap();
+
+        let png = Artifact::from_workspace_path(&dir, "chart.png", None).expect("png artifact");
+        assert_eq!(png.kind, ArtifactKind::Image);
+        let docx = Artifact::from_workspace_path(&dir, "report.docx", None).expect("docx artifact");
+        assert_eq!(docx.kind, ArtifactKind::Document);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

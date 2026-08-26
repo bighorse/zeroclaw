@@ -4320,6 +4320,7 @@ mod tests {
             mime: Some("image/png".into()),
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::Image,
         };
         let result = ch
             .send_with_artifacts(
@@ -4382,6 +4383,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::Document,
         };
         let result = ch
             .send_with_artifacts(
