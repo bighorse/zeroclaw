@@ -103,3 +103,24 @@ export interface WsMessage {
   output?: string;
   message?: string;
 }
+
+/**
+ * Response from `POST /api/upload` (multipart/form-data, field name `file`).
+ *
+ * Only `path` is required by the dashboard: it is the absolute path on the
+ * agent host that gets embedded into the chat message as `[IMAGE:<path>]`.
+ * The remaining fields are optional so the UI does not break if the endpoint
+ * grows or renames metadata.
+ */
+export interface UploadedFile {
+  /** Absolute path of the stored file on the agent host. */
+  path: string;
+  /** Sanitized name the file was stored under. */
+  filename?: string;
+  /** Path relative to the workspace root. */
+  relative_path?: string;
+  /** Stored size in bytes. */
+  size?: number;
+  /** Detected MIME type, when the server could determine one. */
+  mime?: string | null;
+}
