@@ -1,4 +1,7 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{
+    artifact_fallback_notice, message_with_artifact_notice, strip_download_lines_for_paths,
+    Artifact, Channel, ChannelMessage, SendMessage,
+};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -18,6 +21,11 @@ pub struct DiscordChannel {
     listen_to_bots: bool,
     mention_only: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Root the workspace-relative [`Artifact::path`] values are resolved
+    /// against. `None` disables native artifact upload (the channel then
+    /// degrades to the shared text notice). Telegram, Slack and Lark already
+    /// carry the same field.
+    workspace_dir: Option<PathBuf>,
 }
 
 impl DiscordChannel {
@@ -35,7 +43,66 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             typing_handles: Mutex::new(HashMap::new()),
+            workspace_dir: None,
         }
+    }
+
+    /// Configure the workspace root used to resolve tool-produced artifacts.
+    /// Without it `send_with_artifacts` cannot read files and degrades to text.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Local files already referenced by an attachment marker in `content`.
+    ///
+    /// Discord is not prompted to emit markers (`channel_delivery_instructions`
+    /// returns `None` for it), but `send` still parses and uploads any the
+    /// model or a skill produces — so the same de-duplication guard Telegram
+    /// needs applies here. Remote markers and non-existent paths are ignored
+    /// because `classify_outgoing_attachments` will not upload those either.
+    fn marker_attachment_paths(content: &str) -> Vec<PathBuf> {
+        let (_cleaned, markers) = parse_attachment_markers(content);
+        markers
+            .iter()
+            .filter_map(|attachment| {
+                let target = attachment.target.trim();
+                if target.starts_with("http://") || target.starts_with("https://") {
+                    return None;
+                }
+                Some(PathBuf::from(target))
+            })
+            .filter(|path| path.is_file())
+            .collect()
+    }
+
+    /// Split `artifacts` into files this channel will upload and ones it will
+    /// not. Semantics of the three returned lists match the Telegram
+    /// counterpart: `(files, delivered_paths, undelivered)`.
+    fn resolve_artifact_files(
+        workspace_dir: &Path,
+        content: &str,
+        artifacts: &[Artifact],
+    ) -> (Vec<PathBuf>, Vec<String>, Vec<Artifact>) {
+        let marker_paths = Self::marker_attachment_paths(content);
+        let mut files = Vec::new();
+        let mut delivered_paths = Vec::new();
+        let mut undelivered = Vec::new();
+
+        for artifact in artifacts {
+            let full = workspace_dir.join(&artifact.path);
+            if !full.is_file() {
+                undelivered.push(artifact.clone());
+                continue;
+            }
+            delivered_paths.push(artifact.path.clone());
+            if marker_paths.iter().any(|path| path == &full) {
+                continue;
+            }
+            files.push(full);
+        }
+
+        (files, delivered_paths, undelivered)
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -243,6 +310,8 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
+/// Discord rejects a message carrying more than 10 attachments.
+const DISCORD_MAX_FILES_PER_MESSAGE: usize = 10;
 const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
@@ -431,12 +500,12 @@ impl Channel for DiscordChannel {
         }
 
         // Discord accepts max 10 files per message.
-        if local_files.len() > 10 {
+        if local_files.len() > DISCORD_MAX_FILES_PER_MESSAGE {
             tracing::warn!(
                 count = local_files.len(),
                 "discord: truncating local attachment upload list to 10 files"
             );
-            local_files.truncate(10);
+            local_files.truncate(DISCORD_MAX_FILES_PER_MESSAGE);
         }
 
         let content =
@@ -461,6 +530,76 @@ impl Channel for DiscordChannel {
 
             if i < chunks.len() - 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Native artifact delivery: the text message first, then the files as
+    /// their own attachment-only messages, at most
+    /// [`DISCORD_MAX_FILES_PER_MESSAGE`] per message.
+    ///
+    /// Files deliberately do **not** ride along on the text message the way
+    /// marker attachments do. A single oversized or unreadable attachment
+    /// fails the whole multipart POST, and that would swallow the answer with
+    /// it. Splitting the phases keeps the guarantee that an attachment problem
+    /// never blocks text delivery: only the text send propagates its error,
+    /// per-batch upload failures are logged.
+    async fn send_with_artifacts(
+        &self,
+        message: &SendMessage,
+        artifacts: &[Artifact],
+    ) -> anyhow::Result<()> {
+        if artifacts.is_empty() {
+            return self.send(message).await;
+        }
+        let Some(workspace_dir) = self.workspace_dir.as_ref() else {
+            tracing::warn!(
+                artifact_count = artifacts.len(),
+                "discord: no workspace_dir configured; degrading artifacts to text"
+            );
+            return match message_with_artifact_notice(message, artifacts) {
+                Some(degraded) => self.send(&degraded).await,
+                None => self.send(message).await,
+            };
+        };
+
+        let (files, delivered_paths, undelivered) =
+            Self::resolve_artifact_files(workspace_dir, &message.content, artifacts);
+
+        let mut content = strip_download_lines_for_paths(&message.content, &delivered_paths);
+        let notice = artifact_fallback_notice(&content, &undelivered);
+        content.push_str(&notice);
+
+        // Discord rejects an empty message body; skip the text phase rather
+        // than letting that error abort the uploads below.
+        if !content.trim().is_empty() {
+            let text_message = SendMessage {
+                content,
+                recipient: message.recipient.clone(),
+                subject: message.subject.clone(),
+                thread_ts: message.thread_ts.clone(),
+            };
+            self.send(&text_message).await?;
+        }
+
+        let client = self.http_client();
+        for batch in files.chunks(DISCORD_MAX_FILES_PER_MESSAGE) {
+            if let Err(e) = send_discord_message_with_files(
+                &client,
+                &self.bot_token,
+                &message.recipient,
+                "",
+                batch,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    file_count = batch.len(),
+                    "discord: artifact upload failed after the text message was delivered"
+                );
             }
         }
 
@@ -1111,6 +1250,66 @@ mod tests {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let guard = ch.typing_handles.lock();
         assert!(guard.is_empty());
+    }
+
+    #[test]
+    fn with_workspace_dir_sets_field() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        assert!(ch.workspace_dir.is_none(), "defaults to no workspace");
+        let ch = ch.with_workspace_dir(PathBuf::from("/tmp/discord-workspace"));
+        assert_eq!(
+            ch.workspace_dir.as_deref(),
+            Some(Path::new("/tmp/discord-workspace"))
+        );
+    }
+
+    /// Mirrors the Telegram split: missing files degrade to the text notice,
+    /// present files become upload paths, and a file a marker already delivers
+    /// counts as delivered without being uploaded twice.
+    #[test]
+    fn resolve_artifact_files_splits_present_missing_and_marker_covered() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ws.path().join("out")).expect("mkdir");
+        std::fs::write(ws.path().join("out/report.pdf"), b"x").expect("write");
+        std::fs::write(ws.path().join("out/chart.png"), b"x").expect("write");
+
+        let present = Artifact {
+            path: "out/report.pdf".into(),
+            name: "report.pdf".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+        let missing = Artifact {
+            path: "out/gone.docx".into(),
+            name: "gone.docx".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+        let marked = Artifact {
+            path: "out/chart.png".into(),
+            name: "chart.png".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+
+        let marker = format!(
+            "here you go [IMAGE:{}]",
+            ws.path().join("out/chart.png").to_string_lossy()
+        );
+        let (files, delivered, undelivered) =
+            DiscordChannel::resolve_artifact_files(ws.path(), &marker, &[present, missing, marked]);
+
+        assert_eq!(files, vec![ws.path().join("out/report.pdf")]);
+        assert_eq!(
+            delivered,
+            vec!["out/report.pdf".to_string(), "out/chart.png".to_string()],
+            "marker-covered artifacts still count as delivered"
+        );
+        assert_eq!(undelivered.len(), 1);
+        assert_eq!(undelivered[0].path, "out/gone.docx");
     }
 
     #[tokio::test]

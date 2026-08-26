@@ -58,6 +58,135 @@ impl SendMessage {
     }
 }
 
+/// Remove `Download: <url>` lines from `content` whose URL refers to any
+/// workspace path in `uploaded_paths`. Other lines (including `Download:`
+/// lines for artifacts that *failed* to upload) are preserved so they
+/// fall back to the regex-based button rendering in Lark's
+/// `extract_download_links`.
+///
+/// Matching is done against the percent-encoded path segment in the URL
+/// path component, not the URL string itself — an LLM may normalise the
+/// URL differently than our signed-URL generator did (reordering query
+/// params, changing scheme, …), and path-based matching survives that.
+///
+/// Empty `uploaded_paths` is a no-op (returns `content` unchanged as
+/// `String`), which keeps the caller's fast path trivial.
+///
+/// Lives here rather than in `lark.rs` because `lark` is behind
+/// `#[cfg(feature = "channel-lark")]` and Telegram/Discord need the same
+/// stripping to avoid handing the user a link *and* the file.
+pub(crate) fn strip_download_lines_for_paths(content: &str, uploaded_paths: &[String]) -> String {
+    if uploaded_paths.is_empty() {
+        return content.to_string();
+    }
+    // Pre-compute percent-encoded forms once per call.
+    let encoded: Vec<String> = uploaded_paths
+        .iter()
+        .map(|p| urlencoding::encode(p).into_owned())
+        .collect();
+
+    let mut out = String::with_capacity(content.len());
+    let mut first = true;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let is_matched_download = trimmed
+            .strip_prefix("Download: ")
+            .map(|url| {
+                encoded
+                    .iter()
+                    .any(|p| url.contains(format!("/download/{p}").as_str()))
+            })
+            .unwrap_or(false);
+        if is_matched_download {
+            continue;
+        }
+        if !first {
+            out.push('\n');
+        }
+        out.push_str(line);
+        first = false;
+    }
+    // Preserve a trailing newline if the original had one, since we stripped
+    // line terminators via `.lines()`.
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Plain-text notice for artifacts a channel could not attach natively.
+///
+/// Returns `""` when there is nothing to say — the common case, so callers
+/// keep a trivial fast path.
+///
+/// # Why this exists
+///
+/// The [`Channel::send_with_artifacts`] default used to discard `artifacts`
+/// silently. That is invisible for `file_write` / `file_edit` (which also
+/// emit a legacy `Download:` line the agent loop re-appends), but
+/// `shell`-produced artifacts carry **no** `Download:` line at all, and
+/// `publish_file` emits artifacts even with no gateway configured. On those
+/// paths the user's `.docx` simply vanished.
+///
+/// # Never double up
+///
+/// `channels::handle_message` appends `Download: <url>` for every signed URL
+/// in the turn's tool history that is not already in the reply text. An
+/// artifact's `download_url` is the *same* `String` as the one on that line
+/// (both come from one `sign_download_url` call in the tool), so the
+/// containment check below is exact rather than heuristic:
+///
+/// - URL already in `content` → say nothing;
+/// - URL present but missing from `content` → re-surface it (the `shell` case);
+/// - no URL at all → a placeholder naming the file (the no-gateway case).
+///
+/// The text is English on purpose: this default is channel-agnostic and every
+/// non-Lark channel in this repo speaks English to users. Lark, the only
+/// Chinese-facing channel, overrides `send_with_artifacts` and never reaches
+/// this code.
+pub(crate) fn artifact_fallback_notice(content: &str, artifacts: &[Artifact]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for artifact in artifacts {
+        match artifact.download_url.as_deref() {
+            Some(url) if content.contains(url) => {}
+            Some(url) => lines.push(format!("Download: {url}")),
+            None => {
+                let location = if artifact.path == artifact.name {
+                    String::new()
+                } else {
+                    format!(" (workspace path: {})", artifact.path)
+                };
+                lines.push(format!(
+                    "[Attachment not sent: {} — this channel cannot upload files{location}]",
+                    artifact.name
+                ));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let joined = lines.join("\n");
+    format!("\n{joined}")
+}
+
+/// Apply [`artifact_fallback_notice`] to a whole message.
+///
+/// Returns `None` when nothing needs to be added, so callers can send the
+/// original message untouched instead of cloning it.
+pub(crate) fn message_with_artifact_notice(
+    message: &SendMessage,
+    artifacts: &[Artifact],
+) -> Option<SendMessage> {
+    let notice = artifact_fallback_notice(&message.content, artifacts);
+    if notice.is_empty() {
+        return None;
+    }
+    let mut degraded = message.clone();
+    degraded.content.push_str(&notice);
+    Some(degraded)
+}
+
 /// Core channel trait — implement for any messaging platform
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -77,35 +206,57 @@ pub trait Channel: Send + Sync {
 
     /// Send a message along with a list of tool-produced file artifacts.
     ///
-    /// Default implementation ignores `artifacts` and falls back to
-    /// [`send`]. Channels that support native file attachments (Lark
-    /// `im/v1/files`, Telegram `sendDocument`, Slack `files.upload`, …)
-    /// should override this and upload each artifact inline so the user
-    /// sees a proper attachment card rather than a download link.
+    /// Channels that support native file attachments (Lark `im/v1/files`,
+    /// Telegram `sendDocument`, Discord multipart uploads, …) override this
+    /// and upload each artifact inline so the user sees a proper attachment
+    /// rather than a bare link.
     ///
-    /// The default implementation is intentionally a fallback rather than
-    /// a hard `unimplemented!`: this keeps the contract backward compatible
-    /// for every existing channel until PR 3 wires native uploads.
+    /// The default implementation cannot upload anything. Rather than
+    /// discarding `artifacts` silently — which made `shell`-produced files
+    /// and gateway-less `publish_file` output disappear without a trace — it
+    /// **degrades loudly**: [`artifact_fallback_notice`] appends a short
+    /// plain-text notice and a `warn` is logged. Text delivery is never
+    /// blocked by an attachment problem, and the notice never duplicates a
+    /// `Download:` line the agent loop already added.
     async fn send_with_artifacts(
         &self,
         message: &SendMessage,
-        _artifacts: &[Artifact],
+        artifacts: &[Artifact],
     ) -> anyhow::Result<()> {
-        self.send(message).await
+        match message_with_artifact_notice(message, artifacts) {
+            None => self.send(message).await,
+            Some(degraded) => {
+                tracing::warn!(
+                    channel = self.name(),
+                    artifact_count = artifacts.len(),
+                    "channel has no native artifact upload; degrading attachments to text"
+                );
+                self.send(&degraded).await
+            }
+        }
     }
 
-    /// Draft equivalent of [`send_with_artifacts`].
-    ///
-    /// Default implementation ignores `artifacts` and falls back to
-    /// [`finalize_draft`]. See `send_with_artifacts` for rationale.
+    /// Draft equivalent of [`send_with_artifacts`], with the same
+    /// degrade-loudly default: the notice is appended to `text` before it is
+    /// handed to [`finalize_draft`].
     async fn finalize_draft_with_artifacts(
         &self,
         recipient: &str,
         message_id: &str,
         text: &str,
-        _artifacts: &[Artifact],
+        artifacts: &[Artifact],
     ) -> anyhow::Result<()> {
-        self.finalize_draft(recipient, message_id, text).await
+        let notice = artifact_fallback_notice(text, artifacts);
+        if notice.is_empty() {
+            return self.finalize_draft(recipient, message_id, text).await;
+        }
+        tracing::warn!(
+            channel = self.name(),
+            artifact_count = artifacts.len(),
+            "channel has no native artifact upload on the draft path; degrading attachments to text"
+        );
+        self.finalize_draft(recipient, message_id, &format!("{text}{notice}"))
+            .await
     }
 
     /// Signal that the bot is processing a response (e.g. "typing" indicator).
@@ -244,6 +395,46 @@ mod tests {
         assert_eq!(cloned.timestamp, 999);
     }
 
+    /// Build an `Artifact` for the delivery-contract tests. `path` is
+    /// workspace-relative and appears verbatim in the signed URL, matching
+    /// what `from_workspace_path` produces — the strip logic matches on
+    /// `/download/{path}`, so an absolute fixture path would never match.
+    fn artifact(name: &str, download_url: Option<&str>) -> Artifact {
+        Artifact {
+            path: name.to_string(),
+            name: name.to_string(),
+            mime: crate::tools::mime_for_extension(name),
+            size_bytes: 1,
+            download_url: download_url.map(str::to_string),
+        }
+    }
+
+    /// The two halves of the "never double up" contract compose. This is the
+    /// exact scenario `TelegramChannel`/`DiscordChannel::send_with_artifacts`
+    /// run: strip the `Download:` line for what we are about to attach, then
+    /// ask for a notice about what we could not.
+    #[test]
+    fn strip_then_notice_never_leaves_a_duplicate_download_line() {
+        let url = "https://gw.example/download/report.docx?expires=1&sig=ab";
+        let art = artifact("report.docx", Some(url));
+        let content = format!("here you go\nDownload: {url}");
+
+        // Delivered natively: the line is stripped and nothing is added back.
+        let stripped = strip_download_lines_for_paths(&content, std::slice::from_ref(&art.path));
+        assert_eq!(stripped, "here you go");
+        assert!(artifact_fallback_notice(&stripped, &[]).is_empty());
+        assert_eq!(stripped.matches("Download: ").count(), 0);
+
+        // Not delivered: the line is kept and the notice stays silent about it.
+        let kept = strip_download_lines_for_paths(&content, &[]);
+        assert_eq!(kept, content);
+        assert!(
+            artifact_fallback_notice(&kept, std::slice::from_ref(&art)).is_empty(),
+            "url is still in the text: the notice must not repeat it"
+        );
+        assert_eq!(kept.matches("Download: ").count(), 1);
+    }
+
     #[tokio::test]
     async fn default_trait_methods_return_success() {
         let channel = DummyChannel;
@@ -257,9 +448,13 @@ mod tests {
             .is_ok());
     }
 
-    /// PR 2: the default `send_with_artifacts` / `finalize_draft_with_artifacts`
-    /// impls must forward to `send` / `finalize_draft`, preserving pre-PR-2
-    /// behaviour for every channel that has not yet overridden them.
+    /// The default `send_with_artifacts` / `finalize_draft_with_artifacts`
+    /// impls must forward to `send` / `finalize_draft` exactly once for every
+    /// channel that has not overridden them. Since PR 3c the forwarded text
+    /// may carry an appended fallback notice (see
+    /// `default_send_with_artifacts_degrades_without_duplicating_download_lines`),
+    /// but the call count — and therefore the delivery semantics — is
+    /// unchanged.
     #[tokio::test]
     async fn default_artifact_methods_fall_back_to_send() {
         use std::sync::atomic::{AtomicUsize, Ordering};
