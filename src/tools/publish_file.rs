@@ -151,16 +151,17 @@ impl Tool for PublishFileTool {
 
     fn description(&self) -> &str {
         "Surface an existing workspace file to the user as a downloadable \
-         attachment. Use this ONLY for files that would not otherwise be \
-         auto-published: `.md` notes, `.json` / `.yaml` data exports, \
-         `.txt` summaries, `.log` output, source code the user asked to \
-         receive, or any non-standard extension. Do NOT call this for \
-         office documents (.docx/.xlsx/.pptx), PDFs, CSVs, images, or \
-         zips — those are auto-published by `file_write` / `shell` and \
-         calling `publish_file` would produce a duplicate attachment. \
-         The file must already exist; create it first with `file_write` \
-         or `shell`, then publish in a separate call. Single file per \
-         call. Does not create or modify files."
+         attachment. Use this for any file the user asked to receive that \
+         will not be delivered on its own: `.md` notes, `.json` / `.yaml` \
+         exports, `.txt` summaries, `.log` output, source code, any \
+         non-standard extension — and office documents, PDFs, CSVs, images \
+         or zips that ALREADY existed before this turn. Do NOT call this for \
+         a file `file_write` or `shell` created during this turn: those are \
+         auto-published, and publishing again sends it twice. The rule is \
+         about who created the file, not its extension. The file must \
+         already exist; create it first with `file_write` or `shell`, then \
+         publish in a separate call. Single file per call. Does not create \
+         or modify files."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -387,6 +388,28 @@ mod tests {
 
     /// Regression anchor: `.md` is NOT in `USER_DELIVERABLE_EXTENSIONS`
     /// (`file_write` would not surface it), but `publish_file` must.
+    /// The description used to forbid images outright, on the assumption that
+    /// `file_write`/`shell` always auto-publish them. That holds only for files
+    /// created this turn — nothing auto-publishes one that already existed, so
+    /// the blanket ban left the model with no way to send it.
+    #[test]
+    fn description_permits_pre_existing_images() {
+        let tool = PublishFileTool::new(test_security(std::path::PathBuf::from("/tmp")));
+        let d = tool.description();
+        assert!(
+            d.contains("ALREADY existed"),
+            "description must permit pre-existing deliverables: {d}"
+        );
+        assert!(
+            !d.contains("Do NOT call this for \n         office documents"),
+            "the blanket extension ban must be gone"
+        );
+        assert!(
+            d.contains("created the file"),
+            "description must frame the rule around provenance, not extension: {d}"
+        );
+    }
+
     #[tokio::test]
     async fn publish_file_happy_path_markdown() {
         let dir = std::env::temp_dir().join("zeroclaw_test_publish_md");
@@ -807,10 +830,18 @@ mod tests {
     fn publish_file_description_warns_against_duplicate_usage() {
         let tool = PublishFileTool::new(test_security(std::env::temp_dir()));
         let desc = tool.description();
-        // Behavioural anchor: the description MUST tell the LLM not to
-        // publish already-auto-detected formats. Without that hint Claude
-        // will double-attach docx files.
-        assert!(desc.contains("Do NOT call this for office documents"));
-        assert!(desc.contains("duplicate"));
+        // Behavioural anchor: the description MUST warn against republishing a
+        // file that was already delivered automatically, or the model
+        // double-attaches it.
+        //
+        // The guard is worded around provenance rather than extension. The
+        // original phrasing banned whole file types, which also blocked
+        // publishing a pre-existing image the user had asked for — nothing
+        // auto-delivers a file no tool touched this turn.
+        assert!(
+            desc.contains("Do NOT call this for") && desc.contains("created during this turn"),
+            "description must scope the ban to files created this turn: {desc}"
+        );
+        assert!(desc.contains("twice") || desc.contains("duplicate"));
     }
 }
