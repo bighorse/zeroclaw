@@ -1279,6 +1279,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::infer(None, "report.pdf"),
         };
         let missing = Artifact {
             path: "out/gone.docx".into(),
@@ -1286,6 +1287,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::infer(None, "gone.docx"),
         };
         let marked = Artifact {
             path: "out/chart.png".into(),
@@ -1293,6 +1295,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::infer(None, "chart.png"),
         };
 
         let marker = format!(

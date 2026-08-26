@@ -2930,6 +2930,7 @@ mod tests {
                 mime: crate::tools::mime_for_extension(path),
                 size_bytes: 1,
                 download_url: None,
+                kind: crate::tools::ArtifactKind::infer(None, path),
             };
             assert_eq!(
                 TelegramChannel::artifact_attachment_kind(&art),
@@ -2954,6 +2955,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::infer(None, "report.pdf"),
         };
         let missing = Artifact {
             path: "out/gone.docx".into(),
@@ -2961,6 +2963,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::infer(None, "gone.docx"),
         };
 
         let (attachments, delivered, undelivered) = TelegramChannel::resolve_artifact_attachments(
@@ -2999,6 +3002,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::infer(None, "chart.png"),
         };
         let unmarked = Artifact {
             path: "out/report.pdf".into(),
@@ -3006,6 +3010,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::infer(None, "report.pdf"),
         };
 
         // Container-style marker: `send_attachment` remaps `/workspace/` onto
