@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{strip_download_lines_for_paths, Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
@@ -480,57 +480,6 @@ enum LarkAttachment {
     /// Uploaded via `/im/v1/files`; sent as `msg_type=file` (renders as a
     /// downloadable file card).
     File(String),
-}
-
-/// Remove `Download: <url>` lines from `content` whose URL refers to any
-/// workspace path in `uploaded_paths`. Other lines (including `Download:`
-/// lines for artifacts that *failed* to upload) are preserved so they
-/// fall back to the regex-based button rendering in `extract_download_links`.
-///
-/// Matching is done against the percent-encoded path segment in the URL
-/// path component, not the URL string itself — an LLM may normalise the
-/// URL differently than our signed-URL generator did (reordering query
-/// params, changing scheme, …), and path-based matching survives that.
-///
-/// Empty `uploaded_paths` is a no-op (returns `content` unchanged as
-/// `String`), which keeps the caller's fast path trivial.
-fn strip_download_lines_for_paths(content: &str, uploaded_paths: &[String]) -> String {
-    if uploaded_paths.is_empty() {
-        return content.to_string();
-    }
-    // Pre-compute percent-encoded forms once per call.
-    let encoded: Vec<String> = uploaded_paths
-        .iter()
-        .map(|p| urlencoding::encode(p).into_owned())
-        .collect();
-
-    let mut out = String::with_capacity(content.len());
-    let mut first = true;
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        let is_matched_download = trimmed
-            .strip_prefix("Download: ")
-            .map(|url| {
-                encoded
-                    .iter()
-                    .any(|p| url.contains(format!("/download/{p}").as_str()))
-            })
-            .unwrap_or(false);
-        if is_matched_download {
-            continue;
-        }
-        if !first {
-            out.push('\n');
-        }
-        out.push_str(line);
-        first = false;
-    }
-    // Preserve a trailing newline if the original had one, since we stripped
-    // line terminators via `.lines()`.
-    if content.ends_with('\n') && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
 }
 
 /// Extract signed download URLs from message content and return:

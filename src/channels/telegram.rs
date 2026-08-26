@@ -1,4 +1,7 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{
+    artifact_fallback_notice, message_with_artifact_notice, strip_download_lines_for_paths,
+    Artifact, Channel, ChannelMessage, SendMessage,
+};
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
@@ -1639,6 +1642,97 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(())
     }
 
+    /// Map a tool-produced [`Artifact`] onto the Telegram send method that
+    /// renders it best.
+    ///
+    /// Classification is by **file extension only**, reusing the same
+    /// [`infer_attachment_kind_from_target`] table the `[IMAGE:…]` marker path
+    /// already uses, so both routes always agree. `Artifact::mime` is
+    /// deliberately *not* consulted: it is itself derived from the extension
+    /// (`tools::artifact::mime_for_extension`), so it adds no information for
+    /// known types, and where it disagrees it disagrees harmfully —
+    /// `image/svg+xml` would route an `.svg` into `sendPhoto`, which Telegram
+    /// rejects. Unknown extensions fall back to `Document`, which Telegram
+    /// accepts for any byte stream.
+    fn artifact_attachment_kind(artifact: &Artifact) -> TelegramAttachmentKind {
+        infer_attachment_kind_from_target(&artifact.path)
+            .unwrap_or(TelegramAttachmentKind::Document)
+    }
+
+    /// Absolute paths of local files already referenced by an attachment
+    /// marker in `content`.
+    ///
+    /// `channel_delivery_instructions("telegram")` explicitly tells the model
+    /// to emit `[IMAGE:<path>]` / `[DOCUMENT:<path>]` markers, and `send`
+    /// attaches those. Artifacts are detected independently by the tool layer,
+    /// so the same file routinely arrives through both routes — without this
+    /// check the user would receive it twice.
+    ///
+    /// Container paths are remapped through `workspace_dir` exactly the way
+    /// [`Self::send_attachment`] does, so `/workspace/out/x.png` and the host
+    /// path compare equal. Remote (`http`) markers and markers pointing at
+    /// files that do not exist are ignored — `send` will not deliver those, so
+    /// the artifact must still be attached.
+    fn marker_attachment_paths(content: &str, workspace_dir: &Path) -> Vec<std::path::PathBuf> {
+        let (_cleaned, markers) = parse_attachment_markers(content);
+        markers
+            .iter()
+            .filter_map(|attachment| {
+                let target = attachment.target.trim();
+                if is_http_url(target) {
+                    return None;
+                }
+                Some(target.strip_prefix("/workspace/").map_or_else(
+                    || std::path::PathBuf::from(target),
+                    |rel| workspace_dir.join(rel),
+                ))
+            })
+            .filter(|path| path.is_file())
+            .collect()
+    }
+
+    /// Split `artifacts` into what this channel will upload and what it will not.
+    ///
+    /// Returns `(attachments, delivered_paths, undelivered)`:
+    /// - `attachments` — ready-to-send [`TelegramAttachment`]s with absolute
+    ///   host paths;
+    /// - `delivered_paths` — workspace-relative paths of every artifact the
+    ///   user will actually receive as a file, whether through `attachments`
+    ///   or through a marker `send` already handles. Used to strip the
+    ///   matching `Download:` lines so nobody gets a link *and* a file;
+    /// - `undelivered` — artifacts whose file is missing on disk; these stay
+    ///   in the text via [`artifact_fallback_notice`].
+    fn resolve_artifact_attachments(
+        workspace_dir: &Path,
+        content: &str,
+        artifacts: &[Artifact],
+    ) -> (Vec<TelegramAttachment>, Vec<String>, Vec<Artifact>) {
+        let marker_paths = Self::marker_attachment_paths(content, workspace_dir);
+        let mut attachments = Vec::new();
+        let mut delivered_paths = Vec::new();
+        let mut undelivered = Vec::new();
+
+        for artifact in artifacts {
+            let full = workspace_dir.join(&artifact.path);
+            if !full.is_file() {
+                undelivered.push(artifact.clone());
+                continue;
+            }
+            delivered_paths.push(artifact.path.clone());
+            // Already covered by a marker the model emitted — `send` attaches
+            // it from there, so attaching it here would post it twice.
+            if marker_paths.iter().any(|path| path == &full) {
+                continue;
+            }
+            attachments.push(TelegramAttachment {
+                kind: Self::artifact_attachment_kind(artifact),
+                target: full.to_string_lossy().into_owned(),
+            });
+        }
+
+        (attachments, delivered_paths, undelivered)
+    }
+
     async fn send_attachment(
         &self,
         chat_id: &str,
@@ -2448,6 +2542,128 @@ impl Channel for TelegramChannel {
         self.send_text_chunks(&content, chat_id, thread_id).await
     }
 
+    /// Native artifact delivery: the text message first, then one Telegram
+    /// media message per artifact.
+    ///
+    /// Mirrors the `LarkChannel` shape (resolve → text → attach) because that
+    /// ordering gives the property this PR is about: **an attachment problem
+    /// can never block text delivery**. The text goes out first and is the
+    /// only failure that propagates; per-file upload failures are logged and
+    /// skipped, exactly as Lark does after a successful card send.
+    async fn send_with_artifacts(
+        &self,
+        message: &SendMessage,
+        artifacts: &[Artifact],
+    ) -> anyhow::Result<()> {
+        if artifacts.is_empty() {
+            return self.send(message).await;
+        }
+        let Some(workspace_dir) = self.workspace_dir.as_ref() else {
+            tracing::warn!(
+                artifact_count = artifacts.len(),
+                "Telegram: no workspace_dir configured; degrading artifacts to text"
+            );
+            return match message_with_artifact_notice(message, artifacts) {
+                Some(degraded) => self.send(&degraded).await,
+                None => self.send(message).await,
+            };
+        };
+
+        let (attachments, delivered_paths, undelivered) =
+            Self::resolve_artifact_attachments(workspace_dir, &message.content, artifacts);
+
+        let mut content = strip_download_lines_for_paths(&message.content, &delivered_paths);
+        let notice = artifact_fallback_notice(&content, &undelivered);
+        content.push_str(&notice);
+
+        // Stripping every `Download:` line can in principle empty the message;
+        // Telegram rejects an empty `sendMessage`, and that error would abort
+        // the attachments below.
+        if !content.trim().is_empty() {
+            let text_message = SendMessage {
+                content,
+                recipient: message.recipient.clone(),
+                subject: message.subject.clone(),
+                thread_ts: message.thread_ts.clone(),
+            };
+            self.send(&text_message).await?;
+        }
+
+        let (chat_id, thread_id) = Self::parse_reply_target(&message.recipient);
+        for attachment in &attachments {
+            if let Err(e) = self
+                .send_attachment(&chat_id, thread_id.as_deref(), attachment)
+                .await
+            {
+                tracing::warn!(
+                    attachment_target = %attachment.target,
+                    error = %e,
+                    "Telegram: artifact upload failed after the text message was delivered"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Draft-path counterpart of [`Self::send_with_artifacts`].
+    ///
+    /// Telegram is the only channel in this repo with `stream_mode != Off`, so
+    /// without this override every artifact produced during a streaming turn
+    /// would be dropped by the trait default.
+    async fn finalize_draft_with_artifacts(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        artifacts: &[Artifact],
+    ) -> anyhow::Result<()> {
+        if artifacts.is_empty() {
+            return self.finalize_draft(recipient, message_id, text).await;
+        }
+        let Some(workspace_dir) = self.workspace_dir.as_ref() else {
+            tracing::warn!(
+                artifact_count = artifacts.len(),
+                "Telegram: no workspace_dir configured; degrading draft artifacts to text"
+            );
+            let notice = artifact_fallback_notice(text, artifacts);
+            return self
+                .finalize_draft(recipient, message_id, &format!("{text}{notice}"))
+                .await;
+        };
+
+        let (attachments, delivered_paths, undelivered) =
+            Self::resolve_artifact_attachments(workspace_dir, text, artifacts);
+
+        let mut content = strip_download_lines_for_paths(text, &delivered_paths);
+        let notice = artifact_fallback_notice(&content, &undelivered);
+        content.push_str(&notice);
+
+        if content.trim().is_empty() {
+            // `editMessageText` rejects empty text; drop the placeholder draft
+            // so only the attachments remain rather than failing the turn.
+            let _ = self.cancel_draft(recipient, message_id).await;
+        } else {
+            self.finalize_draft(recipient, message_id, &content).await?;
+        }
+
+        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+        for attachment in &attachments {
+            if let Err(e) = self
+                .send_attachment(&chat_id, thread_id.as_deref(), attachment)
+                .await
+            {
+                tracing::warn!(
+                    attachment_target = %attachment.target,
+                    error = %e,
+                    "Telegram: artifact upload failed after the draft was finalised"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 
@@ -2742,6 +2958,143 @@ mod tests {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
         let guard = ch.typing_handle.lock();
         assert!(guard.is_none());
+    }
+
+    /// PR 3c: artifact → Telegram send method. Extension-driven, so it agrees
+    /// with the `[IMAGE:…]` marker path for every extension the artifact
+    /// whitelist can produce. `mime` is populated here on purpose: the `.svg`
+    /// row proves it is ignored — routing `image/svg+xml` to `sendPhoto`
+    /// would be rejected by Telegram.
+    #[test]
+    fn artifact_attachment_kind_maps_by_extension_not_mime() {
+        let cases = [
+            ("report.docx", TelegramAttachmentKind::Document),
+            ("report.pdf", TelegramAttachmentKind::Document),
+            ("sheet.xlsx", TelegramAttachmentKind::Document),
+            ("data.csv", TelegramAttachmentKind::Document),
+            ("bundle.zip", TelegramAttachmentKind::Document),
+            ("chart.png", TelegramAttachmentKind::Image),
+            ("photo.jpeg", TelegramAttachmentKind::Image),
+            ("shot.webp", TelegramAttachmentKind::Image),
+            ("clip.mp4", TelegramAttachmentKind::Video),
+            ("song.mp3", TelegramAttachmentKind::Audio),
+            ("note.ogg", TelegramAttachmentKind::Voice),
+            ("diagram.svg", TelegramAttachmentKind::Document),
+            ("no_extension", TelegramAttachmentKind::Document),
+        ];
+
+        for (path, expected) in cases {
+            let art = Artifact {
+                path: path.into(),
+                name: path.into(),
+                mime: crate::tools::mime_for_extension(path),
+                size_bytes: 1,
+                download_url: None,
+            };
+            assert_eq!(
+                TelegramChannel::artifact_attachment_kind(&art),
+                expected,
+                "{path}"
+            );
+        }
+    }
+    /// Artifacts whose file is missing must not be attached — they fall
+    /// through to the text notice instead — and delivered ones must report
+    /// their workspace-relative path so the caller can strip the matching
+    /// `Download:` line.
+    #[test]
+    fn resolve_artifact_attachments_splits_present_and_missing() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ws.path().join("out")).expect("mkdir");
+        std::fs::write(ws.path().join("out/report.pdf"), b"x").expect("write");
+
+        let present = Artifact {
+            path: "out/report.pdf".into(),
+            name: "report.pdf".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+        let missing = Artifact {
+            path: "out/gone.docx".into(),
+            name: "gone.docx".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+
+        let (attachments, delivered, undelivered) = TelegramChannel::resolve_artifact_attachments(
+            ws.path(),
+            "here you go",
+            &[present, missing],
+        );
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, TelegramAttachmentKind::Document);
+        assert_eq!(
+            attachments[0].target,
+            ws.path()
+                .join("out/report.pdf")
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(delivered, vec!["out/report.pdf".to_string()]);
+        assert_eq!(undelivered.len(), 1);
+        assert_eq!(undelivered[0].path, "out/gone.docx");
+    }
+    /// The Telegram delivery prompt tells the model to emit `[IMAGE:…]` /
+    /// `[DOCUMENT:…]` markers, and `send` attaches those. An artifact pointing
+    /// at the same file must therefore NOT be attached a second time — but it
+    /// must still count as delivered so its `Download:` line gets stripped.
+    #[test]
+    fn resolve_artifact_attachments_skips_files_already_covered_by_a_marker() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ws.path().join("out")).expect("mkdir");
+        std::fs::write(ws.path().join("out/chart.png"), b"x").expect("write");
+        std::fs::write(ws.path().join("out/report.pdf"), b"x").expect("write");
+
+        let marked = Artifact {
+            path: "out/chart.png".into(),
+            name: "chart.png".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+        let unmarked = Artifact {
+            path: "out/report.pdf".into(),
+            name: "report.pdf".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+
+        // Container-style marker: `send_attachment` remaps `/workspace/` onto
+        // `workspace_dir`, so this must compare equal to the resolved artifact.
+        let content = "here you go [IMAGE:/workspace/out/chart.png]";
+        let (attachments, delivered, undelivered) = TelegramChannel::resolve_artifact_attachments(
+            ws.path(),
+            content,
+            std::slice::from_ref(&marked),
+        );
+        assert!(
+            attachments.is_empty(),
+            "a file the marker path already delivers must not be attached twice"
+        );
+        assert_eq!(
+            delivered,
+            vec!["out/chart.png".to_string()],
+            "it is still delivered, so its Download: line must be stripped"
+        );
+        assert!(undelivered.is_empty());
+
+        // A marker for one file must not suppress an unrelated artifact.
+        let (attachments, _delivered, _undelivered) = TelegramChannel::resolve_artifact_attachments(
+            ws.path(),
+            content,
+            std::slice::from_ref(&unmarked),
+        );
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, TelegramAttachmentKind::Document);
     }
 
     #[tokio::test]

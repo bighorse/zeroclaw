@@ -3072,13 +3072,16 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .discord
                 .as_ref()
                 .context("Discord channel is not configured")?;
-            Ok(Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )))
+            Ok(Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ))
         }
         "slack" => {
             let sl = config
@@ -3169,13 +3172,16 @@ fn collect_configured_channels(
     if let Some(ref dc) = config.channels_config.discord {
         channels.push(ConfiguredChannel {
             display_name: "Discord",
-            channel: Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )),
+            channel: Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
