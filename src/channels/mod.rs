@@ -7594,6 +7594,7 @@ This is an example JSON object for profile settings."#;
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::Document,
         }
     }
 

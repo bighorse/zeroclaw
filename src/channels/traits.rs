@@ -305,6 +305,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
+            kind: crate::tools::ArtifactKind::Document,
         };
 
         ch.send_with_artifacts(&SendMessage::new("hi", "bob"), std::slice::from_ref(&art))

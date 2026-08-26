@@ -73,6 +73,7 @@ pub mod web_search_tool;
 #[allow(unused_imports)]
 pub use artifact::{
     append_artifacts, extract_artifacts, is_artifact_extension, mime_for_extension, Artifact,
+    ArtifactKind,
 };
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
