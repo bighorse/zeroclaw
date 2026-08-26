@@ -410,6 +410,78 @@ fn lark_file_type_for(filename: &str) -> &'static str {
     }
 }
 
+/// Base MIME types accepted by Lark's `im/v1/images` endpoint for
+/// `image_type=message` **and** actually producible by the artifact pipeline.
+///
+/// Deliberately an allowlist rather than a `starts_with("image/")` test:
+/// `image/svg+xml` is an `image/*` MIME that the endpoint rejects, and a
+/// rejected upload costs a round-trip before degrading to the Download-button
+/// fallback. Anything not listed keeps the pre-existing `im/v1/files`
+/// behaviour — a file card, which is uglier but always works.
+const LARK_INLINE_IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Decide whether an artifact should be sent as a native inline image
+/// (`msg_type=image`) rather than a file card (`msg_type=file`).
+///
+/// `mime` is [`crate::tools::Artifact::mime`], which is `Option` — artifacts
+/// built by `Artifact::from_workspace_path` always carry one, but the type
+/// permits `None` (hand-built artifacts in tests do exactly that), so we fall
+/// back to an extension-based guess instead of silently mis-routing to the
+/// file endpoint.
+///
+/// Kept as a free fn over `(Option<&str>, &str)` rather than a method on
+/// `Artifact` so the routing table is unit-testable without touching the
+/// artifact contract or the network.
+fn lark_artifact_is_image(mime: Option<&str>, file_name: &str) -> bool {
+    let declared = mime
+        .map(|m| m.trim().to_ascii_lowercase())
+        .filter(|m| !m.is_empty())
+        .or_else(|| crate::tools::mime_for_extension(file_name).map(|m| m.to_ascii_lowercase()));
+
+    let Some(declared) = declared else {
+        return false;
+    };
+    // Drop any `; charset=…` parameter before matching.
+    let base = declared.split(';').next().unwrap_or_default().trim();
+    LARK_INLINE_IMAGE_MIMES.contains(&base)
+}
+
+/// Extract `data.image_key` from an `/im/v1/images` upload response, or
+/// return a descriptive error when the API reports a non-zero `code`.
+///
+/// Mirrors [`parse_lark_upload_response`], differing only in the field name.
+/// Kept separate (rather than parameterising the existing fn) so the error
+/// text names the right field — "missing data.image_key" is the single most
+/// useful string when a tenant lacks the `im:resource` scope.
+fn parse_lark_image_upload_response(body: &serde_json::Value) -> anyhow::Result<String> {
+    let code = extract_lark_response_code(body).unwrap_or(0);
+    if code != 0 {
+        let msg = body
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or("(no msg)");
+        anyhow::bail!("Lark image upload returned code={code}: {msg}; full body: {body}");
+    }
+    body.get("data")
+        .and_then(|d| d.get("image_key"))
+        .and_then(|k| k.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("upload response missing data.image_key: {body}"))
+}
+
+/// An artifact that has been uploaded to Lark and is ready to be sent as its
+/// own message. The variant records both which endpoint produced the key and
+/// which `msg_type` must carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LarkAttachment {
+    /// Uploaded via `/im/v1/images`; sent as `msg_type=image` (renders
+    /// inline in the chat transcript).
+    Image(String),
+    /// Uploaded via `/im/v1/files`; sent as `msg_type=file` (renders as a
+    /// downloadable file card).
+    File(String),
+}
+
 /// Remove `Download: <url>` lines from `content` whose URL refers to any
 /// workspace path in `uploaded_paths`. Other lines (including `Download:`
 /// lines for artifacts that *failed* to upload) are preserved so they
@@ -1545,6 +1617,10 @@ impl LarkChannel {
         format!("{}/im/v1/files", self.api_base())
     }
 
+    fn upload_image_url(&self) -> String {
+        format!("{}/im/v1/images", self.api_base())
+    }
+
     fn send_file_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
     }
@@ -1584,22 +1660,72 @@ impl LarkChannel {
         Ok((status, body))
     }
 
-    /// Upload a single artifact, read from the configured workspace, with
-    /// one 401 retry. Returns the file_key on success.
+    /// One-shot multipart upload to `/im/v1/images`. Same `(status, body)`
+    /// contract as [`Self::upload_file_once`], so the 401-retry wrapper is
+    /// identical.
+    ///
+    /// The multipart field names differ from the file API and are not
+    /// interchangeable: the binary part is `image` (not `file`), the only
+    /// text field is `image_type` (there is no `image_name` — Lark derives
+    /// the display name from the multipart `filename`), and `image_type`
+    /// must be `message` for keys that are usable in `im/v1/messages`.
+    async fn upload_image_once(
+        &self,
+        token: &str,
+        file_name: &str,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name.to_string())
+            .mime_str("application/octet-stream")?;
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+
+        let resp = self
+            .http_client()
+            .post(self.upload_image_url())
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let body = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, body))
+    }
+
+    /// Read an artifact's bytes out of the configured workspace.
     ///
     /// Fails fast (rather than returning Option) when workspace_dir is not
     /// configured — this path is only reachable from `send_with_artifacts`,
     /// which itself short-circuits when workspace_dir is None, so reaching
     /// here without a workspace is a bug worth surfacing.
-    async fn upload_artifact(&self, artifact: &crate::tools::Artifact) -> anyhow::Result<String> {
+    ///
+    /// Shared by `upload_artifact` and `upload_image` so both surface the
+    /// identical error text for a missing workspace or an unreadable file.
+    async fn read_artifact_bytes(
+        &self,
+        artifact: &crate::tools::Artifact,
+    ) -> anyhow::Result<Vec<u8>> {
         let workspace_dir = self
             .workspace_dir
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("LarkChannel has no workspace_dir configured"))?;
         let full_path = workspace_dir.join(&artifact.path);
-        let bytes = tokio::fs::read(&full_path)
+        tokio::fs::read(&full_path)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to read artifact {}: {e}", full_path.display()))?;
+            .map_err(|e| anyhow::anyhow!("failed to read artifact {}: {e}", full_path.display()))
+    }
+
+    /// Upload a single artifact as a **file**, with one 401 retry. Returns
+    /// the file_key on success.
+    ///
+    /// Images are routed to [`Self::upload_image`] by `send_with_artifacts`;
+    /// anything reaching here is rendered as a file card.
+    async fn upload_artifact(&self, artifact: &crate::tools::Artifact) -> anyhow::Result<String> {
+        let bytes = self.read_artifact_bytes(artifact).await?;
 
         let file_type = lark_file_type_for(&artifact.name);
         let mut token = self.get_tenant_access_token().await?;
@@ -1625,6 +1751,37 @@ impl LarkChannel {
         parse_lark_upload_response(&body)
     }
 
+    /// Upload a single artifact as an **image**, with one 401 retry. Returns
+    /// the image_key on success.
+    ///
+    /// Same retry shape as [`Self::upload_artifact`] — only the endpoint,
+    /// the multipart field names and the response field differ.
+    async fn upload_image(&self, artifact: &crate::tools::Artifact) -> anyhow::Result<String> {
+        let bytes = self.read_artifact_bytes(artifact).await?;
+
+        let mut token = self.get_tenant_access_token().await?;
+        let (status, body) = self
+            .upload_image_once(&token, &artifact.name, bytes.clone())
+            .await?;
+
+        let (status, body) = if should_refresh_lark_tenant_token(status, &body) {
+            self.invalidate_token().await;
+            token = self.get_tenant_access_token().await?;
+            self.upload_image_once(&token, &artifact.name, bytes)
+                .await?
+        } else {
+            (status, body)
+        };
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "Lark image upload HTTP {status} for {}: {body}",
+                artifact.path
+            );
+        }
+        parse_lark_image_upload_response(&body)
+    }
+
     /// Send one `msg_type=file` message referring to an already-uploaded
     /// `file_key`. One 401 retry, same shape as `send` / reaction paths.
     async fn send_file_message(&self, recipient: &str, file_key: &str) -> anyhow::Result<()> {
@@ -1646,6 +1803,33 @@ impl LarkChannel {
             (status, response)
         };
         ensure_lark_send_success(status, &response, "file message")
+    }
+
+    /// Send one `msg_type=image` message referring to an already-uploaded
+    /// `image_key`. One 401 retry, same shape as `send_file_message`.
+    ///
+    /// Reuses `send_message_url()` rather than adding a third helper: the
+    /// send endpoint is the same `/im/v1/messages?receive_id_type=chat_id`
+    /// for every `msg_type`; only the body differs.
+    async fn send_image_message(&self, recipient: &str, image_key: &str) -> anyhow::Result<()> {
+        let url = self.send_message_url();
+        let content = serde_json::json!({ "image_key": image_key }).to_string();
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "image",
+            "content": content,
+        });
+
+        let token = self.get_tenant_access_token().await?;
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        let (status, response) = if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            self.send_text_once(&url, &new_token, &body).await?
+        } else {
+            (status, response)
+        };
+        ensure_lark_send_success(status, &response, "image message")
     }
 
     // ── end PR 3 helpers ───────────────────────────────────────────────
@@ -2102,17 +2286,22 @@ impl Channel for LarkChannel {
     /// PR 3: native file attachments.
     ///
     /// Strategy:
-    /// 1. Upload each artifact via `/im/v1/files` in sequence. Failures are
-    ///    tolerated — the corresponding artifact falls back to the
-    ///    Download-button rendering inside the interactive card.
+    /// 1. Upload each artifact in sequence, routed by MIME type: images (see
+    ///    `lark_artifact_is_image`) go to `/im/v1/images`, everything else to
+    ///    `/im/v1/files`. Failures are tolerated — the corresponding artifact
+    ///    falls back to the Download-button rendering inside the interactive
+    ///    card.
     /// 2. Strip `Download:` lines for *successfully uploaded* artifacts so
     ///    the card does not render a redundant button next to the native
     ///    attachment.
     /// 3. Send the interactive card (unchanged path — reuses the table
     ///    fallback, markdown sanitisation, and 401 retry already baked
     ///    into `send`).
-    /// 4. Send one `msg_type=file` message per successfully-uploaded
-    ///    artifact. These show up as native attachment cards in the chat.
+    /// 4. Send one message per successfully-uploaded artifact:
+    ///    `msg_type=image` for images, which renders inline in the transcript
+    ///    (the whole point of the split — a chart posted as a file card is
+    ///    a click away from being seen), and `msg_type=file` for everything
+    ///    else, which renders as a native attachment card.
     ///
     /// Ordering rationale: card first, attachments second, because the
     /// card carries the explanation text — if the user reads top-to-bottom
@@ -2132,16 +2321,25 @@ impl Channel for LarkChannel {
             return self.send(message).await;
         }
 
-        // Upload phase. Collect successes (artifact, file_key) and track
-        // failed paths separately for logging.
-        let mut uploaded: Vec<(&crate::tools::Artifact, String)> =
+        // Upload phase. Collect successes (artifact, attachment key) and
+        // track failed paths separately for logging. Images go to the image
+        // endpoint so they render inline; everything else keeps the
+        // pre-existing file endpoint untouched.
+        let mut uploaded: Vec<(&crate::tools::Artifact, LarkAttachment)> =
             Vec::with_capacity(artifacts.len());
         for art in artifacts {
-            match self.upload_artifact(art).await {
-                Ok(file_key) => uploaded.push((art, file_key)),
+            let as_image = lark_artifact_is_image(art.mime.as_deref(), &art.name);
+            let outcome = if as_image {
+                self.upload_image(art).await.map(LarkAttachment::Image)
+            } else {
+                self.upload_artifact(art).await.map(LarkAttachment::File)
+            };
+            match outcome {
+                Ok(attachment) => uploaded.push((art, attachment)),
                 Err(e) => {
                     tracing::warn!(
                         artifact_path = %art.path,
+                        as_image,
                         error = %e,
                         "Lark: artifact upload failed; falling back to Download: URL in card"
                     );
@@ -2161,17 +2359,31 @@ impl Channel for LarkChannel {
         };
         self.send(&card_message).await?;
 
-        // Attachment phase. Each file_key becomes its own native attachment
-        // message. We log and swallow per-attachment failures rather than
-        // aborting — the card already went out, so bailing here would be
-        // a worse UX than "some attachments missing".
-        for (art, file_key) in uploaded {
-            if let Err(e) = self.send_file_message(&message.recipient, &file_key).await {
+        // Attachment phase. Each uploaded key becomes its own native message
+        // — inline image or file card, depending on how it was uploaded. We
+        // log and swallow per-attachment failures rather than aborting — the
+        // card already went out, so bailing here would be a worse UX than
+        // "some attachments missing".
+        for (art, attachment) in uploaded {
+            let (kind, key, outcome) = match &attachment {
+                LarkAttachment::Image(image_key) => (
+                    "image",
+                    image_key.as_str(),
+                    self.send_image_message(&message.recipient, image_key).await,
+                ),
+                LarkAttachment::File(file_key) => (
+                    "file",
+                    file_key.as_str(),
+                    self.send_file_message(&message.recipient, file_key).await,
+                ),
+            };
+            if let Err(e) = outcome {
                 tracing::warn!(
                     artifact_path = %art.path,
-                    file_key = %file_key,
+                    attachment_kind = %kind,
+                    attachment_key = %key,
                     error = %e,
-                    "Lark: file message send failed after successful upload"
+                    "Lark: attachment message send failed after successful upload"
                 );
             }
         }
@@ -3730,7 +3942,14 @@ mod tests {
     fn lark_file_type_defaults_to_stream_for_unknown() {
         assert_eq!(lark_file_type_for("notes.md"), "stream");
         assert_eq!(lark_file_type_for("data.csv"), "stream");
+        // Still `stream`, and deliberately kept: `lark_file_type_for`'s
+        // contract did not change when outbound image routing landed. What
+        // changed is the *caller* — `send_with_artifacts` now sends raster
+        // images through `/im/v1/images` and never reaches this fn for them
+        // (see `lark_artifact_is_image`). Non-raster images such as SVG do
+        // still land here, so this assertion guards a live path.
         assert_eq!(lark_file_type_for("image.png"), "stream");
+        assert_eq!(lark_file_type_for("diagram.svg"), "stream");
         assert_eq!(lark_file_type_for("archive.zip"), "stream");
         assert_eq!(lark_file_type_for("no_extension"), "stream");
     }
@@ -3840,6 +4059,131 @@ mod tests {
     /// artifact-producing turn — if it regresses, every Lark message doubles
     /// in latency. We exercise it with a mis-configured channel that would
     /// panic if upload_artifact were reached.
+    #[test]
+    fn lark_artifact_is_image_routes_by_mime_then_extension() {
+        // (declared mime, file name, expected: send as inline image?)
+        let cases: &[(Option<&str>, &str, bool)] = &[
+            // Happy path: the MIME the artifact pipeline actually emits.
+            (Some("image/png"), "chart.png", true),
+            (Some("image/jpeg"), "photo.jpg", true),
+            (Some("image/webp"), "banner.webp", true),
+            (Some("image/gif"), "loop.gif", true),
+            // Header casing and parameters must not defeat the match.
+            (Some("IMAGE/PNG"), "chart.png", true),
+            (Some("image/png; charset=binary"), "chart.png", true),
+            // SVG is an `image/*` MIME that Lark's image endpoint REJECTS.
+            // It must keep going through the file path, otherwise every SVG
+            // costs a wasted round-trip before degrading.
+            (Some("image/svg+xml"), "diagram.svg", false),
+            // Non-images stay on the file path.
+            (Some("application/pdf"), "report.pdf", false),
+            (
+                Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+                "report.docx",
+                false,
+            ),
+            (Some("application/zip"), "bundle.zip", false),
+            // `Artifact::mime` is Option — fall back to the extension guess
+            // rather than silently mis-routing every hand-built artifact.
+            (None, "chart.png", true),
+            (None, "photo.JPEG", true),
+            (None, "report.docx", false),
+            (None, "no_extension", false),
+            // Empty / whitespace-only MIME must not be trusted either.
+            (Some(""), "chart.png", true),
+            (Some("   "), "chart.png", true),
+            (Some(""), "report.pdf", false),
+        ];
+
+        for (mime, name, expected) in cases {
+            assert_eq!(
+                lark_artifact_is_image(*mime, name),
+                *expected,
+                "routing mismatch for mime={mime:?} name={name}"
+            );
+        }
+    }
+    #[test]
+    fn parse_image_upload_response_extracts_image_key() {
+        let body = serde_json::json!({
+            "code": 0,
+            "msg": "ok",
+            "data": { "image_key": "img_v3_0123456789abcdef" }
+        });
+        assert_eq!(
+            parse_lark_image_upload_response(&body).unwrap(),
+            "img_v3_0123456789abcdef"
+        );
+    }
+    #[test]
+    fn parse_image_upload_response_surfaces_api_error() {
+        // Realistic shape when the app is missing the `im:resource` scope.
+        let body = serde_json::json!({
+            "code": 99_991_672,
+            "msg": "app ticket invalid"
+        });
+        let err = parse_lark_image_upload_response(&body).expect_err("must fail on non-zero code");
+        let msg = err.to_string();
+        assert!(msg.contains("99991672"), "error must carry the code: {msg}");
+        assert!(
+            msg.contains("app ticket invalid"),
+            "error must carry the api msg: {msg}"
+        );
+        assert!(
+            msg.contains("image upload"),
+            "error must say it was the image endpoint, not the file one: {msg}"
+        );
+    }
+    #[test]
+    fn parse_image_upload_response_missing_image_key_fails_descriptively() {
+        // Guards against the copy-paste bug this fn exists to prevent:
+        // reading `file_key` out of an image-upload response.
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "file_key": "file_v3_wrong_endpoint" }
+        });
+        let err = parse_lark_image_upload_response(&body).unwrap_err();
+        assert!(
+            err.to_string().contains("missing data.image_key"),
+            "error must name the missing field: {err}"
+        );
+    }
+    /// The image split must not disturb the `workspace_dir == None` fast
+    /// path: a `.png` artifact with no workspace must still fall through to
+    /// plain `send`, never touch `/im/v1/images`. Mirrors
+    /// `send_with_artifacts_no_workspace_dir_falls_back_to_send`, which
+    /// covers the file side.
+    #[tokio::test]
+    async fn send_with_artifacts_image_no_workspace_dir_falls_back_to_send() {
+        let ch = LarkChannel::new(
+            "cli_bogus".into(),
+            "secret_bogus".into(),
+            String::new(),
+            None,
+            vec!["*".into()],
+            false,
+        );
+        let art = crate::tools::Artifact {
+            path: "chart.png".into(),
+            name: "chart.png".into(),
+            mime: Some("image/png".into()),
+            size_bytes: 1,
+            download_url: None,
+        };
+        let result = ch
+            .send_with_artifacts(
+                &SendMessage::new("hi", "oc_test"),
+                std::slice::from_ref(&art),
+            )
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            !msg.contains("upload") && !msg.contains("image_key") && !msg.contains("file_key"),
+            "no-workspace path must fall through to send; got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn send_with_artifacts_empty_short_circuits_to_send() {
         // No valid credentials, no workspace — but `artifacts=[]` must
