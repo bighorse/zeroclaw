@@ -470,7 +470,7 @@ fn strip_download_lines_for_paths(content: &str, uploaded_paths: &[String]) -> S
 /// `?expires=...&sig=...` query string when users click through.
 ///
 /// Recognises lines of the form produced by `FileWriteTool`:
-/// ```
+/// ```text
 /// Download: http://host/download/file?expires=NNN&sig=HEX
 /// ```
 /// and bare/markdown-linked URLs containing `/download/` with signed params.
