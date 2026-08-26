@@ -1119,7 +1119,16 @@ impl LarkChannel {
                             }
                         }
                         "post" => match parse_post_content_details(&lark_msg.content) {
-                            Some(details) => (details.text, details.mentioned_open_ids),
+                            Some(details) => {
+                                let mut text = details.text;
+                                self.append_post_images(
+                                    &mut text,
+                                    &lark_msg.message_id,
+                                    &details.image_keys,
+                                )
+                                .await;
+                                (text, details.mentioned_open_ids)
+                            }
                             None => {
                                 tracing::warn!(
                                     "Lark WS: post parse returned None for {}",
@@ -1672,6 +1681,33 @@ impl LarkChannel {
     }
 
     /// Parse an event callback payload and extract text messages
+    /// Download every image referenced by a rich-text (`post`) message and
+    /// append an `[IMAGE:<path>]` marker per image to `text`.
+    ///
+    /// A post interleaves text and images, so unlike a bare `image` message the
+    /// download result cannot replace the content — it has to be appended, or
+    /// the caption the user typed alongside the picture is lost.
+    ///
+    /// Failures degrade rather than drop: the text still goes to the model,
+    /// carrying the parser's `[image: alt]` placeholder. A missing picture is
+    /// worth less than a missing question.
+    async fn append_post_images(&self, text: &mut String, msg_id: &str, image_keys: &[String]) {
+        for key in image_keys {
+            let content = serde_json::json!({ "image_key": key }).to_string();
+            match self.download_lark_resource(msg_id, "image", &content).await {
+                Some(marker) => {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&marker);
+                }
+                None => {
+                    tracing::warn!("Lark: post image download failed (msg_id={msg_id}, key={key})");
+                }
+            }
+        }
+    }
+
     async fn download_lark_resource(
         &self,
         msg_id: &str,
@@ -1837,7 +1873,25 @@ impl LarkChannel {
                 }
             }
             "post" => match parse_post_content_details(content_str) {
-                Some(details) => (details.text, details.mentioned_open_ids),
+                Some(details) => {
+                    // `parse_event_payload` is sync; the webhook handler resolves
+                    // this marker asynchronously (see `[lark_post_images:` below).
+                    let mut text = details.text;
+                    if !details.image_keys.is_empty() {
+                        let msg_id = event
+                            .pointer("/message/message_id")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or_default();
+                        use std::fmt::Write as _;
+                        let _ = write!(
+                            text,
+                            "\n[lark_post_images:{}:{}]",
+                            msg_id,
+                            details.image_keys.join(",")
+                        );
+                    }
+                    (text, details.mentioned_open_ids)
+                }
                 None => return messages,
             },
             "file" | "image" | "media" | "folder" => {
@@ -2258,6 +2312,30 @@ impl LarkChannel {
             // Parse event messages
             let mut messages = state.channel.parse_event_payload(&payload);
             for m in &mut messages {
+                // Rich-text posts carry their images as a trailing marker rather
+                // than replacing the content, so the user's caption survives.
+                if let Some(idx) = m.content.find("\n[lark_post_images:") {
+                    let tail = m.content[idx + 1..].to_string();
+                    let inner = tail
+                        .trim_start_matches("[lark_post_images:")
+                        .trim_end_matches(']');
+                    let mut parts = inner.splitn(2, ':');
+                    let msg_id = parts.next().unwrap_or_default().to_string();
+                    let keys: Vec<String> = parts
+                        .next()
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter(|k| !k.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    m.content.truncate(idx);
+                    let mut text = std::mem::take(&mut m.content);
+                    state
+                        .channel
+                        .append_post_images(&mut text, &msg_id, &keys)
+                        .await;
+                    m.content = text;
+                }
                 if m.content.starts_with("[lark_download:") {
                     let parts: Vec<&str> = m.content.splitn(4, ':').collect();
                     if parts.len() == 4 {
@@ -2547,6 +2625,10 @@ fn random_lark_ack_reaction(
 struct ParsedPostContent {
     text: String,
     mentioned_open_ids: Vec<String>,
+    /// `image_key`s of `img` elements, in document order. The parser is sync
+    /// and downloading is not, so the keys are carried out to the async caller
+    /// rather than fetched here.
+    image_keys: Vec<String>,
 }
 
 fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
@@ -2577,6 +2659,7 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
 
     let mut text = String::new();
     let mut mentioned_open_ids = Vec::new();
+    let mut image_keys = Vec::new();
 
     if let Some(title) = locale
         .get("title")
@@ -2642,6 +2725,13 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
                             text.push_str("\n```");
                         }
                         "img" => {
+                            if let Some(key) = el
+                                .get("image_key")
+                                .and_then(|k| k.as_str())
+                                .filter(|s| !s.is_empty())
+                            {
+                                image_keys.push(key.to_string());
+                            }
                             if let Some(alt) = el
                                 .get("alt")
                                 .and_then(|a| a.as_str())
@@ -2682,7 +2772,10 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
     }
 
     let result = text.trim().to_string();
-    if result.is_empty() {
+    // An image-only post carries no text at all. Dropping it here would make a
+    // bare screenshot vanish, so emptiness is only fatal when there is also
+    // nothing to download.
+    if result.is_empty() && image_keys.is_empty() {
         tracing::warn!("Lark: post content parsed to empty text, dropping message");
         let preview: String = content.chars().take(200).collect();
         tracing::debug!("Lark: dropped post content_preview={preview}");
@@ -2691,6 +2784,7 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
         Some(ParsedPostContent {
             text: result,
             mentioned_open_ids,
+            image_keys,
         })
     }
 }
@@ -3711,6 +3805,63 @@ mod tests {
         assert!(result.text.contains("PharmaClaw"));
         assert!(result.text.contains("马广军"));
         assert!(result.text.contains("---"));
+    }
+
+    /// The bug this fixes: a screenshot sent with a caption reached the model
+    /// as the caption alone. `image_key` was parsed and thrown away, so nothing
+    /// was ever downloaded and no `[IMAGE:]` marker was produced — the model
+    /// answered about a picture it had never seen.
+    #[test]
+    fn parse_post_collects_image_keys_alongside_text() {
+        let content = r#"{"zh_cn":{"title":"","content":[[{"tag":"img","image_key":"img_v3_abc123","alt":"screenshot"},{"tag":"text","text":"解读该图片"}]]}}"#;
+        let result = parse_post_content_details(content).unwrap();
+        assert_eq!(
+            result.image_keys,
+            vec!["img_v3_abc123".to_string()],
+            "image_key must survive parsing so the caller can download it"
+        );
+        assert!(
+            result.text.contains("解读该图片"),
+            "the caption must survive too: {}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn parse_post_collects_every_image_key_in_order() {
+        let content = r#"{"zh_cn":{"content":[[{"tag":"img","image_key":"k1"},{"tag":"text","text":"vs"},{"tag":"img","image_key":"k2"}]]}}"#;
+        let result = parse_post_content_details(content).unwrap();
+        assert_eq!(result.image_keys, vec!["k1".to_string(), "k2".to_string()]);
+    }
+
+    /// An image-only post has no text at all. Before this change the empty-text
+    /// guard dropped the whole message, so a bare screenshot vanished silently.
+    #[test]
+    fn parse_post_image_only_is_not_dropped() {
+        let content = r#"{"zh_cn":{"content":[[{"tag":"img","image_key":"img_only"}]]}}"#;
+        let result = parse_post_content_details(content)
+            .expect("an image-only post must survive; it is not an empty message");
+        assert_eq!(result.image_keys, vec!["img_only".to_string()]);
+        assert!(result.text.is_empty());
+    }
+
+    #[test]
+    fn parse_post_img_without_key_does_not_panic_or_collect() {
+        let content =
+            r#"{"zh_cn":{"content":[[{"tag":"img","alt":"broken"},{"tag":"text","text":"hi"}]]}}"#;
+        let result = parse_post_content_details(content).unwrap();
+        assert!(result.image_keys.is_empty());
+        assert!(result.text.contains("hi"));
+    }
+
+    /// Text-only posts must keep working exactly as before — no marker, no
+    /// download attempt, no behaviour change.
+    #[test]
+    fn parse_post_text_only_collects_no_images() {
+        let content = r#"{"zh_cn":{"title":"标题","content":[[{"tag":"text","text":"正文"}]]}}"#;
+        let result = parse_post_content_details(content).unwrap();
+        assert!(result.image_keys.is_empty());
+        assert!(result.text.contains("标题") && result.text.contains("正文"));
     }
 
     // ── PR 3: artifact upload logic ─────────────────────────────────────
