@@ -594,6 +594,24 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        // Both spellings reach here: `lark` is the international product,
+        // `feishu` the Chinese one, and a deployment answers to whichever it
+        // is configured as.
+        "lark" | "feishu" => Some(
+            "When responding on Lark/Feishu:\n\
+             - Use Markdown formatting; it renders in the reply card\n\
+             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - To send a file or image to the user, call `publish_file` with its workspace \
+               path. It is delivered as a real attachment — images render inline in the chat, \
+               everything else arrives as a file card. Do this for any file the user asked to \
+               receive, including one that already existed before this conversation.\n\
+             - Files you create with `file_write` or `shell` are delivered automatically; \
+               do not publish those a second time.\n\
+             - Do not paste a local filesystem path and call it delivery — a path the user \
+               cannot open is not an answer.\n\
+             - Use tool results silently: answer the latest user message directly, and do not \
+               narrate delayed/internal tool execution bookkeeping.",
+        ),
         _ => None,
     }
 }
@@ -6639,6 +6657,34 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let recalled = mem.recall("45", 5, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
+    }
+
+    /// Feishu fell through to `_ => None`, so the model was never told the
+    /// channel could carry attachments at all. Asked for an image it answered,
+    /// truthfully given what it knew, that it could only send text.
+    #[test]
+    fn lark_and_feishu_both_get_delivery_instructions() {
+        for name in ["lark", "feishu"] {
+            let instructions = channel_delivery_instructions(name)
+                .unwrap_or_else(|| panic!("{name} must have delivery instructions"));
+            assert!(
+                instructions.contains("publish_file"),
+                "{name} instructions must name the tool that delivers files"
+            );
+            assert!(
+                instructions.contains("already existed"),
+                "{name} instructions must cover pre-existing files, the case that was broken"
+            );
+        }
+    }
+
+    /// The two spellings are the same product and must not drift.
+    #[test]
+    fn lark_and_feishu_instructions_are_identical() {
+        assert_eq!(
+            channel_delivery_instructions("lark"),
+            channel_delivery_instructions("feishu")
+        );
     }
 
     #[tokio::test]
