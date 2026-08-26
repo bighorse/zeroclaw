@@ -406,6 +406,7 @@ mod tests {
             mime: crate::tools::mime_for_extension(name),
             size_bytes: 1,
             download_url: download_url.map(str::to_string),
+            kind: crate::tools::ArtifactKind::infer(None, name.to_string().as_ref()),
         }
     }
 
@@ -500,7 +501,7 @@ mod tests {
             mime: None,
             size_bytes: 1,
             download_url: None,
-            kind: crate::tools::ArtifactKind::Document,
+            kind: crate::tools::ArtifactKind::infer(None, "x.docx"),
         };
 
         ch.send_with_artifacts(&SendMessage::new("hi", "bob"), std::slice::from_ref(&art))
