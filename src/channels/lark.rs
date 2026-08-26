@@ -2152,7 +2152,11 @@ impl Channel for LarkChannel {
         // action buttons. This avoids the `&` → `&amp;` HTML-entity escaping
         // that Lark applies to inline markdown links, which breaks the signed-URL
         // query string when users click through from the chat card.
-        let (cleaned_content, download_buttons) = extract_download_links(&message.content);
+        // Feishu delivers files as artifacts, not markers. A marker reaching
+        // here was never going to be acted on; strip it so the user does not
+        // see raw `[IMAGE:/abs/path]` in the card.
+        let marker_free = super::strip_attachment_markers(&message.content);
+        let (cleaned_content, download_buttons) = extract_download_links(&marker_free);
 
         let mut card_map = serde_json::Map::new();
         card_map.insert("schema".to_string(), serde_json::json!("2.0"));
