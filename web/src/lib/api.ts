@@ -8,6 +8,7 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
+  UploadedFile,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 
@@ -247,4 +248,32 @@ export function getCliTools(): Promise<CliTool[]> {
   return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) =>
     unwrapField(data, 'cli_tools'),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Uploads
+// ---------------------------------------------------------------------------
+
+/**
+ * Upload a single file for use in the agent chat.
+ *
+ * Routed through `apiFetch` so bearer injection, 401 handling and error
+ * mapping stay identical to every other dashboard call. `Content-Type` is
+ * deliberately left unset: `apiFetch` only forces JSON for string bodies, so
+ * the browser adds the multipart boundary itself.
+ */
+export async function uploadFile(file: File): Promise<UploadedFile> {
+  const form = new FormData();
+  form.append('file', file, file.name);
+
+  const result = await apiFetch<UploadedFile>('/api/upload', {
+    method: 'POST',
+    body: form,
+  });
+
+  if (typeof result?.path !== 'string' || result.path.length === 0) {
+    throw new Error('Upload succeeded but the response has no file path');
+  }
+
+  return result;
 }
