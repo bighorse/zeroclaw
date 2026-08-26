@@ -91,7 +91,7 @@ const SENSITIVE_BASENAME_CONTAINS: &[&str] = &["secrets."];
 /// - `basename` is the final path component.
 ///
 /// All comparisons are case-insensitive.
-fn is_sensitive_path(rel_str: &str, basename: &str) -> bool {
+pub(crate) fn is_sensitive_path(rel_str: &str, basename: &str) -> bool {
     // `.git/` as a path segment (not a substring) — so `digitalgit/x`
     // remains publishable, but `.git/config` or `reports/.git/HEAD`
     // get rejected.
