@@ -158,10 +158,17 @@ impl Provider for RouterProvider {
             .unwrap_or(false)
     }
 
+    /// Vision capability is restrictive, not additive: a plain (non-`hint:`)
+    /// model resolves to `default_index`, so the gate that consumes this must
+    /// report the default provider's capability. Reporting `.any()` across the
+    /// route table let a vision-capable *route* mask a non-vision default,
+    /// which is exactly the mixed-provider setup routing exists to create.
+    /// Mirrors `supports_native_tools()` above.
     fn supports_vision(&self) -> bool {
         self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_vision())
+            .unwrap_or(false)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -460,5 +467,73 @@ mod tests {
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);
+    }
+
+    /// Minimal stub whose only meaningful trait method is the vision flag.
+    struct VisionMock(bool);
+
+    #[async_trait]
+    impl Provider for VisionMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// A plain model name resolves to the default provider, so a vision-capable
+    /// route must never make the router look vision-capable.
+    #[test]
+    fn supports_vision_reflects_default_provider_not_any_route() {
+        // (default_vision, routed_vision, expected)
+        let cases = [
+            (false, true, false),
+            (true, false, true),
+            (false, false, false),
+            (true, true, true),
+        ];
+
+        for (default_vision, routed_vision, expected) in cases {
+            let router = RouterProvider::new(
+                vec![
+                    (
+                        "default".into(),
+                        Box::new(VisionMock(default_vision)) as Box<dyn Provider>,
+                    ),
+                    (
+                        "vision".into(),
+                        Box::new(VisionMock(routed_vision)) as Box<dyn Provider>,
+                    ),
+                ],
+                vec![(
+                    "vision".into(),
+                    Route {
+                        provider_name: "vision".into(),
+                        model: "vision-model".into(),
+                    },
+                )],
+                "default-model".into(),
+            );
+
+            assert_eq!(
+                router.supports_vision(),
+                expected,
+                "default_vision={default_vision} routed_vision={routed_vision}"
+            );
+        }
+    }
+
+    #[test]
+    fn supports_vision_is_false_without_providers() {
+        let router = RouterProvider::new(Vec::new(), Vec::new(), "default-model".into());
+        assert!(!router.supports_vision());
     }
 }

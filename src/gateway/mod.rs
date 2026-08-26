@@ -1016,9 +1016,47 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
+/// Reject image input when the active provider cannot accept images.
+///
+/// Mirrors the gate in the agent loop (`src/agent/loop_.rs`): both gateway chat
+/// paths only call `prepare_messages_for_provider`, which normalizes
+/// `[IMAGE:...]` markers into inline `data:` URIs. Without this check a
+/// text-only provider silently receives a multi-megabyte base64 blob as
+/// ordinary prompt text instead of a structured capability error.
+///
+/// Only `user` messages can carry markers (`multimodal::count_image_markers`
+/// filters on role), so callers may pass just the user turn — the assembled
+/// system prompt is irrelevant here, and checking first avoids building it.
+fn ensure_vision_supported(
+    provider: &dyn Provider,
+    provider_name: &str,
+    messages: &[ChatMessage],
+) -> Result<(), providers::ProviderCapabilityError> {
+    let image_marker_count = crate::multimodal::count_image_markers(messages);
+    if image_marker_count > 0 && !provider.supports_vision() {
+        return Err(providers::ProviderCapabilityError {
+            provider: provider_name.to_string(),
+            capability: "vision".to_string(),
+            message: format!(
+                "received {image_marker_count} image marker(s), but this provider does not support vision input"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
 async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
     let user_messages = vec![ChatMessage::user(message)];
+
+    // Vision gate — before prompt assembly and before any provider call.
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    ensure_vision_supported(&*state.provider, &provider_label, &user_messages)?;
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
     // workspace-aware system context before model invocation.
@@ -4265,6 +4303,110 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    /// Minimal stub whose only meaningful trait method is the vision flag.
+    struct VisionCapabilityMock(bool);
+
+    #[async_trait]
+    impl Provider for VisionCapabilityMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn ensure_vision_supported_gates_on_markers_and_capability() {
+        // (provider_supports_vision, message, expect_rejection)
+        let cases = [
+            (false, "plain question", false),
+            (false, "look at [IMAGE:/tmp/a.png]", true),
+            (false, "[IMAGE:/tmp/a.png] and [IMAGE:/tmp/b.png]", true),
+            (true, "look at [IMAGE:/tmp/a.png]", false),
+            (true, "plain question", false),
+        ];
+
+        for (vision, message, expect_rejection) in cases {
+            let provider = VisionCapabilityMock(vision);
+            let messages = vec![ChatMessage::user(message)];
+            let result = ensure_vision_supported(&provider, "mock-provider", &messages);
+            assert_eq!(
+                result.is_err(),
+                expect_rejection,
+                "vision={vision} message={message}"
+            );
+            if let Err(err) = result {
+                assert_eq!(err.capability, "vision");
+                assert_eq!(err.provider, "mock-provider");
+                assert!(err.message.contains("image marker"));
+            }
+        }
+    }
+
+    /// Regression: the webhook simple-chat path must reject image markers when
+    /// the active provider has no vision capability, instead of forwarding the
+    /// normalized `data:` URI to the model as plain prompt text.
+    #[tokio::test]
+    async fn gateway_simple_chat_rejects_images_for_non_vision_provider() {
+        let mock = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = mock.clone();
+        assert!(!provider.supports_vision());
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
+        };
+
+        let error = run_gateway_chat_simple(&state, "describe [IMAGE:/tmp/shot.png]")
+            .await
+            .expect_err("non-vision provider must not receive image markers");
+
+        let capability = error
+            .downcast_ref::<crate::providers::ProviderCapabilityError>()
+            .expect("gateway must surface a structured ProviderCapabilityError");
+        assert_eq!(capability.capability, "vision");
+        assert!(capability.message.contains("1 image marker"));
+        assert_eq!(
+            mock.calls.load(Ordering::SeqCst),
+            0,
+            "provider must not be called once the vision gate rejects the request"
+        );
     }
 }
 

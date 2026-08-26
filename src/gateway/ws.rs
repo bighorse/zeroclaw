@@ -154,6 +154,28 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
+        // Vision gate — same contract as the webhook path and the agent loop: a
+        // provider without vision support must never receive the normalized
+        // `data:` URI as plain prompt text. Checked before `agent_start` is
+        // broadcast so a rejected turn does not open an unmatched agent
+        // lifecycle event on the SSE stream.
+        if let Err(capability_error) = super::ensure_vision_supported(
+            &*state.provider,
+            &provider_label,
+            &[crate::providers::ChatMessage::user(&content)],
+        ) {
+            tracing::warn!(
+                provider = provider_label.as_str(),
+                "WS chat rejected: {capability_error}"
+            );
+            let err = serde_json::json!({
+                "type": "error",
+                "message": capability_error.to_string(),
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            continue;
+        }
+
         // Broadcast agent_start event
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_start",
@@ -313,5 +335,46 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    /// `handle_socket` needs a live WebSocket, so the WS turn itself cannot be
+    /// unit-tested. This pins the exact gate expression it evaluates for every
+    /// inbound frame: the user turn built from `content`, checked against the
+    /// active provider before any provider call is made.
+    #[test]
+    fn ws_chat_gate_rejects_image_markers_for_non_vision_provider() {
+        struct TextOnlyProvider;
+
+        #[async_trait::async_trait]
+        impl crate::providers::Provider for TextOnlyProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: f64,
+            ) -> anyhow::Result<String> {
+                panic!("provider must not be called once the vision gate rejects the turn")
+            }
+        }
+
+        let content = "describe this [IMAGE:/tmp/shot.png]".to_string();
+        let err = crate::gateway::ensure_vision_supported(
+            &TextOnlyProvider,
+            "mock",
+            &[crate::providers::ChatMessage::user(&content)],
+        )
+        .expect_err("non-vision provider must not receive image markers");
+        assert_eq!(err.capability, "vision");
+        assert_eq!(err.provider, "mock");
+        assert!(err.message.contains("1 image marker"));
+
+        // A marker-free turn on the same provider still passes.
+        assert!(crate::gateway::ensure_vision_supported(
+            &TextOnlyProvider,
+            "mock",
+            &[crate::providers::ChatMessage::user("plain question")],
+        )
+        .is_ok());
     }
 }

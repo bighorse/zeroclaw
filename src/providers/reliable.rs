@@ -786,10 +786,20 @@ impl Provider for ReliableProvider {
             .unwrap_or(false)
     }
 
+    /// Vision capability is restrictive, not additive.
+    ///
+    /// A request is dispatched to `providers[0]` first, so the gate that
+    /// consumes this must know whether *that* provider can accept images.
+    /// Reporting `.any()` across the fallback chain let a non-vision primary
+    /// receive a normalized `data:` URI as plain prompt text whenever any
+    /// fallback happened to support vision. Mirrors `supports_native_tools()`
+    /// above. (The streaming capability methods correctly stay `.any()` —
+    /// streaming really is additive across the chain.)
     fn supports_vision(&self) -> bool {
         self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+            .first()
+            .map(|(_, p)| p.supports_vision())
+            .unwrap_or(false)
     }
 
     async fn chat_with_tools(
@@ -2494,5 +2504,68 @@ mod tests {
             "QWEN",
             "DEEPSEEK-V4-PRO"
         ));
+    }
+
+    /// Minimal stub whose only meaningful trait method is the vision flag.
+    struct VisionMock(bool);
+
+    #[async_trait]
+    impl Provider for VisionMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// Vision gating is restrictive, not additive: the request is dispatched to
+    /// the primary provider first, so a vision-capable fallback must never make
+    /// the whole chain look vision-capable.
+    #[test]
+    fn supports_vision_reflects_primary_not_any_fallback() {
+        // (primary_vision, fallback_vision, expected)
+        let cases = [
+            (false, true, false),
+            (true, false, true),
+            (false, false, false),
+            (true, true, true),
+        ];
+
+        for (primary_vision, fallback_vision, expected) in cases {
+            let provider = ReliableProvider::new(
+                vec![
+                    (
+                        "primary".into(),
+                        Box::new(VisionMock(primary_vision)) as Box<dyn Provider>,
+                    ),
+                    (
+                        "fallback".into(),
+                        Box::new(VisionMock(fallback_vision)) as Box<dyn Provider>,
+                    ),
+                ],
+                0,
+                1,
+            );
+
+            assert_eq!(
+                provider.supports_vision(),
+                expected,
+                "primary_vision={primary_vision} fallback_vision={fallback_vision}"
+            );
+        }
+    }
+
+    #[test]
+    fn supports_vision_is_false_without_providers() {
+        let provider = ReliableProvider::new(Vec::new(), 0, 1);
+        assert!(!provider.supports_vision());
     }
 }

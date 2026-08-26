@@ -308,10 +308,20 @@ impl AzureOpenAiProvider {
 
 #[async_trait]
 impl Provider for AzureOpenAiProvider {
+    /// `vision: false` is a statement about this provider's serialization, not
+    /// about the deployed Azure model. `convert_messages` emits
+    /// `NativeMessage { content: Option<String>, .. }` on every branch and the
+    /// non-native path uses `Message { content: String }` — there is no
+    /// multimodal content array anywhere in this file, so an image marker
+    /// normalized to a `data:` URI would be shipped as ordinary prompt text
+    /// (context blow-up and per-token billing on megabytes of base64).
+    /// Declaring vision support is what makes the runtime gate wave that
+    /// through. Flip this back to `true` only together with an OpenAI-style
+    /// `content: [{type:"text"},{type:"image_url"}]` encoder.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
-            vision: true,
+            vision: false,
         }
     }
 
@@ -337,8 +347,10 @@ impl Provider for AzureOpenAiProvider {
         true
     }
 
+    // Kept explicit to mirror `supports_native_tools`; see the note on
+    // `capabilities()` for why this is `false`.
     fn supports_vision(&self) -> bool {
-        true
+        false
     }
 
     async fn chat_with_system(
@@ -722,11 +734,14 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_reports_native_tools_and_vision() {
+    fn capabilities_reports_native_tools_without_vision() {
         let p = AzureOpenAiProvider::new(Some("key"), "resource", "deployment", None);
         let caps = <AzureOpenAiProvider as Provider>::capabilities(&p);
         assert!(caps.native_tool_calling);
-        assert!(caps.vision);
+        assert!(
+            !caps.vision,
+            "convert_messages has no multimodal encoder; declaring vision would ship base64 as prompt text"
+        );
     }
 
     #[test]
@@ -736,9 +751,32 @@ mod tests {
     }
 
     #[test]
-    fn supports_vision_returns_true() {
+    fn supports_vision_returns_false() {
         let p = AzureOpenAiProvider::new(Some("key"), "resource", "deployment", None);
-        assert!(p.supports_vision());
+        assert!(!p.supports_vision());
+    }
+
+    /// Proves *why* the capability is `false`: an image marker survives
+    /// `convert_messages` as ordinary string content. When someone implements a
+    /// real OpenAI-style `content: [{type:"image_url"}]` encoder, this test
+    /// fails and forces the capability flag to be revisited at the same time.
+    #[test]
+    fn convert_messages_serializes_image_markers_as_plain_text() {
+        let messages = vec![ChatMessage::user("look [IMAGE:data:image/png;base64,AAAA]")];
+        let native = AzureOpenAiProvider::convert_messages(&messages);
+
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "user");
+        assert_eq!(
+            native[0].content.as_deref(),
+            Some("look [IMAGE:data:image/png;base64,AAAA]")
+        );
+
+        let json = serde_json::to_value(&native[0]).expect("NativeMessage serializes");
+        assert!(
+            json["content"].is_string(),
+            "content must be a plain string; an array would mean image parts exist: {json}"
+        );
     }
 
     #[tokio::test]
