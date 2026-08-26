@@ -1986,9 +1986,13 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Slack delivers files as artifacts, not markers. A marker that reaches
+        // here was never going to be acted on, so it must not reach the user
+        // either — raw `[IMAGE:/abs/path]` reads as a bug and leaks a path.
+        let text = super::strip_attachment_markers(&message.content);
         let mut body = serde_json::json!({
             "channel": message.recipient,
-            "text": message.content
+            "text": text
         });
 
         if let Some(ref ts) = message.thread_ts {

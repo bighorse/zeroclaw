@@ -525,6 +525,16 @@ pub(crate) struct AttachmentMarker {
 /// Bracketed text that does not parse as a supported marker is preserved in
 /// the returned body verbatim, so ordinary prose like `[see notes]` and
 /// markdown links survive untouched. The returned body is trimmed.
+/// Remove attachment markers from a reply on channels that cannot act on them.
+///
+/// The delivery prompt teaches markers per channel, but a model carries habits
+/// across channels — and a marker that nothing parses reaches the user as raw
+/// `[IMAGE:/path/to/file.png]`, which reads as a bug and leaks a local path.
+/// Stripping is not delivery; these channels deliver through artifacts.
+pub(crate) fn strip_attachment_markers(message: &str) -> String {
+    parse_attachment_markers(message).0
+}
+
 pub(crate) fn parse_attachment_markers(message: &str) -> (String, Vec<AttachmentMarker>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
@@ -4038,6 +4048,26 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    /// Channels that deliver via artifacts do not parse markers. Without
+    /// stripping, a model that picked up the habit on another channel leaks
+    /// raw `[IMAGE:/abs/path]` into the reply — a visible bug and a path
+    /// disclosure.
+    #[test]
+    fn strip_attachment_markers_removes_markers_and_keeps_prose() {
+        let out = strip_attachment_markers("here is the chart [IMAGE:/ws/chart.png] enjoy");
+        assert!(!out.contains("[IMAGE:"));
+        assert!(!out.contains("/ws/chart.png"));
+        assert!(out.contains("here is the chart") && out.contains("enjoy"));
+    }
+
+    /// Ordinary bracketed prose is not a marker and must survive untouched.
+    #[test]
+    fn strip_attachment_markers_leaves_ordinary_brackets() {
+        let out = strip_attachment_markers("see [note 1] and [TODO: later]");
+        assert!(out.contains("[note 1]"));
+        assert!(out.contains("[TODO: later]"));
     }
 
     #[test]
