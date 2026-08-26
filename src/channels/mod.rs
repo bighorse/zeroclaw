@@ -525,6 +525,20 @@ pub(crate) struct AttachmentMarker {
 /// Bracketed text that does not parse as a supported marker is preserved in
 /// the returned body verbatim, so ordinary prose like `[see notes]` and
 /// markdown links survive untouched. The returned body is trimmed.
+/// True when an outbound marker names something that must never leave the
+/// host, reusing `publish_file`'s denylist so the two cannot drift.
+///
+/// Remote URLs are not filtered here — they name no local file, and the
+/// channels resolve them over the network.
+fn is_sensitive_attachment_target(target: &str) -> bool {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return false;
+    }
+    let normalized = target.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    crate::tools::publish_file::is_sensitive_path(&normalized, basename)
+}
+
 pub(crate) fn parse_attachment_markers(message: &str) -> (String, Vec<AttachmentMarker>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
@@ -559,10 +573,20 @@ pub(crate) fn parse_attachment_markers(message: &str) -> (String, Vec<Attachment
             })
         });
 
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[open..=close]);
+        match parsed {
+            // A marker naming a sensitive path is dropped outright, not
+            // preserved as text: leaving `[DOCUMENT:.env]` in the reply tells
+            // the user the file exists and what it is called. `publish_file`
+            // has refused these since it was written; the marker path never
+            // did, so a model talked into emitting one had nothing in its way.
+            Some(attachment) if is_sensitive_attachment_target(&attachment.target) => {
+                tracing::warn!(
+                    "channels: refusing attachment marker for sensitive path ({:?})",
+                    attachment.kind
+                );
+            }
+            Some(attachment) => attachments.push(attachment),
+            None => cleaned.push_str(&message[open..=close]),
         }
 
         cursor = close + 1;
@@ -4038,6 +4062,55 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    /// `publish_file` has always refused these paths. The marker path never
+    /// did — so a model induced to emit `[DOCUMENT:.env]` had nothing in its
+    /// way, on every channel that parses markers.
+    #[test]
+    fn sensitive_marker_targets_are_dropped_not_echoed() {
+        for target in [
+            ".env",
+            "secrets/.env",
+            ".git/config",
+            "id_rsa",
+            "a/b/.git/HEAD",
+        ] {
+            let msg = format!("here it is [DOCUMENT:{target}]");
+            let (body, attachments) = parse_attachment_markers(&msg);
+            assert!(
+                attachments.is_empty(),
+                "{target} must not become an attachment"
+            );
+            assert!(
+                !body.contains(target),
+                "{target} must not be echoed back to the user either: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_marker_targets_still_attach() {
+        let (body, attachments) = parse_attachment_markers("report [DOCUMENT:out/report.pdf]");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].target, "out/report.pdf");
+        assert_eq!(body.trim(), "report");
+    }
+
+    /// Remote URLs name no local file; the channels fetch them over the
+    /// network, so the local denylist does not apply.
+    #[test]
+    fn remote_urls_are_not_treated_as_sensitive_paths() {
+        let (_, attachments) =
+            parse_attachment_markers("[IMAGE:https://example.com/.env/chart.png]");
+        assert_eq!(attachments.len(), 1);
+    }
+
+    /// Windows-style separators must not slip past the segment check.
+    #[test]
+    fn backslash_separated_sensitive_paths_are_dropped() {
+        let (_, attachments) = parse_attachment_markers(r"[DOCUMENT:sub\.git\config]");
+        assert!(attachments.is_empty());
     }
 
     #[test]
