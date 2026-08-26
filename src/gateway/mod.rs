@@ -29,7 +29,7 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
@@ -46,6 +46,16 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
+/// Maximum accepted upload size (32 MiB) for `POST /api/upload`.
+///
+/// Deliberately a constant, not a config key: `MAX_BODY_SIZE` is a constant
+/// too, and a tunable here would only widen the DoS surface with no caller
+/// asking for it.
+pub const MAX_UPLOAD_BYTES: usize = 33_554_432;
+/// Maximum length of the sanitized on-disk upload file name.
+const MAX_UPLOAD_NAME_LEN: usize = 128;
+/// Workspace-relative directory that uploads land in.
+const UPLOAD_SUBDIR: &str = "uploads";
 /// Request timeout. 30s is the legacy slow-loris guard, but it kills any
 /// LLM-driven path (/webhook, /api/chat, channel webhooks) in the middle
 /// of an agent loop — multi-turn tool calls easily run 30-120s. Slow-loris
@@ -717,6 +727,27 @@ pub async fn run_gateway(
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
 
+    // Uploads need a far larger body limit than the gateway-wide 64KB cap.
+    //
+    // `Router::layer` rewrites *every* route already in the router, so a
+    // router merged before the global `RequestBodyLimitLayer` still ends up
+    // wrapped by it and capped at `MAX_BODY_SIZE`. This router is therefore
+    // merged *after* the global layers (see below) and carries its own:
+    //   - `DefaultBodyLimit`: axum's extractor-level cap, 2MB by default,
+    //     which `Multipart` honours regardless of tower-http layers;
+    //   - `RequestBodyLimitLayer`: hard Content-Length / stream cap;
+    //   - `TimeoutLayer`: keeps the slow-client guard that opting out of
+    //     the global stack would otherwise lose.
+    let upload_router = Router::new()
+        .route("/api/upload", post(handle_api_upload))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .layer(RequestBodyLimitLayer::new(MAX_UPLOAD_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ))
+        .with_state(state.clone());
+
     // Build router with middleware
     let app = Router::new()
         // ── Admin routes (for CLI management) ──
@@ -776,6 +807,9 @@ pub async fn run_gateway(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ))
+        // ── Uploads: merged *after* the global body limit so the route keeps
+        //    its own 32MB cap instead of being re-wrapped at 64KB ──
+        .merge(upload_router)
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 
@@ -896,6 +930,381 @@ async fn handle_workspace_download(
         }
         Err(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
     }
+}
+
+/// Basenames that Windows resolves to a device in *any* directory.
+const WINDOWS_RESERVED_STEMS: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Turn a client-supplied multipart `filename` into a safe basename.
+///
+/// Structural attacks are **rejected** rather than silently rewritten, so the
+/// caller gets a 400 instead of a surprise destination — the same contract
+/// `handle_workspace_download` uses for `..` and `\`. Whatever survives is
+/// then narrowed to `[A-Za-z0-9._-]`, which removes NUL bytes, control
+/// characters, bidi overrides and shell metacharacters in one pass and leaves
+/// the name pure ASCII (so the byte slicing below can never split a char).
+fn sanitize_upload_file_name(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("file name is empty");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("file name must not contain path separators");
+    }
+    if trimmed.contains("..") {
+        return Err("file name must not contain `..`");
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("file name must not contain control characters");
+    }
+    if trimmed.chars().all(|c| c == '.') {
+        return Err("file name must not be a bare dot");
+    }
+
+    let narrowed: String = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // A leading `.` would create a hidden file; a leading `-` could later be
+    // read as a flag by a shell tool operating on the workspace.
+    let narrowed = narrowed.trim_start_matches(['.', '-']).to_string();
+    if narrowed.is_empty() {
+        return Err("file name has no usable characters");
+    }
+
+    let truncated = truncate_upload_file_name(&narrowed);
+    let stem = truncated.split('.').next().unwrap_or("");
+    if WINDOWS_RESERVED_STEMS
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return Ok(format!("_{truncated}"));
+    }
+    Ok(truncated)
+}
+
+/// Cap the on-disk name length while preserving the extension.
+///
+/// Only ever called with the ASCII-narrowed name from
+/// `sanitize_upload_file_name`, so byte indexing is char-boundary safe.
+fn truncate_upload_file_name(name: &str) -> String {
+    if name.len() <= MAX_UPLOAD_NAME_LEN {
+        return name.to_string();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() + 1 < MAX_UPLOAD_NAME_LEN => {
+            let keep = (MAX_UPLOAD_NAME_LEN - ext.len() - 1).min(stem.len());
+            format!("{}.{}", &stem[..keep], ext)
+        }
+        _ => name[..MAX_UPLOAD_NAME_LEN].to_string(),
+    }
+}
+
+/// Pick a non-colliding destination for `file_name` inside `dir`.
+///
+/// Uploading the same name twice must never silently overwrite the earlier
+/// file, so a short random suffix goes before the extension when taken.
+async fn unique_upload_path(dir: &std::path::Path, file_name: &str) -> std::path::PathBuf {
+    let candidate = dir.join(file_name);
+    if !tokio::fs::try_exists(&candidate).await.unwrap_or(true) {
+        return candidate;
+    }
+    let suffix = Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..8];
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => dir.join(format!("{stem}-{suffix}.{ext}")),
+        _ => dir.join(format!("{file_name}-{suffix}")),
+    }
+}
+
+/// Why streaming an upload field to disk failed.
+#[derive(Debug)]
+enum UploadWriteError {
+    /// The field exceeded the byte budget.
+    TooLarge,
+    /// The multipart stream was malformed or truncated mid-field.
+    Multipart(String),
+    /// Writing into the workspace failed.
+    Io(String),
+}
+
+/// Stream one multipart field to `dest`, aborting past `max_bytes`.
+///
+/// A rejected upload must never leave a truncated artefact in the workspace,
+/// so the partial file is removed on every error path — after the handle is
+/// dropped, which matters on Windows.
+async fn write_upload_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+    dest: &std::path::Path,
+    max_bytes: u64,
+) -> Result<u64, UploadWriteError> {
+    let outcome = stream_field_to_file(field, dest, max_bytes).await;
+    if outcome.is_err() {
+        let _ = tokio::fs::remove_file(dest).await;
+    }
+    outcome
+}
+
+async fn stream_field_to_file(
+    field: &mut axum::extract::multipart::Field<'_>,
+    dest: &std::path::Path,
+    max_bytes: u64,
+) -> Result<u64, UploadWriteError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| UploadWriteError::Io(e.to_string()))?;
+    let mut written: u64 = 0;
+
+    let outcome: Result<u64, UploadWriteError> = loop {
+        match field.chunk().await {
+            Ok(Some(chunk)) => {
+                written += chunk.len() as u64;
+                if written > max_bytes {
+                    break Err(UploadWriteError::TooLarge);
+                }
+                if let Err(e) = file.write_all(&chunk).await {
+                    break Err(UploadWriteError::Io(e.to_string()));
+                }
+            }
+            Ok(None) => break Ok(written),
+            Err(e) => break Err(UploadWriteError::Multipart(e.body_text())),
+        }
+    };
+
+    // tokio's `File` does not guarantee the write landed on drop.
+    if let Err(e) = file.flush().await {
+        return Err(UploadWriteError::Io(e.to_string()));
+    }
+    outcome
+}
+
+/// Response body for `POST /api/upload`.
+#[derive(serde::Serialize)]
+struct UploadResponse {
+    status: &'static str,
+    /// Workspace-relative path, e.g. `uploads/report.pdf`.
+    path: String,
+    /// Absolute on-disk path, for tools that take absolute paths.
+    absolute_path: String,
+    /// Name actually used on disk, after sanitization and collision handling.
+    file_name: String,
+    size: u64,
+    /// Server-derived from the stored extension; the client-declared part
+    /// Content-Type is never echoed back.
+    content_type: &'static str,
+    /// Signed download URL — `null` when no public gateway URL resolves.
+    download_url: Option<String>,
+}
+
+/// POST /api/upload — multipart file upload into `workspace/uploads/`.
+///
+/// Same auth / rate-limit / idempotency contract as `/api/chat`: sliding
+/// window rate limit, `Authorization: Bearer <token>` when pairing is
+/// enabled, and an optional `X-Idempotency-Key`.
+///
+/// The route lives on its own router with a 32MB body limit
+/// (`MAX_UPLOAD_BYTES`); the gateway-wide 64KB cap does not apply to it.
+///
+/// Request:  POST /api/upload  `multipart/form-data`, one part with a filename
+/// Response: 200 {"status":"stored","path":"uploads/x.pdf","download_url":...}
+async fn handle_api_upload(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/api/upload rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many upload requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err)).into_response();
+    }
+
+    // Bearer auth (same model as /api/chat).
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("/api/upload: rejected — invalid bearer token");
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err)).into_response();
+        }
+    }
+
+    let mut multipart = match multipart {
+        Ok(m) => m,
+        Err(rejection) => {
+            tracing::warn!("/api/upload: not a multipart body: {rejection}");
+            let err = serde_json::json!({
+                "error": "Invalid multipart/form-data body. Send the file as a form-data part with a filename."
+            });
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+        }
+    };
+
+    if let Some(idempotency_key) = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !state.idempotency_store.record_if_new(idempotency_key) {
+            tracing::info!("/api/upload duplicate ignored (idempotency key: {idempotency_key})");
+            let body = serde_json::json!({
+                "status": "duplicate",
+                "idempotent": true,
+                "message": "Upload already processed for this idempotency key"
+            });
+            return (StatusCode::OK, Json(body)).into_response();
+        }
+    }
+
+    let (workspace_dir, download_secret, public_url) = {
+        let guard = state.config.lock();
+        (
+            guard.workspace_dir.clone(),
+            guard.resolve_download_secret(),
+            guard.resolve_gateway_public_url(),
+        )
+    };
+
+    // Containment: resolve the uploads directory and prove it stays inside the
+    // workspace — same canonicalize + starts_with contract as
+    // `handle_workspace_download`, so a symlinked `uploads/` cannot escape.
+    let upload_dir = workspace_dir.join(UPLOAD_SUBDIR);
+    if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
+        tracing::error!("/api/upload: cannot create {}: {e}", upload_dir.display());
+        let err = serde_json::json!({ "error": "Upload directory is not writable" });
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+    }
+    let canonical_workspace = match tokio::fs::canonicalize(&workspace_dir).await {
+        Ok(p) => p,
+        Err(_) => {
+            let err = serde_json::json!({ "error": "Workspace error" });
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+        }
+    };
+    let canonical_upload_dir = match tokio::fs::canonicalize(&upload_dir).await {
+        Ok(p) => p,
+        Err(_) => {
+            let err = serde_json::json!({ "error": "Workspace error" });
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+        }
+    };
+    if !canonical_upload_dir.starts_with(&canonical_workspace) {
+        tracing::error!("/api/upload: uploads directory escapes the workspace");
+        let err = serde_json::json!({ "error": "Path escapes workspace" });
+        return (StatusCode::FORBIDDEN, Json(err)).into_response();
+    }
+
+    // Store the first part that carries a filename; ignore the rest. multer
+    // drains an unread field automatically on the next `next_field()`.
+    let mut stored: Option<(String, u64)> = None;
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("/api/upload: malformed multipart body: {e}");
+                let err = serde_json::json!({ "error": "Malformed multipart/form-data body" });
+                return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+            }
+        };
+
+        if stored.is_some() {
+            continue;
+        }
+        let Some(raw_name) = field.file_name().map(str::to_string) else {
+            continue;
+        };
+        let file_name = match sanitize_upload_file_name(&raw_name) {
+            Ok(name) => name,
+            Err(reason) => {
+                tracing::warn!("/api/upload: rejected file name {raw_name:?}: {reason}");
+                let err = serde_json::json!({ "error": format!("Invalid file name: {reason}") });
+                return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+            }
+        };
+
+        let dest = unique_upload_path(&canonical_upload_dir, &file_name).await;
+        let stored_name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file_name.clone());
+
+        match write_upload_field(&mut field, &dest, MAX_UPLOAD_BYTES as u64).await {
+            Ok(size) => stored = Some((stored_name, size)),
+            Err(UploadWriteError::TooLarge) => {
+                tracing::warn!("/api/upload: {stored_name} exceeded {MAX_UPLOAD_BYTES} bytes");
+                let err = serde_json::json!({
+                    "error": format!("File exceeds the {MAX_UPLOAD_BYTES} byte upload limit"),
+                });
+                return (StatusCode::PAYLOAD_TOO_LARGE, Json(err)).into_response();
+            }
+            Err(UploadWriteError::Multipart(msg)) => {
+                tracing::warn!("/api/upload: multipart stream error: {msg}");
+                let err = serde_json::json!({ "error": "Malformed multipart/form-data body" });
+                return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+            }
+            Err(UploadWriteError::Io(msg)) => {
+                tracing::error!("/api/upload: write failed: {msg}");
+                let err = serde_json::json!({ "error": "Failed to store uploaded file" });
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response();
+            }
+        }
+    }
+
+    let Some((file_name, size)) = stored else {
+        tracing::warn!("/api/upload: no file part in multipart body");
+        let err = serde_json::json!({
+            "error": "No file part found. Send the file as a multipart/form-data part with a filename."
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    };
+
+    let rel_path = format!("{UPLOAD_SUBDIR}/{file_name}");
+    let download_url = public_url.map(|base| {
+        signed_url::sign_download_url(
+            &base,
+            &rel_path,
+            &download_secret,
+            signed_url::DEFAULT_TTL_SECS,
+        )
+    });
+    let absolute_path = canonical_upload_dir.join(&file_name).display().to_string();
+    tracing::info!(path = %rel_path, size, "/api/upload: stored file");
+
+    let body = UploadResponse {
+        status: "stored",
+        path: rel_path,
+        absolute_path,
+        content_type: guess_content_type(&file_name),
+        file_name,
+        size,
+        download_url,
+    };
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Guess a reasonable Content-Type from the file extension.
@@ -2832,6 +3241,99 @@ mod tests {
         assert_eq!(MAX_BODY_SIZE, 65_536);
     }
 
+    // ── POST /api/upload helpers ────────────────────────────────────────
+
+    /// Build a one-part `multipart/form-data` body and run it through the
+    /// real extractor, so tests exercise the same parser the router does.
+    async fn build_test_multipart(file_name: &str, content: &[u8]) -> Multipart {
+        use axum::extract::FromRequest;
+
+        let boundary = "zeroclawtestboundary";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/upload")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .expect("valid test request");
+
+        Multipart::from_request(request, &())
+            .await
+            .expect("valid multipart body")
+    }
+
+    fn upload_test_config(workspace: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        config.gateway.public_url = Some("https://gateway.test".to_string());
+        config
+    }
+
+    fn upload_app_state(
+        config: Config,
+        pairing: Arc<PairingGuard>,
+        rate_limiter: Arc<GatewayRateLimiter>,
+    ) -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing,
+            trust_forwarded_headers: false,
+            rate_limiter,
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            recent_sop_results: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
+        }
+    }
+
+    /// Temp workspace + ready-to-call state for the upload handler tests.
+    fn upload_fixture(
+        temp: &tempfile::TempDir,
+        pairing: PairingGuard,
+        rate_limiter: GatewayRateLimiter,
+    ) -> (std::path::PathBuf, AppState) {
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let state = upload_app_state(
+            upload_test_config(&workspace),
+            Arc::new(pairing),
+            Arc::new(rate_limiter),
+        );
+        (workspace, state)
+    }
+
     #[test]
     fn trim_api_chat_history_noop_under_cap() {
         let mut history = vec![
@@ -3012,6 +3514,244 @@ mod tests {
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
+    }
+
+    #[test]
+    fn upload_limit_is_32mb() {
+        assert_eq!(MAX_UPLOAD_BYTES, 33_554_432);
+    }
+    #[test]
+    fn sanitize_upload_file_name_rejects_structural_attacks() {
+        let cases = [
+            "",
+            "   ",
+            "..",
+            ".",
+            "../secret.txt",
+            "..\\secret.txt",
+            "nested/report.pdf",
+            "nested\\report.pdf",
+            "report\u{0}.pdf",
+            "report\n.pdf",
+        ];
+        for raw in cases {
+            assert!(
+                sanitize_upload_file_name(raw).is_err(),
+                "expected {raw:?} to be rejected"
+            );
+        }
+    }
+    #[test]
+    fn sanitize_upload_file_name_narrows_survivors() {
+        let long = format!("{}.txt", "a".repeat(200));
+        let cases: [(&str, String); 7] = [
+            ("report.pdf", "report.pdf".to_string()),
+            ("my report (1).pdf", "my_report__1_.pdf".to_string()),
+            (".env", "env".to_string()),
+            ("-rf", "rf".to_string()),
+            ("CON.txt", "_CON.txt".to_string()),
+            ("发票.pdf", "__.pdf".to_string()),
+            (long.as_str(), format!("{}.txt", "a".repeat(124))),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                sanitize_upload_file_name(raw).unwrap(),
+                expected,
+                "raw={raw:?}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn upload_field_over_limit_is_rejected_and_leaves_no_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("big.bin");
+
+        let mut multipart = build_test_multipart("big.bin", &[b'x'; 64]).await;
+        let mut field = multipart.next_field().await.unwrap().unwrap();
+
+        let outcome = write_upload_field(&mut field, &dest, 8).await;
+        assert!(matches!(outcome, Err(UploadWriteError::TooLarge)));
+        assert!(!dest.exists(), "partial upload must not survive rejection");
+    }
+    #[tokio::test]
+    async fn upload_field_within_limit_is_written_verbatim() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("note.txt");
+
+        let mut multipart = build_test_multipart("note.txt", b"hello zeroclaw").await;
+        let mut field = multipart.next_field().await.unwrap().unwrap();
+
+        let size = write_upload_field(&mut field, &dest, 1024).await.unwrap();
+        assert_eq!(size, 14);
+        let written = String::from_utf8(tokio::fs::read(&dest).await.unwrap()).unwrap();
+        assert_eq!(written, "hello zeroclaw");
+    }
+    #[tokio::test]
+    async fn upload_stores_file_under_workspace_uploads() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, state) = upload_fixture(
+            &temp,
+            PairingGuard::new(false, &[]),
+            GatewayRateLimiter::new(100, 100, 100),
+        );
+
+        let multipart = build_test_multipart("report.md", b"# hello").await;
+        let response = handle_api_upload(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(multipart),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "stored");
+        assert_eq!(parsed["path"], "uploads/report.md");
+        assert_eq!(parsed["file_name"], "report.md");
+        assert_eq!(parsed["size"], 7);
+        assert_eq!(parsed["content_type"], "text/markdown; charset=utf-8");
+        assert!(parsed["absolute_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("report.md"));
+        assert!(parsed["download_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://gateway.test/download/uploads%2Freport.md?expires="));
+
+        let stored = String::from_utf8(
+            tokio::fs::read(workspace.join("uploads").join("report.md"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored, "# hello");
+    }
+    #[tokio::test]
+    async fn upload_rejects_path_traversal_file_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, state) = upload_fixture(
+            &temp,
+            PairingGuard::new(false, &[]),
+            GatewayRateLimiter::new(100, 100, 100),
+        );
+
+        let multipart = build_test_multipart("../../etc/passwd", b"root:x:0:0").await;
+        let response = handle_api_upload(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(multipart),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let mut entries = tokio::fs::read_dir(workspace.join("uploads"))
+            .await
+            .unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "a rejected traversal must not write anything"
+        );
+        assert!(!temp.path().join("etc").exists());
+    }
+    #[tokio::test]
+    async fn upload_requires_bearer_token_when_pairing_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, state) = upload_fixture(
+            &temp,
+            PairingGuard::new(true, &[]),
+            GatewayRateLimiter::new(100, 100, 100),
+        );
+
+        let multipart = build_test_multipart("report.md", b"# hello").await;
+        let response = handle_api_upload(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(multipart),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !workspace.join("uploads").exists(),
+            "auth must be checked before any filesystem work"
+        );
+    }
+    #[tokio::test]
+    async fn upload_rate_limit_returns_429() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_workspace, state) = upload_fixture(
+            &temp,
+            PairingGuard::new(false, &[]),
+            GatewayRateLimiter::new(100, 1, 100),
+        );
+
+        let first = handle_api_upload(
+            State(state.clone()),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(build_test_multipart("a.txt", b"a").await),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = handle_api_upload(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(build_test_multipart("b.txt", b"b").await),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    #[tokio::test]
+    async fn upload_never_overwrites_an_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, state) = upload_fixture(
+            &temp,
+            PairingGuard::new(false, &[]),
+            GatewayRateLimiter::new(100, 100, 100),
+        );
+        tokio::fs::create_dir_all(workspace.join("uploads"))
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("uploads").join("note.txt"), b"original")
+            .await
+            .unwrap();
+
+        let response = handle_api_upload(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(build_test_multipart("note.txt", b"replacement").await),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let stored_name = parsed["file_name"].as_str().unwrap();
+        assert_ne!(stored_name, "note.txt");
+        assert!(stored_name.starts_with("note-") && stored_name.ends_with(".txt"));
+
+        let untouched = String::from_utf8(
+            tokio::fs::read(workspace.join("uploads").join("note.txt"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(untouched, "original");
     }
 
     #[tokio::test]
