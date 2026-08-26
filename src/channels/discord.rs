@@ -104,87 +104,17 @@ async fn process_attachments(
     parts.join("\n---\n")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DiscordAttachmentKind {
-    Image,
-    Document,
-    Video,
-    Audio,
-    Voice,
-}
+/// Discord-local names for the shared outbound attachment-marker types.
+///
+/// The enum, the struct and the parser all live in the parent module so the
+/// Discord and Telegram marker vocabularies cannot drift apart. See the
+/// matching aliases in `telegram.rs`.
+type DiscordAttachmentKind = super::AttachmentMarkerKind;
+type DiscordAttachment = super::AttachmentMarker;
 
-impl DiscordAttachmentKind {
-    fn from_marker(kind: &str) -> Option<Self> {
-        match kind.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
-            _ => None,
-        }
-    }
-
-    fn marker_name(&self) -> &'static str {
-        match self {
-            Self::Image => "IMAGE",
-            Self::Document => "DOCUMENT",
-            Self::Video => "VIDEO",
-            Self::Audio => "AUDIO",
-            Self::Voice => "VOICE",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiscordAttachment {
-    kind: DiscordAttachmentKind,
-    target: String,
-}
-
+/// Delegate to the shared `parse_attachment_markers` in the parent module.
 fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(rel_start) = message[cursor..].find('[') {
-        let start = cursor + rel_start;
-        cleaned.push_str(&message[cursor..start]);
-
-        let Some(rel_end) = message[start..].find(']') else {
-            cleaned.push_str(&message[start..]);
-            cursor = message.len();
-            break;
-        };
-        let end = start + rel_end;
-        let marker_text = &message[start + 1..end];
-
-        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
-            let kind = DiscordAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(DiscordAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[start..=end]);
-        }
-
-        cursor = end + 1;
-    }
-
-    if cursor < message.len() {
-        cleaned.push_str(&message[cursor..]);
-    }
-
-    (cleaned.trim().to_string(), attachments)
+    super::parse_attachment_markers(message)
 }
 
 fn classify_outgoing_attachments(

@@ -126,33 +126,14 @@ fn build_telegram_ack_reaction_request(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TelegramAttachmentKind {
-    Image,
-    Document,
-    Video,
-    Audio,
-    Voice,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TelegramAttachment {
-    kind: TelegramAttachmentKind,
-    target: String,
-}
-
-impl TelegramAttachmentKind {
-    fn from_marker(marker: &str) -> Option<Self> {
-        match marker.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
-            _ => None,
-        }
-    }
-}
+/// Telegram-local names for the shared outbound attachment-marker types.
+///
+/// The enum, the struct and the parser all live in the parent module so the
+/// Telegram and Discord marker vocabularies cannot drift apart. Aliasing —
+/// rather than renaming every use site — mirrors the `strip_tool_call_tags`
+/// delegate below: the channel keeps its own vocabulary, the logic is shared.
+type TelegramAttachmentKind = super::AttachmentMarkerKind;
+type TelegramAttachment = super::AttachmentMarker;
 
 /// Check whether a file path has a recognized image extension.
 fn is_image_extension(path: &Path) -> bool {
@@ -246,50 +227,9 @@ fn strip_tool_call_tags(message: &str) -> String {
     super::strip_tool_call_tags(message)
 }
 
+/// Delegate to the shared `parse_attachment_markers` in the parent module.
 fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0;
-
-    while cursor < message.len() {
-        let Some(open_rel) = message[cursor..].find('[') else {
-            cleaned.push_str(&message[cursor..]);
-            break;
-        };
-
-        let open = cursor + open_rel;
-        cleaned.push_str(&message[cursor..open]);
-
-        let Some(close_rel) = message[open..].find(']') else {
-            cleaned.push_str(&message[open..]);
-            break;
-        };
-
-        let close = open + close_rel;
-        let marker = &message[open + 1..close];
-
-        let parsed = marker.split_once(':').and_then(|(kind, target)| {
-            let kind = TelegramAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(TelegramAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[open..=close]);
-        }
-
-        cursor = close + 1;
-    }
-
-    (cleaned.trim().to_string(), attachments)
+    super::parse_attachment_markers(message)
 }
 
 /// Telegram Bot API maximum file download size (20 MB).

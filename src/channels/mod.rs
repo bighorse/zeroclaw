@@ -464,6 +464,113 @@ fn strip_tool_call_tags(message: &str) -> String {
     result.trim().to_string()
 }
 
+/// Kind of outbound attachment referenced by an `[KIND:target]` marker in an
+/// LLM response.
+///
+/// Shared by every channel that renders outbound attachment markers so the
+/// accepted marker vocabulary cannot drift between platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachmentMarkerKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+    Voice,
+}
+
+impl AttachmentMarkerKind {
+    /// Map a marker label to its kind. Surrounding whitespace is ignored and
+    /// matching is case-insensitive. Unknown labels return `None` so the
+    /// caller leaves the bracketed text in the message body untouched.
+    pub(crate) fn from_marker(marker: &str) -> Option<Self> {
+        match marker.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            "VOICE" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+
+    /// Canonical marker label, used when re-rendering an unresolved marker
+    /// back into message text.
+    ///
+    /// Takes `self` by value: the enum is `Copy`, and `&self` would trip
+    /// `clippy::trivially_copy_pass_by_ref` under the crate's pedantic lints.
+    pub(crate) fn marker_name(self) -> &'static str {
+        match self {
+            Self::Image => "IMAGE",
+            Self::Document => "DOCUMENT",
+            Self::Video => "VIDEO",
+            Self::Audio => "AUDIO",
+            Self::Voice => "VOICE",
+        }
+    }
+}
+
+/// One parsed `[KIND:target]` marker.
+///
+/// `target` is either a local filesystem path or an `http(s)` URL. It is not
+/// validated here — resolution and any path-safety checks belong to the
+/// channel that actually opens the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttachmentMarker {
+    pub(crate) kind: AttachmentMarkerKind,
+    pub(crate) target: String,
+}
+
+/// Split an outbound message into its text body and its attachment markers.
+///
+/// Bracketed text that does not parse as a supported marker is preserved in
+/// the returned body verbatim, so ordinary prose like `[see notes]` and
+/// markdown links survive untouched. The returned body is trimmed.
+pub(crate) fn parse_attachment_markers(message: &str) -> (String, Vec<AttachmentMarker>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some(open_rel) = message[cursor..].find('[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let open = cursor + open_rel;
+        cleaned.push_str(&message[cursor..open]);
+
+        let Some(close_rel) = message[open..].find(']') else {
+            cleaned.push_str(&message[open..]);
+            break;
+        };
+
+        let close = open + close_rel;
+        let marker = &message[open + 1..close];
+
+        let parsed = marker.split_once(':').and_then(|(kind, target)| {
+            let kind = AttachmentMarkerKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(AttachmentMarker {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[open..=close]);
+        }
+
+        cursor = close + 1;
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "matrix" => Some(
@@ -3913,6 +4020,84 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    #[test]
+    fn parse_attachment_markers_extracts_supported_kinds() {
+        let cases: &[(&str, AttachmentMarkerKind)] = &[
+            ("[IMAGE:/tmp/a.png]", AttachmentMarkerKind::Image),
+            ("[photo:/tmp/a.png]", AttachmentMarkerKind::Image),
+            ("[ DOCUMENT :/tmp/a.pdf]", AttachmentMarkerKind::Document),
+            ("[FILE:/tmp/a.pdf]", AttachmentMarkerKind::Document),
+            ("[VIDEO:/tmp/a.mp4]", AttachmentMarkerKind::Video),
+            ("[AUDIO:/tmp/a.mp3]", AttachmentMarkerKind::Audio),
+            ("[VOICE:/tmp/a.ogg]", AttachmentMarkerKind::Voice),
+        ];
+
+        for &(input, expected) in cases {
+            let (cleaned, attachments) = parse_attachment_markers(input);
+            assert_eq!(cleaned, "", "input: {input}");
+            assert_eq!(attachments.len(), 1, "input: {input}");
+            assert_eq!(attachments[0].kind, expected, "input: {input}");
+        }
+    }
+    #[test]
+    fn parse_attachment_markers_matches_legacy_channel_behaviour() {
+        // Every branch where the previously duplicated Telegram and Discord
+        // parsers could have diverged: text before the first marker, text
+        // after the last marker, an unsupported marker, an unclosed bracket,
+        // an empty target, no bracket at all, and the empty message.
+        let cases: &[(&str, &str, usize)] = &[
+            (
+                "Here are files [IMAGE:/tmp/a.png] and [DOCUMENT:https://example.com/a.pdf]",
+                "Here are files  and",
+                2,
+            ),
+            (
+                "Report [UNKNOWN:/tmp/a.bin]",
+                "Report [UNKNOWN:/tmp/a.bin]",
+                0,
+            ),
+            ("[IMAGE:/tmp/a.png] trailing tail", "trailing tail", 1),
+            ("prefix [IMAGE:/tmp/a.png", "prefix [IMAGE:/tmp/a.png", 0),
+            ("[IMAGE:]", "[IMAGE:]", 0),
+            ("plain text, no brackets", "plain text, no brackets", 0),
+            ("", "", 0),
+        ];
+
+        for &(input, expected_text, expected_count) in cases {
+            let (cleaned, attachments) = parse_attachment_markers(input);
+            assert_eq!(cleaned, expected_text, "input: {input:?}");
+            assert_eq!(attachments.len(), expected_count, "input: {input:?}");
+        }
+    }
+    #[test]
+    fn parse_attachment_markers_is_utf8_safe_around_markers() {
+        let (cleaned, attachments) =
+            parse_attachment_markers("图片来了 [IMAGE:/tmp/图 表.png] 请查收");
+
+        assert_eq!(cleaned, "图片来了  请查收");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, AttachmentMarkerKind::Image);
+        assert_eq!(attachments[0].target, "/tmp/图 表.png");
+    }
+    #[test]
+    fn attachment_marker_kind_marker_name_round_trips() {
+        let kinds = [
+            AttachmentMarkerKind::Image,
+            AttachmentMarkerKind::Document,
+            AttachmentMarkerKind::Video,
+            AttachmentMarkerKind::Audio,
+            AttachmentMarkerKind::Voice,
+        ];
+
+        for kind in kinds {
+            assert_eq!(
+                AttachmentMarkerKind::from_marker(kind.marker_name()),
+                Some(kind),
+                "kind: {kind:?}"
+            );
+        }
     }
 
     #[test]
