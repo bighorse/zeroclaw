@@ -775,6 +775,12 @@ pub async fn run_gateway(
         .route("/api/status", get(api::handle_api_status))
         .route("/api/sop/runs", get(api::handle_api_sop_runs))
         .route("/api/capabilities", get(api::handle_api_capabilities))
+        .route("/api/tasks", get(api::handle_api_tasks))
+        .route("/api/tasks/{run_id}", get(api::handle_api_task_detail))
+        .route(
+            "/api/tasks/{run_id}/evidence/{eid}",
+            get(api::handle_api_task_evidence),
+        )
         .route("/api/config", get(api::handle_api_config_get))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))

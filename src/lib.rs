@@ -54,6 +54,8 @@ pub(crate) mod heartbeat;
 pub mod hooks;
 pub(crate) mod identity;
 pub(crate) mod integrations;
+/// 任务证据台账（读取层，建立在 runtime_trace 之上）
+pub mod ledger;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;

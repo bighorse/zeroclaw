@@ -64,6 +64,7 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
+mod ledger;
 mod memory;
 mod migration;
 mod multimodal;

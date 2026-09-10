@@ -1127,6 +1127,200 @@ pub async fn handle_api_capabilities(
     .into_response()
 }
 
+// ── P1a：任务档案与证据台账 ────────────────────────────────────────
+
+/// 解析当前 trace 配置：证据台账建立在它之上。
+fn trace_setup(state: &AppState) -> (std::path::PathBuf, bool) {
+    let cfg = state.config.lock();
+    let mode = crate::observability::runtime_trace::storage_mode_from_config(&cfg.observability);
+    let path = crate::observability::runtime_trace::resolve_trace_path(
+        &cfg.observability,
+        &cfg.workspace_dir,
+    );
+    (
+        path,
+        mode == crate::observability::runtime_trace::RuntimeTraceStorageMode::Full,
+    )
+}
+
+/// GET /api/tasks — 任务档案列表（每条带证据条数，供前台核对"这一单有没有依据"）。
+///
+/// 与 /api/sop/runs 的区别：这里以「任务」为单位，附带证据统计与台账可用性，
+/// 并且把已结束的 run 一并返回——「从活跃列表消失」不等于成功，客户端不该靠推断。
+pub async fn handle_api_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (trace_path, full) = trace_setup(&state);
+    let avail = crate::ledger::availability(&trace_path, full);
+
+    let runs: Vec<serde_json::Value> = {
+        let engine = state.sop_engine.lock().unwrap();
+        let mut all: Vec<&crate::sop::types::SopRun> = engine.active_runs().values().collect();
+        all.extend(engine.finished_runs(None));
+        all.into_iter()
+            .map(|r| {
+                let turn = if avail.available {
+                    crate::ledger::turn_for_run(&trace_path, &r.run_id)
+                } else {
+                    None
+                };
+                let evidence_count = turn
+                    .as_ref()
+                    .map(|t| {
+                        crate::ledger::evidence_for_turn(&trace_path, t)
+                            .iter()
+                            .filter(|e| {
+                                e.source_class == crate::ledger::SourceClass::External
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "task_id": r.run_id,
+                    "run_id": r.run_id,
+                    "sop_name": r.sop_name,
+                    "sop_version": engine.get_sop(&r.sop_name).map(|s| s.version.clone()),
+                    "status": r.status,
+                    "current_step": r.current_step,
+                    "total_steps": r.total_steps,
+                    "started_at": r.started_at,
+                    "waiting_since": r.waiting_since,
+                    "completed_at": r.completed_at,
+                    "trigger_payload": r.trigger_event.payload.as_ref().map(|p| p.chars().take(1500).collect::<String>()),
+                    "turn_id": turn,
+                    "external_evidence_count": evidence_count,
+                })
+            })
+            .collect()
+    };
+
+    Json(serde_json::json!({
+        "api": "frontdesk",
+        "api_version": 1,
+        "ledger": avail,
+        "tasks": runs,
+    }))
+    .into_response()
+}
+
+/// GET /api/tasks/{run_id} — 单个任务档案：run 状态 + 本轮全部工具调用（证据）。
+pub async fn handle_api_task_detail(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (trace_path, full) = trace_setup(&state);
+    let avail = crate::ledger::availability(&trace_path, full);
+
+    let run_json = {
+        let engine = state.sop_engine.lock().unwrap();
+        let Some(r) = engine.get_run(&run_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"run not found","run_id":run_id})),
+            )
+                .into_response();
+        };
+        let step_info = engine
+            .get_sop(&r.sop_name)
+            .and_then(|sop| sop.steps.iter().find(|st| st.number == r.current_step))
+            .map(|st| serde_json::json!({"title": st.title, "body": st.body}));
+        serde_json::json!({
+            "task_id": r.run_id,
+            "run_id": r.run_id,
+            "sop_name": r.sop_name,
+            "sop_version": engine.get_sop(&r.sop_name).map(|s| s.version.clone()),
+            "status": r.status,
+            "current_step": r.current_step,
+            "total_steps": r.total_steps,
+            "current_step_info": step_info,
+            "started_at": r.started_at,
+            "waiting_since": r.waiting_since,
+            "completed_at": r.completed_at,
+            "trigger_payload": r.trigger_event.payload.clone(),
+            "step_results": r.step_results.iter().map(|sr| serde_json::json!({
+                "step": sr.step_number,
+                "output": sr.output.chars().take(2000).collect::<String>(),
+            })).collect::<Vec<_>>(),
+        })
+    };
+
+    let turn = if avail.available {
+        crate::ledger::turn_for_run(&trace_path, &run_id)
+    } else {
+        None
+    };
+    let evidence = turn
+        .as_ref()
+        .map(|t| crate::ledger::evidence_for_turn(&trace_path, t))
+        .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "api": "frontdesk",
+        "api_version": 1,
+        "ledger": avail,
+        "task": run_json,
+        "turn_id": turn,
+        "evidence": evidence,
+        // 说清楚这批证据是什么、不是什么——界面直接引用这句，不要另行编写
+        "evidence_note": "以下为该任务所在对话轮中被记录到的工具调用。只有 source_class = external 的可作为对外依据；local_file 可能读的是既有缓存，self 为助手自产。未被记录的调用不在此列。",
+    }))
+    .into_response()
+}
+
+/// GET /api/tasks/{run_id}/evidence/{eid} — 证据全文。
+/// 只走 Bearer 鉴权的 JSON，**不发签名 URL**：签名链接会被转发、被贴进聊天，
+/// 而这里的内容可能含患者数据。
+pub async fn handle_api_task_evidence(
+    State(state): State<AppState>,
+    Path((run_id, eid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (trace_path, full) = trace_setup(&state);
+    let avail = crate::ledger::availability(&trace_path, full);
+    if !avail.available {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"api":"frontdesk","ledger":avail})),
+        )
+            .into_response();
+    }
+    let Some(turn) = crate::ledger::turn_for_run(&trace_path, &run_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"该任务没有可关联的对话轮记录","run_id":run_id})),
+        )
+            .into_response();
+    };
+    match crate::ledger::evidence_full(&trace_path, &turn, &eid) {
+        Some((meta, full_text)) => Json(serde_json::json!({
+            "api": "frontdesk",
+            "api_version": 1,
+            "evidence": meta,
+            "output": full_text,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "证据不存在或内容哈希不匹配（记录可能已被改动或轮转）",
+                "eid": eid,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// `/api/sop/runs` 的查询参数。
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct SopRunsQuery {
