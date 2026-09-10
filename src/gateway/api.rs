@@ -1224,7 +1224,15 @@ pub async fn handle_api_task_detail(
         let Some(r) = engine.get_run(&run_id) else {
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error":"run not found","run_id":run_id})),
+                // 带上 frontdesk 标记：客户端要能把「端点存在、这条 run 已不在」
+                // 和「这台 daemon 根本没有该端点（旧版本）」区分开——否则界面只能
+                // 笼统说「服务端版本较旧」，把原因说错。
+                Json(serde_json::json!({
+                    "api": "frontdesk",
+                    "api_version": 1,
+                    "error": "run not found",
+                    "run_id": run_id,
+                })),
             )
                 .into_response();
         };
