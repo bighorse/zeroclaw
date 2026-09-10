@@ -1030,6 +1030,28 @@ fn hydrate_config_for_save(
     incoming
 }
 
+/// 步骤条标签：取标题前 4 个字符；若因此切在半个 ASCII 词里，就把结尾这段 ASCII 去掉。
+fn short_label(title: &str) -> String {
+    let head: String = title.chars().take(4).collect();
+    let full: Vec<char> = title.chars().collect();
+    let cut_mid_word = full.len() > 4
+        && head
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && full[4].is_ascii_alphanumeric();
+    if cut_mid_word {
+        let trimmed: String = head
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric())
+            .trim()
+            .to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    head.trim().to_string()
+}
+
 /// GET /api/capabilities — 本助手能执行什么（规程 + 技能），供前台「新任务」与「助手概况」用。
 ///
 /// 响应带 `{"api":"frontdesk","api_version":1}` 标记：gateway 对未匹配的 GET 走 SPA fallback
@@ -1056,8 +1078,9 @@ pub async fn handle_api_capabilities(
                         serde_json::json!({
                             "num": st.number,
                             "title": st.title,
-                            // 步骤条标签取标题前 4 字；正文不外泄（可能含患者信息与内部指令）
-                            "short": st.title.chars().take(4).collect::<String>(),
+                            // 步骤条标签：标题前 4 字，但不切在半个英文词上
+                            // （「检索 PubMed 指南」截成「检索 P」很难看且无意义）
+                            "short": short_label(&st.title),
                             "human": st.requires_confirmation,
                         })
                     })
@@ -1259,6 +1282,14 @@ mod frontdesk_v6_tests {
         assert!(e.get_run(&run_id).is_some());
         e.cancel_run(&run_id).expect("cancel");
         assert!(e.get_run(&run_id).is_some(), "结束后仍应可查");
+    }
+
+    #[test]
+    fn step_short_label_does_not_cut_mid_word() {
+        assert_eq!(super::short_label("解析病例资料"), "解析病例");
+        assert_eq!(super::short_label("检索 PubMed 指南"), "检索"); // 不要「检索 P」
+        assert_eq!(super::short_label("审核确认"), "审核确认");
+        assert_eq!(super::short_label("PubMed"), "PubM"); // 全 ASCII 时保留前 4 字符
     }
 
     #[test]
