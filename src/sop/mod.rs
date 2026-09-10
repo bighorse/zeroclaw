@@ -106,10 +106,16 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
     let toml_content = std::fs::read_to_string(&toml_path)?;
     let manifest: SopManifest = toml::from_str(&toml_content)?;
 
+    let strict_steps = manifest
+        .sop
+        .step_parser
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("strict"))
+        .unwrap_or(false);
     let md_path = sop_dir.join("SOP.md");
     let steps = if md_path.exists() {
         let md_content = std::fs::read_to_string(&md_path)?;
-        parse_steps(&md_content)
+        parse_steps_with_mode(&md_content, strict_steps)
     } else {
         Vec::new()
     };
@@ -123,6 +129,7 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         cooldown_secs,
         max_concurrent,
         deterministic,
+        step_parser: _,
     } = manifest.sop;
 
     // When deterministic=true, override execution_mode to Deterministic
@@ -155,8 +162,20 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
 /// Each item's first bold text (`**...**`) is the step title; the rest is body.
 /// Sub-bullets `- tools:` and `- requires_confirmation: true` are parsed.
 pub fn parse_steps(md: &str) -> Vec<SopStep> {
+    parse_steps_with_mode(md, false)
+}
+
+/// 同 `parse_steps`，但 `strict = true` 时只把顶格（无缩进）的编号项当作步骤。
+///
+/// legacy 模式对每行先 trim 再判编号，于是 notes 里缩进的编号子项也成了步骤；
+/// 每遇到"新步骤"就会重置 `requires_confirmation`，导致人工审批门被静默丢弃。
+pub fn parse_steps_with_mode(md: &str, strict: bool) -> Vec<SopStep> {
     let mut steps = Vec::new();
     let mut in_steps_section = false;
+    // strict：围栏代码块内的内容一律不参与解析。真实 SOP 常在步骤里贴产物模板，
+    // 模板里的 `## 1. 病例摘要` 会被 legacy 当成"新的二级标题"从而**提前结束步骤解析**，
+    // 后面的步骤（含人工审批门）直接不存在。case-clinical-report 实测即如此。
+    let mut in_code_fence = false;
     let mut current_number: Option<u32> = None;
     let mut current_title = String::new();
     let mut current_body = String::new();
@@ -167,8 +186,31 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
     for line in md.lines() {
         let trimmed = line.trim();
 
-        // Detect ## Steps heading
-        if trimmed.starts_with("## ") {
+        if strict {
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_code_fence = !in_code_fence;
+                if in_steps_section && current_number.is_some() {
+                    current_body.push_str(line);
+                    current_body.push('\n');
+                }
+                continue;
+            }
+            if in_code_fence {
+                if in_steps_section && current_number.is_some() {
+                    current_body.push_str(line);
+                    current_body.push('\n');
+                }
+                continue;
+            }
+        }
+
+        // Detect ## Steps heading（strict 下只认顶格标题：缩进的 `## …` 是正文）
+        let is_heading = if strict {
+            !line.starts_with(char::is_whitespace) && trimmed.starts_with("## ")
+        } else {
+            trimmed.starts_with("## ")
+        };
+        if is_heading {
             if trimmed.eq_ignore_ascii_case("## steps") || trimmed.eq_ignore_ascii_case("## Steps")
             {
                 in_steps_section = true;
@@ -196,7 +238,13 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
         }
 
         // Check for numbered item: `1.`, `2.`, etc.
-        if let Some(rest) = parse_numbered_item(trimmed) {
+        // strict：只认顶格的编号项，缩进的一律视为正文（notes 子项）
+        let numbered = if strict && line.starts_with(char::is_whitespace) {
+            None
+        } else {
+            parse_numbered_item(trimmed)
+        };
+        if let Some(rest) = numbered {
             // Flush previous step
             flush_step(
                 &mut steps,
@@ -548,6 +596,59 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn strict_mode_keeps_the_human_gate_that_legacy_drops() {
+        // 取自真实生产 SOP case-clinical-report 的骨架。两个 legacy 缺陷：
+        //  ① 缩进的 notes 编号项被当成步骤（步数被放大）
+        //  ② 步骤里贴的产物模板含 `## 标题`，被当成"新的二级标题"→ **步骤解析提前终止**，
+        //     其后的第 4 步（人工审批门）与第 5 步根本不存在
+        // 线上就是 ②：5 步被解析成 14 步且人工门为空。
+        // 注意：必须用顶格的原始字符串。Rust 字符串行尾反斜杠会把下一行的前导空格
+        // 一并吃掉，缩进消失后这个夹具就测不出「缩进项不算步骤」了（本测试踩过）。
+        let md = r#"## Steps
+1. **解析病例资料** — 提取关键信息。
+   - notes:
+      1. 先做入口校验。
+      2. 再解析文字。
+2. **检索 PubMed 指南** — 调用硬化技能。
+   - notes:
+      1. 结果写入笔记，格式：
+         ```markdown
+         # 文献检索笔记
+         ## 指南
+         ## 系统综述
+         ```
+3. **生成结构化报告** — 融合病例与文献。
+4. **审核确认** — 呈送审核人。
+   - tools: （仅 narrate）
+   - requires_confirmation: true
+   - notes:
+      1. 不得代签。
+5. **报告交付** — 生成正式版。
+"#;
+
+        let legacy = parse_steps_with_mode(md, false);
+        let strict = parse_steps_with_mode(md, true);
+
+        // legacy 的现状：代码块里的 `## 指南` 让解析在第 2 步就结束，
+        // 第 4 步的人工门连同第 5 步一起消失。
+        assert!(
+            !legacy.iter().any(|s| s.requires_confirmation),
+            "legacy 解析不出人工审批门——线上的「必须审核人确认」形同虚设"
+        );
+        assert!(
+            !legacy.iter().any(|s| s.title == "报告交付"),
+            "legacy 在代码块的 ## 处提前终止，最后的步骤不存在"
+        );
+
+        // strict：步数正确，人工门落在第 4 步
+        assert_eq!(strict.len(), 5, "strict 只认顶格编号项，且跳过围栏代码块");
+        assert_eq!(strict[3].title, "审核确认");
+        assert!(strict[3].requires_confirmation, "第 4 步必须是人工确认门");
+        assert_eq!(strict.iter().filter(|s| s.requires_confirmation).count(), 1);
+        assert_eq!(strict[4].title, "报告交付");
+    }
 
     #[test]
     fn parse_steps_basic() {

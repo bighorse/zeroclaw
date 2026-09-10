@@ -217,6 +217,15 @@ pub(crate) struct SopMeta {
     /// Opt-in deterministic execution (no LLM round-trips between steps).
     #[serde(default)]
     pub deterministic: bool,
+    /// 步骤解析模式。默认 `legacy`（与历史行为完全一致，绝不改变任何在跑的 SOP）；
+    /// `strict` 只把**顶格**的编号项当步骤。
+    ///
+    /// 为什么需要它：legacy 解析在判定编号前先 trim 掉缩进，于是 notes 里缩进的
+    /// `1. 2. 3.` 也被当成步骤，把真步骤挤走，**并且把该步的 requires_confirmation
+    /// 一起丢掉**——人工审批门就此静默消失。已在真实 SOP case-clinical-report 上实测：
+    /// 5 步被解析成 14 步、人工门为空。
+    #[serde(default)]
+    pub step_parser: Option<String>,
 }
 
 fn default_sop_version() -> String {

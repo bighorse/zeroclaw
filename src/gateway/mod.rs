@@ -762,6 +762,7 @@ pub async fn run_gateway(
         .route("/webhook", post(handle_webhook))
         .route("/sop/approve/{run_id}", post(handle_sop_approve))
         .route("/sop/reject/{run_id}", post(handle_sop_reject))
+        .route("/sop/cancel/{run_id}", post(handle_sop_cancel))
         .route("/sop/{*rest}", post(handle_sop_webhook))
         .route("/api/chat", post(handle_api_chat))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -773,6 +774,7 @@ pub async fn run_gateway(
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/sop/runs", get(api::handle_api_sop_runs))
+        .route("/api/capabilities", get(api::handle_api_capabilities))
         .route("/api/config", get(api::handle_api_config_get))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
@@ -1714,10 +1716,74 @@ async fn handle_webhook(
 ///
 /// Note: this endpoint exists because `SopApproveTool` is intentionally
 /// NOT exposed to the LLM — the dual-sign quality gate would be
+/// 不可逆动作的乐观并发参数：客户端把它「以为」正在等批的步号带上，
+/// 服务端不符即 409，避免在状态已变之后照旧执行（批准与驳回都无法回滚）。
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct StepGuardQuery {
+    #[serde(default)]
+    pub expect_step: Option<u32>,
+}
+
+/// POST /sop/cancel/{run_id} — 终止一个仍在跑的 run（尚未走到审批门时用）。
+///
+/// 与 reject 的区别只在适用状态：reject 针对等待审批的 run，cancel 针对进行中的 run。
+/// 两者都会 finish_run(Cancelled)，都不可撤回。
+async fn handle_sop_cancel(
+    State(state): State<AppState>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        let err = serde_json::json!({"error":"rate limit exceeded"});
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            let err = serde_json::json!({"error":"Unauthorized"});
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    let result = {
+        let mut engine = match state.sop_engine.lock() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("SOP cancel: engine lock poisoned: {e}");
+                let err = serde_json::json!({"error":"engine lock poisoned"});
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+            }
+        };
+        engine.cancel_run(&run_id)
+    };
+
+    match result {
+        Ok(()) => {
+            tracing::info!(run_id = %run_id, "SOP cancel: run cancelled by user");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status":"cancelled","run_id":run_id})),
+            )
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e.to_string(), "run_id": run_id})),
+        ),
+    }
+}
+
 /// trivially defeated if the LLM could self-approve.
 async fn handle_sop_approve(
     State(state): State<AppState>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<StepGuardQuery>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -1751,6 +1817,19 @@ async fn handle_sop_approve(
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
             }
         };
+        // 乐观并发：客户端带上它「以为」正在等批的步号。批准会立刻 spawn 续跑且无法回滚，
+        // 所以状态一旦变过（超时自动推进、别的设备已批），宁可 409 让用户重新看一眼。
+        if let Some(expect) = q.expect_step {
+            let actual = engine.get_run(&run_id).map(|r| r.current_step);
+            if actual != Some(expect) {
+                let err = serde_json::json!({
+                    "error": "step moved",
+                    "expected": expect,
+                    "actual": actual,
+                });
+                return (StatusCode::CONFLICT, Json(err));
+            }
+        }
         engine.approve_step(&run_id)
     };
 
@@ -1856,6 +1935,7 @@ pub(crate) fn push_recent_sop_result(
 async fn handle_sop_reject(
     State(state): State<AppState>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<StepGuardQuery>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
@@ -1896,6 +1976,17 @@ async fn handle_sop_reject(
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
             }
         };
+        if let Some(expect) = q.expect_step {
+            let actual = engine.get_run(&run_id).map(|r| r.current_step);
+            if actual != Some(expect) {
+                let err = serde_json::json!({
+                    "error": "step moved",
+                    "expected": expect,
+                    "actual": actual,
+                });
+                return (StatusCode::CONFLICT, Json(err));
+            }
+        }
         engine.reject_step(&run_id, reason.clone())
     };
 
@@ -2196,6 +2287,9 @@ struct SopStartedSignal {
     any_tool_started: std::sync::atomic::AtomicBool,
     /// SSE broadcast：把 SOP 执行结果实时推给前台客户端（sop_result 事件）。
     event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    /// 与续跑结果同一个补发缓冲：首段汇报也必须能在重连后补发，
+    /// 否则用户批准前切走一次，这份结果就永久消失了。
+    recent_sop_results: Option<Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>>,
 }
 
 impl SopStartedSignal {
@@ -2206,6 +2300,7 @@ impl SopStartedSignal {
         webhook_secret: Option<String>,
         owner_openid: Option<String>,
         event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+        recent_sop_results: Option<Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>>,
     ) -> Self {
         Self {
             inner,
@@ -2216,6 +2311,7 @@ impl SopStartedSignal {
             sop_name_started: parking_lot::Mutex::new(None),
             any_tool_started: std::sync::atomic::AtomicBool::new(false),
             event_tx,
+            recent_sop_results,
         }
     }
 
@@ -2301,14 +2397,22 @@ impl crate::observability::Observer for SopStartedSignal {
                         "openid": self.owner_openid,
                         "response_text": response_text,
                     }));
-                    // 前台客户端经 SSE 实时收到执行结果（否则早返回后结果无人接收）
+                    // 前台客户端经 SSE 实时收到执行结果（否则早返回后结果无人接收）。
+                    // 必须带稳定 id 并进补发缓冲：客户端靠 id 去重，靠补发在断线/锁屏后补齐——
+                    // 缺了它，这一段汇报要么重复上屏，要么彻底丢失。
                     if let Some(tx) = &self.event_tx {
-                        let _ = tx.send(serde_json::json!({
+                        let ts = chrono::Utc::now().timestamp();
+                        let ev = serde_json::json!({
                             "type": "sop_result",
+                            "id": format!("{sop_name}:{ts}"),
                             "sop_name": sop_name,
                             "response": response_text,
-                            "timestamp": chrono::Utc::now().timestamp(),
-                        }));
+                            "timestamp": ts,
+                        });
+                        if let Some(recent) = &self.recent_sop_results {
+                            push_recent_sop_result(recent, ev.clone());
+                        }
+                        let _ = tx.send(ev);
                     }
                 }
             }
@@ -2455,6 +2559,7 @@ async fn handle_api_chat(
         webhook_secret,
         owner_openid,
         Some(state.event_tx.clone()),
+        Some(state.recent_sop_results.clone()),
     ));
     let signal_obs_bg = signal_obs.clone();
     let history_store = state.api_chat_history.clone();
@@ -2551,6 +2656,10 @@ async fn handle_api_chat(
 
     let _ = (provider_label, model_label);
 
+    // 本轮 id：客户端据此把「我刚发的这一轮」与随后出现的 run / 汇报对上。
+    // /api/chat 此前不返回任何可关联的标识，客户端只能靠轮询做集合差，很脆。
+    let turn_id = format!("turn-{}", chrono::Utc::now().timestamp_millis());
+
     // Select: return as soon as the agent finishes (quick non-SOP path) OR as
     // soon as a SOP is detected (early-return path — agent keeps running in bg).
     tokio::select! {
@@ -2558,7 +2667,11 @@ async fn handle_api_chat(
             // Agent completed before (or without) triggering a SOP.
             match res {
                 Ok(Ok((response, _))) => {
-                    let body = serde_json::json!({"response": response, "model": model_label_clone});
+                    let body = serde_json::json!({
+                        "response": response,
+                        "model": model_label_clone,
+                        "turn_id": turn_id,
+                    });
                     (StatusCode::OK, Json(body))
                 }
                 Ok(Err(e)) => {
@@ -2585,6 +2698,7 @@ async fn handle_api_chat(
                     format!("已为您发起「{sop_name}」，正在后台执行；执行结果和需要你确认的步骤都会自动出现。")
                 },
                 "model": model_label_clone,
+                "turn_id": turn_id,
                 "sop_started": true,
                 "sop_name": sop_name,
             });

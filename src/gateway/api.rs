@@ -1030,20 +1030,109 @@ fn hydrate_config_for_save(
     incoming
 }
 
-/// GET /api/sop/runs — SOP run 列表（进行中/等待审批/近期完成），供龙虾前台审批箱直读，
-/// 免去从对话文本收割 run 编号的脆弱路径。
-pub async fn handle_api_sop_runs(
+/// GET /api/capabilities — 本助手能执行什么（规程 + 技能），供前台「新任务」与「助手概况」用。
+///
+/// 响应带 `{"api":"frontdesk","api_version":1}` 标记：gateway 对未匹配的 GET 走 SPA fallback
+/// 返回 200 + HTML，客户端只看状态码会把「旧版本不支持」误判成「支持但清单为空」。
+/// 有了这个标记，客户端可以确定性地判断降级。
+pub async fn handle_api_capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let runs: Vec<serde_json::Value> = {
+
+    let sops: Vec<serde_json::Value> = {
         let engine = state.sop_engine.lock().unwrap();
         engine
-            .active_runs()
-            .values()
+            .sops()
+            .iter()
+            .map(|sop| {
+                let steps: Vec<serde_json::Value> = sop
+                    .steps
+                    .iter()
+                    .map(|st| {
+                        serde_json::json!({
+                            "num": st.number,
+                            "title": st.title,
+                            // 步骤条标签取标题前 4 字；正文不外泄（可能含患者信息与内部指令）
+                            "short": st.title.chars().take(4).collect::<String>(),
+                            "human": st.requires_confirmation,
+                        })
+                    })
+                    .collect();
+                let gate_steps: Vec<u32> = sop
+                    .steps
+                    .iter()
+                    .filter(|st| st.requires_confirmation)
+                    .map(|st| st.number)
+                    .collect();
+                serde_json::json!({
+                    "name": sop.name,
+                    "title": sop.name,
+                    "description": sop.description,
+                    "version": sop.version,
+                    "steps": steps,
+                    "gate_steps": gate_steps,
+                })
+            })
+            .collect()
+    };
+
+    // 技能没有常驻注册表，按需从工作区读（与 agent 启动时同一来源）
+    let skills: Vec<serde_json::Value> = {
+        let cfg = state.config.lock(); // parking_lot：无需 unwrap
+        crate::skills::load_skills_with_config(&cfg.workspace_dir, &cfg)
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "summary": s.description,
+                    "version": s.version,
+                })
+            })
+            .collect()
+    };
+
+    Json(serde_json::json!({
+        "api": "frontdesk",
+        "api_version": 1,
+        "sops": sops,
+        "skills": skills,
+    }))
+    .into_response()
+}
+
+/// `/api/sop/runs` 的查询参数。
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct SopRunsQuery {
+    /// `finished` = 连同最近结束的 run 一起返回（默认只返回活跃 run，与旧行为一致）
+    #[serde(default)]
+    pub include: Option<String>,
+}
+
+/// GET /api/sop/runs — SOP run 列表（进行中/等待审批/近期完成），供龙虾前台审批箱直读，
+/// 免去从对话文本收割 run 编号的脆弱路径。
+pub async fn handle_api_sop_runs(
+    State(state): State<AppState>,
+    Query(q): Query<SopRunsQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    // 前台的核心诚实问题：run 完成后就从 active_runs 消失，客户端无法区分
+    // 「完成」「失败」「被取消」「daemon 重启」。`?include=finished` 把最近结束的
+    // run 一并返回，让客户端能如实回答，而不是把「消失」一律当成功。
+    let include_finished = q.include.as_deref() == Some("finished");
+    let runs: Vec<serde_json::Value> = {
+        let engine = state.sop_engine.lock().unwrap();
+        let mut all: Vec<&crate::sop::types::SopRun> = engine.active_runs().values().collect();
+        if include_finished {
+            all.extend(engine.finished_runs(None));
+        }
+        all.into_iter()
             .map(|r| {
                 // 当前步骤的标题/内容：审批时用户要看到"批的是什么"
                 let step_info = engine
@@ -1063,8 +1152,10 @@ pub async fn handle_api_sop_runs(
                     .payload
                     .as_ref()
                     .map(|p| p.chars().take(1500).collect::<String>());
+                let sop_version = engine.get_sop(&r.sop_name).map(|sop| sop.version.clone());
                 serde_json::json!({
                     "current_step_info": step_info,
+                    "sop_version": sop_version,
                     "last_output": last_output,
                     "trigger_payload": trigger_payload,
                     "run_id": r.run_id,
@@ -1080,6 +1171,109 @@ pub async fn handle_api_sop_runs(
             .collect()
     };
     Json(serde_json::json!({ "runs": runs })).into_response()
+}
+
+#[cfg(test)]
+mod frontdesk_v6_tests {
+    //! 龙虾前台 v6（PR-A）新增能力的回归测试。
+    //! 关心的不是「返回 200」，而是**客户端能否确定性地判断服务端支持什么、以及状态是否已变**。
+    use crate::config::SopConfig;
+    use crate::sop::engine::SopEngine;
+    use crate::sop::types::{
+        Sop, SopEvent, SopExecutionMode, SopPriority, SopStep, SopTriggerSource,
+    };
+
+    fn gated_sop() -> Sop {
+        Sop {
+            name: "case-clinical-report".into(),
+            description: "病例解读".into(),
+            version: "1.2.1".into(),
+            priority: SopPriority::High,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "解析病例资料".into(),
+                    body: "".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: Default::default(),
+                    schema: None,
+                },
+                SopStep {
+                    number: 2,
+                    title: "审核确认".into(),
+                    body: "".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: true,
+                    kind: Default::default(),
+                    schema: None,
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 4,
+            location: None,
+            deterministic: false,
+        }
+    }
+
+    fn engine_with_run() -> (SopEngine, String) {
+        let mut e = SopEngine::new(SopConfig::default());
+        e.set_sops_for_test(vec![gated_sop()]);
+        let action = e
+            .start_run(
+                "case-clinical-report",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: Some("{\"case_id\":\"20260910-肺结节\"}".into()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .expect("start");
+        let run_id = match action {
+            crate::sop::types::SopRunAction::ExecuteStep { run_id, .. } => run_id,
+            other => panic!("unexpected action: {other:?}"),
+        };
+        (e, run_id)
+    }
+
+    #[test]
+    fn finished_runs_are_queryable_so_disappearance_is_not_ambiguous() {
+        // run 完成后从 active_runs 消失。若服务端不提供已结束列表，
+        // 客户端只能在「完成 / 失败 / 被取消 / daemon 重启」之间瞎猜。
+        let (mut e, run_id) = engine_with_run();
+        assert_eq!(e.active_runs().len(), 1);
+        e.cancel_run(&run_id).expect("cancel");
+        assert!(e.active_runs().is_empty(), "取消后应移出活跃列表");
+        let finished = e.finished_runs(None);
+        assert_eq!(finished.len(), 1, "已结束的 run 必须仍可查到");
+        assert_eq!(finished[0].run_id, run_id);
+    }
+
+    #[test]
+    fn get_run_finds_both_active_and_finished() {
+        // expect_step 的比对依赖它：run 刚结束时也要能查到，才不会把 409 误判成 404。
+        let (mut e, run_id) = engine_with_run();
+        assert!(e.get_run(&run_id).is_some());
+        e.cancel_run(&run_id).expect("cancel");
+        assert!(e.get_run(&run_id).is_some(), "结束后仍应可查");
+    }
+
+    #[test]
+    fn gate_steps_are_derivable_for_capabilities() {
+        // /api/capabilities 要如实告诉前台「第几步需要人确认」，
+        // 这个信息只能来自 SOP 定义里的 requires_confirmation。
+        let sop = gated_sop();
+        let gates: Vec<u32> = sop
+            .steps
+            .iter()
+            .filter(|s| s.requires_confirmation)
+            .map(|s| s.number)
+            .collect();
+        assert_eq!(gates, vec![2]);
+    }
 }
 
 #[cfg(test)]

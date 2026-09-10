@@ -12,7 +12,7 @@ use axum::{
     },
 };
 use std::convert::Infallible;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_stream::StreamExt;
 
 /// GET /api/events — SSE event stream
@@ -49,15 +49,24 @@ pub async fn handle_sse_events(
 
     let rx = state.event_tx.subscribe();
     let live = BroadcastStream::new(rx).filter_map(
-        |result: Result<
-            serde_json::Value,
-            tokio_stream::wrappers::errors::BroadcastStreamRecvError,
-        >| {
+        |result: Result<serde_json::Value, BroadcastStreamRecvError>| {
             match result {
                 Ok(value) => Some(Ok::<_, Infallible>(
                     Event::default().data(value.to_string()),
                 )),
-                Err(_) => None, // Skip lagged messages
+                // 广播通道容量有限，客户端落后就会丢事件。以前这里静默跳过——
+                // 客户端完全无从知道自己漏了什么，界面会停在一个过时状态还以为是最新的。
+                // 改为下发 resync：客户端收到就全量重拉一次。
+                Err(BroadcastStreamRecvError::Lagged(n)) => Some(Ok::<_, Infallible>(
+                    Event::default().data(
+                        serde_json::json!({
+                            "type": "resync",
+                            "dropped": n,
+                            "timestamp": chrono::Utc::now().timestamp(),
+                        })
+                        .to_string(),
+                    ),
+                )),
             }
         },
     );
