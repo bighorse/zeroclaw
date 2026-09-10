@@ -115,7 +115,11 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
     let md_path = sop_dir.join("SOP.md");
     let steps = if md_path.exists() {
         let md_content = std::fs::read_to_string(&md_path)?;
-        parse_steps_with_mode(&md_content, strict_steps)
+        let steps = parse_steps_with_mode(&md_content, strict_steps);
+        if !strict_steps {
+            warn_if_legacy_differs(&manifest.sop.name, &md_content, &steps);
+        }
+        steps
     } else {
         Vec::new()
     };
@@ -210,7 +214,18 @@ pub fn parse_steps_with_mode(md: &str, strict: bool) -> Vec<SopStep> {
         } else {
             trimmed.starts_with("## ")
         };
-        if is_heading {
+
+        // strict：顶格的编号式标题（`### 1. 标题`）就是一个步骤，不是段落分隔符。
+        // 真实 SOP 里这是第三种常见写法；legacy 把它当正文，于是整段步骤只剩
+        // notes 里的编号子项，strict 则一步都认不出来（实测 kf-followup 归零）。
+        // 必须在 is_heading 之前判定：`## 3. 标题` 形态否则会被当成"另起一节"而终止步骤段。
+        let numbered_heading = if strict && in_steps_section {
+            parse_numbered_heading(line)
+        } else {
+            None
+        };
+
+        if is_heading && numbered_heading.is_none() {
             if trimmed.eq_ignore_ascii_case("## steps") || trimmed.eq_ignore_ascii_case("## Steps")
             {
                 in_steps_section = true;
@@ -239,7 +254,9 @@ pub fn parse_steps_with_mode(md: &str, strict: bool) -> Vec<SopStep> {
 
         // Check for numbered item: `1.`, `2.`, etc.
         // strict：只认顶格的编号项，缩进的一律视为正文（notes 子项）
-        let numbered = if strict && line.starts_with(char::is_whitespace) {
+        let numbered = if let Some(rest) = numbered_heading {
+            Some(rest)
+        } else if strict && line.starts_with(char::is_whitespace) {
             None
         } else {
             parse_numbered_item(trimmed)
@@ -356,6 +373,75 @@ fn flush_step(
 }
 
 /// Try to parse `N. rest` from a line, returning `rest` if successful.
+/// 加载时自查：legacy 解析与 strict 解析对不上就告警。
+///
+/// 为什么不直接把 strict 设成默认：那会一次性改变每一个在跑 SOP 的步骤编号与人工门，
+/// 是需要逐个复核的行为变更。但"默认解析可能悄悄丢步骤、丢人工门"这件事本身
+/// 必须能被发现——否则每写一个新 SOP 就要靠人再扫一遍。这里只记日志、不改行为。
+///
+/// 最严重的一档单独点名：文本里写了人工审批门，legacy 却一个都没解析出来。
+fn warn_if_legacy_differs(name: &str, md: &str, legacy: &[SopStep]) {
+    let strict = parse_steps_with_mode(md, true);
+    let gates = |v: &[SopStep]| -> Vec<u32> {
+        v.iter()
+            .filter(|s| s.requires_confirmation)
+            .map(|s| s.number)
+            .collect()
+    };
+    let (lg, sg) = (gates(legacy), gates(&strict));
+    if legacy.len() == strict.len() && lg == sg {
+        return;
+    }
+    if lg.is_empty() && !sg.is_empty() {
+        warn!(
+            "SOP '{name}': 默认解析器没有解析出任何人工审批门，但 SOP.md 里写了 {} 处（严格解析下位于第 {:?} 步）。\
+             这道门在引擎里目前不存在。请在 SOP.toml 里设 step_parser = \"strict\" 并复验。",
+            sg.len(),
+            sg
+        );
+    } else {
+        warn!(
+            "SOP '{name}': 默认解析器得到 {} 步（人工门 {:?}），严格解析得到 {} 步（人工门 {:?}）。\
+             两者不一致通常意味着缩进的编号子项被当成了步骤，或步骤正文里的 `## 标题` 提前终止了解析。\
+             请核对后考虑在 SOP.toml 里设 step_parser = \"strict\"。",
+            legacy.len(),
+            lg,
+            strict.len(),
+            sg
+        );
+    }
+}
+
+/// 顶格的编号式标题：`### 1. 标题` / `#### 2、标题`。返回标题部分。
+///
+/// 只在 strict 且已进入 Steps 段时使用。要求顶格，是为了不把步骤正文里
+/// 缩进贴出的产物模板（那里常有 `### 1. 病例摘要`）误当成步骤。
+fn parse_numbered_heading(line: &str) -> Option<&str> {
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    if !(2..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = line[hashes..].trim_start();
+    // `1. 标题` 或 `1、标题`
+    let cut = rest.find(['.', '、'])?;
+    let (num, tail) = rest.split_at(cut);
+    if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let tail = tail
+        .strip_prefix('.')
+        .or_else(|| tail.strip_prefix('、'))
+        .unwrap_or(tail)
+        .trim();
+    if tail.is_empty() {
+        return None;
+    }
+    Some(tail)
+}
+
 fn parse_numbered_item(line: &str) -> Option<&str> {
     let dot_pos = line.find(". ")?;
     let prefix = &line[..dot_pos];
@@ -648,6 +734,98 @@ mod tests {
         assert!(strict[3].requires_confirmation, "第 4 步必须是人工确认门");
         assert_eq!(strict.iter().filter(|s| s.requires_confirmation).count(), 1);
         assert_eq!(strict[4].title, "报告交付");
+    }
+
+    #[test]
+    fn strict_reads_numbered_headings_as_steps() {
+        // 第三种真实写法：步骤写成 `### N. 标题` 的 markdown 标题。
+        // 生产上 kf-followup 与 semester-report 都是这么写的，而两个解析器原先都不认：
+        // legacy 把标题当正文、只认 notes 里的编号子项（步骤全错），
+        // strict 则一步都解析不出来（0 步 = SOP 等于没有步骤）。
+        let md = r#"## Steps
+
+### 1. 线索确认 — 读入并建档
+从 jsonl 中匹配记录。
+   - tools: file_read
+   - notes:
+     1. 匹配不到就重试。
+     2. 重试三次仍失败则终止。
+
+### 2. 生成跟进话术
+   - tools: shell
+
+### 3. 人工放行 — 发出前须人工确认
+   - requires_confirmation: true
+
+## Output
+一份跟进记录。
+"#;
+
+        let strict = parse_steps_with_mode(md, true);
+        assert_eq!(strict.len(), 3, "三个 `### N.` 标题就是三个步骤");
+        assert_eq!(strict[0].title, "线索确认 — 读入并建档");
+        assert_eq!(strict[0].suggested_tools, vec!["file_read"]);
+        assert!(
+            !strict[0].requires_confirmation,
+            "notes 里的编号子项不得把第 1 步变成门，也不得另起一步"
+        );
+        assert_eq!(strict[2].title, "人工放行 — 发出前须人工确认");
+        assert!(strict[2].requires_confirmation);
+        // `## Output` 仍然是段落终止符，不能被当成第 4 步
+        assert!(!strict.iter().any(|s| s.title.contains("Output")));
+
+        // legacy 行为保持不变（这是 opt-in 修复，不动既有默认）。
+        // 记下它到底错成什么样：步骤名全部取自 notes 子项，而那道人工门被挂到了
+        // 「重试三次仍失败则终止」上——门还在，却守在一个不存在的关口上。
+        // 这比"门丢了"更难发现，因为 `sop status` 看上去是有门的。
+        let legacy = parse_steps_with_mode(md, false);
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(legacy[0].title, "匹配不到就重试。");
+        assert_eq!(legacy[1].title, "重试三次仍失败则终止。");
+        assert!(
+            legacy[1].requires_confirmation,
+            "legacy 把门挂在了错误的步骤上——正是要 opt-in 到 strict 的理由"
+        );
+        assert!(
+            !legacy.iter().any(|s| s.title.contains("人工放行")),
+            "真正需要人工放行的那一步在 legacy 下根本不存在"
+        );
+    }
+
+    #[test]
+    fn strict_numbered_heading_only_applies_at_column_zero() {
+        // 步骤正文里贴的产物模板常含 `### 1. 病例摘要`。缩进的一律是正文，
+        // 否则模板会凭空变出步骤——这正是 legacy 那类缺陷的镜像。
+        let md = r#"## Steps
+
+### 1. 生成报告
+按下列模板输出：
+
+   ### 1. 病例摘要
+   ### 2. 处置建议
+
+### 2. 交付
+"#;
+        let strict = parse_steps_with_mode(md, true);
+        assert_eq!(strict.len(), 2, "缩进的模板标题不算步骤");
+        assert_eq!(strict[1].title, "交付");
+    }
+
+    #[test]
+    fn parse_numbered_heading_rejects_non_steps() {
+        assert_eq!(parse_numbered_heading("### 1. 标题"), Some("标题"));
+        assert_eq!(parse_numbered_heading("#### 12、标题"), Some("标题"));
+        assert_eq!(parse_numbered_heading("## 3. 标题"), Some("标题"));
+        // 一级标题是文档标题，不是步骤
+        assert_eq!(parse_numbered_heading("# 1. 标题"), None);
+        // 没有编号
+        assert_eq!(parse_numbered_heading("### Steps"), None);
+        // 编号后没有内容
+        assert_eq!(parse_numbered_heading("### 1."), None);
+        // 缩进
+        assert_eq!(parse_numbered_heading("   ### 1. 标题"), None);
+        // 版本号之类的不是编号标题
+        assert_eq!(parse_numbered_heading("### v1.2 变更"), None);
     }
 
     #[test]
