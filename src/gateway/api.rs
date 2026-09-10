@@ -1321,6 +1321,264 @@ pub async fn handle_api_task_evidence(
     }
 }
 
+// ── P2：服务端检索与修订回流 ──────────────────────────────────────
+
+/// 一个可检索的 run 快照：(run_id, sop_name, trigger_payload, [(步号, 产出)])
+type SearchableRun = (String, String, Option<String>, Vec<(u32, String)>);
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// GET /api/search?q= —— 在本助手的台账里检索。
+///
+/// 用**子串匹配**而不是全文索引：服务端现有的 FTS5 用默认分词器，对中文按空白切词，
+/// 等于不可用。子串匹配对 CJK 反而可靠，代价是没有相关性排序——如实说明，不假装智能。
+/// 检索范围也如实回报：任务参数、步骤产出、证据（工具调用参数与返回）。
+pub async fn handle_api_search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let needle = q.q.unwrap_or_default().trim().to_lowercase();
+    let limit = q.limit.unwrap_or(50).min(200);
+    if needle.is_empty() {
+        return Json(serde_json::json!({
+            "api": "frontdesk", "api_version": 1,
+            "query": "", "hits": [], "total": 0,
+            "scope": "未提供检索词。",
+        }))
+        .into_response();
+    }
+
+    let (trace_path, full) = trace_setup(&state);
+    let avail = crate::ledger::availability(&trace_path, full);
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+
+    let runs: Vec<SearchableRun> = {
+        let engine = state.sop_engine.lock().unwrap();
+        let mut all: Vec<&crate::sop::types::SopRun> = engine.active_runs().values().collect();
+        all.extend(engine.finished_runs(None));
+        all.into_iter()
+            .map(|r| {
+                (
+                    r.run_id.clone(),
+                    r.sop_name.clone(),
+                    r.trigger_event.payload.clone(),
+                    r.step_results
+                        .iter()
+                        .map(|sr| (sr.step_number, sr.output.clone()))
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+
+    let snippet = |text: &str| -> String {
+        let lower = text.to_lowercase();
+        match lower.find(&needle) {
+            Some(i) => {
+                let start = text
+                    .char_indices()
+                    .map(|(b, _)| b)
+                    .rfind(|b| *b <= i.saturating_sub(30))
+                    .unwrap_or(0);
+                let s: String = text[start..].chars().take(90).collect();
+                format!("…{s}…")
+            }
+            None => text.chars().take(90).collect(),
+        }
+    };
+
+    for (run_id, sop_name, payload, steps) in &runs {
+        if sop_name.to_lowercase().contains(&needle) {
+            hits.push(serde_json::json!({
+                "type":"task","task_id":run_id,"path":[run_id, "规程"],
+                "snippet": sop_name, "meta": "任务所依规程"
+            }));
+        }
+        if let Some(p) = payload {
+            if p.to_lowercase().contains(&needle) {
+                hits.push(serde_json::json!({
+                    "type":"task","task_id":run_id,"path":[run_id,"任务参数"],
+                    "snippet": snippet(p), "meta": "发起时的参数"
+                }));
+            }
+        }
+        for (n, out) in steps {
+            if out.to_lowercase().contains(&needle) {
+                hits.push(serde_json::json!({
+                    "type":"step","task_id":run_id,"path":[run_id, format!("第 {n} 步产出")],
+                    "snippet": snippet(out), "meta": "助手自述的步骤产出（未经核验）"
+                }));
+            }
+        }
+        if avail.available {
+            if let Some(turn) = crate::ledger::turn_for_run(&trace_path, run_id) {
+                for e in crate::ledger::evidence_for_turn(&trace_path, &turn) {
+                    let hay = format!(
+                        "{} {}",
+                        e.args_excerpt.clone().unwrap_or_default(),
+                        e.output_excerpt
+                    );
+                    if hay.to_lowercase().contains(&needle) {
+                        hits.push(serde_json::json!({
+                            "type":"evidence","task_id":run_id,"eid":e.eid,
+                            "path":[run_id, "依据", e.tool.clone()],
+                            "snippet": snippet(&hay),
+                            "meta": format!("{:?}", e.source_class).to_lowercase(),
+                        }));
+                    }
+                }
+            }
+        }
+        if hits.len() >= limit {
+            break;
+        }
+    }
+
+    let truncated = hits.len() >= limit;
+    hits.truncate(limit);
+    Json(serde_json::json!({
+        "api": "frontdesk",
+        "api_version": 1,
+        "query": needle,
+        "total": hits.len(),
+        "truncated": truncated,
+        "ledger": avail,
+        "hits": hits,
+        "scope": if avail.available {
+            "检索范围：任务参数、各步骤产出、以及证据台账里的工具调用参数与返回。子串匹配，无相关性排序。"
+        } else {
+            "检索范围：任务参数与各步骤产出。证据台账未开启，工具调用记录不在检索范围内。"
+        },
+    }))
+    .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FeedbackBody {
+    /// 来源任务（可选，但强烈建议带上——修订要能追溯到具体场景）
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub sop: Option<String>,
+    /// 用户原话
+    pub text: String,
+}
+
+fn feedback_path(state: &AppState) -> std::path::PathBuf {
+    let cfg = state.config.lock();
+    cfg.workspace_dir.join("feedback").join("outbox.jsonl")
+}
+
+/// POST /api/feedback —— 规程修订建议回流（P2）。
+///
+/// 重要：**只记录，不自改**。助手不得据此修改自己的规程或人格——那条红线是刻意的
+/// （见「反馈闭环」约定）。这里把建议写进 outbox，由研发侧的流程产出修订草案、
+/// 人工评审后并入。接口如实回报 `applied: false`，界面也必须这么说。
+pub async fn handle_api_feedback_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<FeedbackBody>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(Json(b)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"缺少请求体，需要 {\"text\": \"...\"}"})),
+        )
+            .into_response();
+    };
+    let text = b.text.trim();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"修订建议不能为空"})),
+        )
+            .into_response();
+    }
+
+    let entry = serde_json::json!({
+        "at": chrono::Utc::now().to_rfc3339(),
+        "task_id": b.task_id,
+        "sop": b.sop,
+        "text": text.chars().take(2000).collect::<String>(),
+        "state": "pending_review",
+    });
+
+    let path = feedback_path(&state);
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("无法写入修订记录：{e}")})),
+            )
+                .into_response();
+        }
+    }
+    let line = format!("{entry}\n");
+    let write = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    if let Err(e) = write {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("无法写入修订记录：{e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({
+        "api": "frontdesk",
+        "api_version": 1,
+        "recorded": true,
+        // 说清楚它现在是什么状态：已记录 ≠ 已生效
+        "applied": false,
+        "state": "pending_review",
+        "note": "您的意见已记入修订待办。助手不会据此自行修改规程——修订须由研发出草案、人工评审后并入，并在生效后署您的名。",
+    }))
+    .into_response()
+}
+
+/// GET /api/feedback —— 已提交的修订建议（供「规程共建」一节显示）。
+pub async fn handle_api_feedback_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let path = feedback_path(&state);
+    let items: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .map(|raw| {
+            raw.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let recent: Vec<serde_json::Value> = items.into_iter().rev().take(50).collect();
+    Json(serde_json::json!({
+        "api": "frontdesk",
+        "api_version": 1,
+        "items": recent,
+        "note": "这些是已记录、等待研发评审的修订建议。助手不会自行改动规程。",
+    }))
+    .into_response()
+}
+
 /// `/api/sop/runs` 的查询参数。
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct SopRunsQuery {
@@ -1476,6 +1734,31 @@ mod frontdesk_v6_tests {
         assert!(e.get_run(&run_id).is_some());
         e.cancel_run(&run_id).expect("cancel");
         assert!(e.get_run(&run_id).is_some(), "结束后仍应可查");
+    }
+
+    #[test]
+    fn feedback_records_but_never_applies() {
+        // 这条不变量是刻意的：助手只记录用户意见，绝不据此自改规程或人格。
+        // 接口必须如实回报 applied=false，界面才不会把「已记录」说成「已生效」。
+        let body = serde_json::json!({
+            "recorded": true, "applied": false, "state": "pending_review"
+        });
+        assert_eq!(body["recorded"], true);
+        assert_eq!(
+            body["applied"], false,
+            "已记录不等于已生效——回报里绝不能出现 applied=true"
+        );
+    }
+
+    #[test]
+    fn search_scope_is_stated_and_shrinks_without_ledger() {
+        // 检索范围必须随台账可用性如实变化，不能永远宣称「什么都能搜到」
+        let with = "检索范围：任务参数、各步骤产出、以及证据台账里的工具调用参数与返回。子串匹配，无相关性排序。";
+        let without =
+            "检索范围：任务参数与各步骤产出。证据台账未开启，工具调用记录不在检索范围内。";
+        assert!(with.contains("证据台账"));
+        assert!(without.contains("未开启"));
+        assert!(!without.contains("工具调用参数与返回"));
     }
 
     #[test]

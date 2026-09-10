@@ -775,7 +775,15 @@ pub async fn run_gateway(
         .route("/api/status", get(api::handle_api_status))
         .route("/api/sop/runs", get(api::handle_api_sop_runs))
         .route("/api/capabilities", get(api::handle_api_capabilities))
-        .route("/api/tasks", get(api::handle_api_tasks))
+        .route("/api/search", get(api::handle_api_search))
+        .route(
+            "/api/feedback",
+            get(api::handle_api_feedback_list).post(api::handle_api_feedback_create),
+        )
+        .route(
+            "/api/tasks",
+            get(api::handle_api_tasks).post(handle_api_task_create),
+        )
         .route("/api/tasks/{run_id}", get(api::handle_api_task_detail))
         .route(
             "/api/tasks/{run_id}/evidence/{eid}",
@@ -1722,6 +1730,185 @@ async fn handle_webhook(
 ///
 /// Note: this endpoint exists because `SopApproveTool` is intentionally
 /// NOT exposed to the LLM — the dual-sign quality gate would be
+/// POST /api/tasks —— 确定性派活（P1b）。
+///
+/// 为什么需要它：`/api/chat` 依赖模型自己去调 `sop_execute`，既可能不调、调错规程，
+/// 也**不返回 run_id**——客户端只能轮询做集合差来猜"刚才那一句变成了哪个任务"。
+/// 这里由客户端明确指定规程，服务端校验后直接 `start_run`，**当场返回 run_id**，
+/// 再派生一轮 agent 去执行。派活这件事不该交给模型的自觉。
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateTaskBody {
+    /// 规程名，必须在 /api/capabilities 列表内
+    pub sop: String,
+    /// 任务参数（原样交给 SOP 作为 trigger payload）
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    /// 用户原话，仅用于记录与给 agent 的上下文
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+async fn handle_api_task_create(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Option<Json<CreateTaskBody>>,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error":"rate limit exceeded"})),
+        );
+    }
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error":"Unauthorized"})),
+            );
+        }
+    }
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"缺少请求体，需要 {\"sop\": \"<规程名>\"}"})),
+        );
+    };
+
+    let payload_str = body
+        .payload
+        .as_ref()
+        .map(|v| v.to_string())
+        .or_else(|| body.text.clone());
+
+    let started = {
+        let mut engine = match state.sop_engine.lock() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("create task: engine lock poisoned: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"engine lock poisoned"})),
+                );
+            }
+        };
+        // 规程名必须存在：错名字要当场报错并给出可选清单，
+        // 不能像模型路由那样悄悄跑成别的东西
+        if engine.get_sop(&body.sop).is_none() {
+            let available: Vec<String> = engine.sops().iter().map(|s| s.name.clone()).collect();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "没有这个规程",
+                    "sop": body.sop,
+                    "available": available,
+                })),
+            );
+        }
+        let event = crate::sop::types::SopEvent {
+            source: crate::sop::types::SopTriggerSource::Manual,
+            topic: Some("frontdesk".to_string()),
+            payload: payload_str.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        engine.start_run(&body.sop, event)
+    };
+
+    match started {
+        Ok(action) => {
+            let run_id = match &action {
+                crate::sop::types::SopRunAction::ExecuteStep { run_id, .. }
+                | crate::sop::types::SopRunAction::WaitApproval { run_id, .. } => run_id.clone(),
+                other => format!("{other:?}"),
+            };
+            tracing::info!(run_id = %run_id, sop = %body.sop, "frontdesk: task created");
+
+            // 派生一轮 agent 去真正执行（与批准续跑同一路径）。不阻塞本响应：
+            // 客户端已经拿到 run_id，进展经 /api/sop/runs 与 SSE 可见。
+            {
+                let config = state.config.lock().clone();
+                let history = Arc::clone(&state.api_chat_history);
+                let engine = Arc::clone(&state.sop_engine);
+                let event_tx = state.event_tx.clone();
+                let recent = Arc::clone(&state.recent_sop_results);
+                let rid = run_id.clone();
+                let sop = body.sop.clone();
+                let said = body.text.clone().unwrap_or_default();
+                let payload_for_turn = payload_str.clone().unwrap_or_default();
+                tokio::spawn(async move {
+                    let wake = format!(
+                        "[系统] 已按用户指令建立 SOP run {rid}（规程 {sop}）。任务参数：{payload_for_turn}。用户原话：{said}。\
+                         请用 sop_advance 从当前步骤开始执行，直到全部完成或到达需要用户确认的步骤为止。\
+                         最后用面向用户的口吻简要汇报（不要提系统消息或内部指令）。"
+                    );
+                    let prior = { history.lock().clone() };
+                    match crate::agent::process_message_with_history(
+                        config,
+                        &wake,
+                        Some(prior),
+                        None,
+                        Some(engine),
+                        Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
+                    )
+                    .await
+                    {
+                        Ok((resp, new_hist)) => {
+                            *history.lock() = new_hist;
+                            let ts = chrono::Utc::now().timestamp();
+                            let ev = serde_json::json!({
+                                "type": "sop_result",
+                                "id": format!("{rid}:{ts}"),
+                                "run_id": rid,
+                                "response": resp,
+                                "timestamp": ts,
+                            });
+                            push_recent_sop_result(&recent, ev.clone());
+                            let _ = event_tx.send(ev);
+                        }
+                        Err(e) => {
+                            tracing::warn!(run_id = %rid, "frontdesk task turn failed: {e:#}");
+                            // 执行失败必须让前台看见，否则任务会静静地停在那里
+                            let _ = event_tx.send(serde_json::json!({
+                                "type": "error",
+                                "component": "task_turn",
+                                "run_id": rid,
+                                "message": format!("任务 {rid} 的执行轮失败：{e}"),
+                                "timestamp": chrono::Utc::now().timestamp(),
+                            }));
+                        }
+                    }
+                });
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "api": "frontdesk",
+                    "api_version": 1,
+                    "run_id": run_id,
+                    "task_id": run_id,
+                    "sop": body.sop,
+                    "status": "started",
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("无法建立任务：{e}"),
+                "sop": body.sop,
+            })),
+        ),
+    }
+}
+
 /// 不可逆动作的乐观并发参数：客户端把它「以为」正在等批的步号带上，
 /// 服务端不符即 409，避免在状态已变之后照旧执行（批准与驳回都无法回滚）。
 #[derive(Debug, Default, serde::Deserialize)]
