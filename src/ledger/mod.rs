@@ -38,10 +38,10 @@ impl SourceClass {
     pub fn of_tool(tool: &str) -> Self {
         match tool {
             "http_request" | "web_fetch" | "web_search" | "browser" => Self::External,
-            // shell 什么都能干：可能真的调了外部 API，也可能只是 echo。
-            // 无法确定即按自产处理，等技能登记机制上线（P2）再放开。
-            "shell" => Self::SelfProduced,
             "file_read" => Self::LocalFile,
+            // 其余一律自产——**shell 也在此列**：它什么都能干，可能真的调了外部 API，
+            // 也可能只是 echo。无法确定就不许升级成「外部依据」，
+            // 等技能登记机制上线（P2，脚本声明数据源 host）再按登记放开。
             _ => Self::SelfProduced,
         }
     }
