@@ -1240,19 +1240,49 @@ pub async fn handle_api_task_detail(
     let run_json = {
         let engine = state.sop_engine.lock().unwrap();
         let Some(r) = engine.get_run(&run_id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                // 带上 frontdesk 标记：客户端要能把「端点存在、这条 run 已不在」
-                // 和「这台 daemon 根本没有该端点（旧版本）」区分开——否则界面只能
-                // 笼统说「服务端版本较旧」，把原因说错。
-                Json(serde_json::json!({
-                    "api": "frontdesk",
-                    "api_version": 1,
-                    "error": "run not found",
-                    "run_id": run_id,
-                })),
-            )
-                .into_response();
+            drop(engine);
+            // 引擎忘了这一单（助手重启过，执行状态只在内存）——但调用记录是落盘的。
+            // 记录里还有它，就照样给出依据与产物，只是没有执行状态；连记录都没有才算「不在了」。
+            let turns = if avail.available {
+                crate::ledger::turns_for_run(&trace_path, &run_id)
+            } else {
+                Vec::new()
+            };
+            if turns.is_empty() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    // 带上 frontdesk 标记：客户端要能把「端点存在、这条 run 已不在」
+                    // 和「这台 daemon 根本没有该端点（旧版本）」区分开——否则界面只能
+                    // 笼统说「服务端版本较旧」，把原因说错。
+                    Json(serde_json::json!({
+                        "api": "frontdesk",
+                        "api_version": 1,
+                        "error": "run not found",
+                        "run_id": run_id,
+                    })),
+                )
+                    .into_response();
+            }
+            let evidence = crate::ledger::evidence_for_run(&trace_path, &run_id);
+            let workspace = state.config.lock().workspace_dir.clone();
+            let artifacts: Vec<serde_json::Value> = task_artifacts(&evidence, &workspace)
+                .into_iter()
+                .map(|a| serde_json::json!({"id": a.id, "path": a.rel, "bytes": a.bytes}))
+                .collect();
+            return Json(serde_json::json!({
+                "api": "frontdesk",
+                "api_version": 1,
+                "ledger": avail,
+                "task": serde_json::Value::Null,
+                "state_lost": true,
+                "reports": reports_for_run(&state, &run_id),
+                "turn_id": turns.first(),
+                "turn_ids": turns,
+                "evidence": evidence,
+                "artifacts": artifacts,
+                "evidence_note": "服务端已不保留这一单的执行状态（助手重启过），以上工具调用与产物取自落盘的调用记录。只有向外部取数据、且调用成功的，才算依据；读本地文件的可能读的是旧缓存，助手自己写的内容不算依据。",
+            }))
+            .into_response();
         };
         let step_info = engine
             .get_sop(&r.sop_name)
@@ -1304,10 +1334,30 @@ pub async fn handle_api_task_detail(
         "evidence": evidence,
         // 这一单写出的文件（取自工具调用记录，且此刻仍在工作区里）。内容只走下面的 Bearer 端点
         "artifacts": artifacts,
+        "reports": reports_for_run(&state, &run_id),
         // 说清楚这批证据是什么、不是什么——界面直接引用这句，不要另行编写
         "evidence_note": "以上是这项任务的各轮对话里记录到的工具调用。只有向外部取数据、且调用成功的，才算依据；读本地文件的可能读的是旧缓存，助手自己写的内容不算依据。没有被记录下来的调用不在此列。",
     }))
     .into_response()
+}
+
+/// 这一单的助手汇报（sop_result），取自补发缓冲。
+/// 汇报以前只经 SSE 推给前台：SSE 断了（助手重启、反代半开连接、锁屏）就再也收不到，
+/// 任务停在门步、第一节却空着。本项目的原则是「SSE 只当门铃，轮询才是真相」——汇报也要能拉取。
+fn reports_for_run(state: &AppState, run_id: &str) -> Vec<serde_json::Value> {
+    state
+        .recent_sop_results
+        .lock()
+        .iter()
+        .filter(|e| e.get("run_id").and_then(|v| v.as_str()) == Some(run_id))
+        .map(|e| {
+            serde_json::json!({
+                "id": e.get("id"),
+                "response": e.get("response"),
+                "timestamp": e.get("timestamp"),
+            })
+        })
+        .collect()
 }
 
 /// 一单写出的一个文件。
