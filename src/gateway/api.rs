@@ -509,6 +509,7 @@ pub async fn handle_api_cost(
     if let Some(ref tracker) = state.cost_tracker {
         match tracker.get_summary() {
             Ok(summary) => Json(serde_json::json!({
+                "tracking": true,
                 "cost": summary,
                 "limits": { "daily": daily_limit, "monthly": monthly_limit },
             }))
@@ -520,7 +521,10 @@ pub async fn handle_api_cost(
                 .into_response(),
         }
     } else {
+        // 没开费用统计：下面的零是占位值，不是「花了 0」。显式标出来，
+        // 否则前台会把「没在记账」展示成「本月用量 0.00」
         Json(serde_json::json!({
+            "tracking": false,
             "cost": {
                 "session_cost_usd": 0.0,
                 "daily_cost_usd": 0.0,
@@ -1278,7 +1282,7 @@ pub async fn handle_api_task_detail(
         "turn_id": turn,
         "evidence": evidence,
         // 说清楚这批证据是什么、不是什么——界面直接引用这句，不要另行编写
-        "evidence_note": "以下为该任务所在对话轮中被记录到的工具调用。只有 source_class = external 的可作为对外依据；local_file 可能读的是既有缓存，self 为助手自产。未被记录的调用不在此列。",
+        "evidence_note": "以上是这项任务所在那一轮对话里记录到的工具调用。只有向外部取数据、且调用成功的，才算依据；读本地文件的可能读的是旧缓存，助手自己写的内容不算依据。没有被记录下来的调用不在此列。",
     }))
     .into_response()
 }
@@ -1641,6 +1645,10 @@ pub async fn handle_api_sop_runs(
                     "sop_version": sop_version,
                     "last_output": last_output,
                     "trigger_payload": trigger_payload,
+                    // 由什么发起（manual / webhook / cron / mqtt / peripheral）——前台「发起」一栏
+                    // 以前只能把交付对象的名字盖在每一单上，连 webhook 起的单也写成那个人
+                    "trigger_source": r.trigger_event.source,
+                    "trigger_topic": r.trigger_event.topic,
                     "run_id": r.run_id,
                     "sop_name": r.sop_name,
                     "status": r.status,

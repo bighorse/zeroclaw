@@ -1828,6 +1828,13 @@ async fn handle_api_task_create(
                 | crate::sop::types::SopRunAction::WaitApproval { run_id, .. } => run_id.clone(),
                 other => format!("{other:?}"),
             };
+            // 第一步的要求（引擎已经算好）一并交给助手：只给 run_id 时，模型会先四处查看，
+            // 实测 DeepSeek 查完又新建了一单重复的 run 去推进，原来那单反而没人管
+            let step_context = match &action {
+                crate::sop::types::SopRunAction::ExecuteStep { context, .. }
+                | crate::sop::types::SopRunAction::WaitApproval { context, .. } => context.clone(),
+                _ => String::new(),
+            };
             tracing::info!(run_id = %run_id, sop = %body.sop, "frontdesk: task created");
 
             // 派生一轮 agent 去真正执行（与批准续跑同一路径）。不阻塞本响应：
@@ -1836,6 +1843,7 @@ async fn handle_api_task_create(
                 let config = state.config.lock().clone();
                 let history = Arc::clone(&state.api_chat_history);
                 let engine = Arc::clone(&state.sop_engine);
+                let engine_for_failure = Arc::clone(&state.sop_engine);
                 let event_tx = state.event_tx.clone();
                 let recent = Arc::clone(&state.recent_sop_results);
                 let rid = run_id.clone();
@@ -1844,8 +1852,11 @@ async fn handle_api_task_create(
                 let payload_for_turn = payload_str.clone().unwrap_or_default();
                 tokio::spawn(async move {
                     let wake = format!(
-                        "[系统] 已按用户指令建立 SOP run {rid}（规程 {sop}）。任务参数：{payload_for_turn}。用户原话：{said}。\
-                         请用 sop_advance 从当前步骤开始执行，直到全部完成或到达需要用户确认的步骤为止。\
+                        "[系统] 本次要做的任务已经建好：SOP run {rid}（规程 {sop}），它就是用户这次交办的那一单。\
+                         任务参数：{payload_for_turn}。用户原话：{said}。\n\n\
+                         它当前所在步骤的要求如下：\n{step_context}\n\n\
+                         请直接按上面的要求完成这一步，然后对 run {rid} 调用 sop_advance 推进，\
+                         依次做完后续步骤，直到全部完成或到达需要用户确认的步骤为止。\
                          最后用面向用户的口吻简要汇报（不要提系统消息或内部指令）。"
                     );
                     let prior = { history.lock().clone() };
@@ -1874,7 +1885,11 @@ async fn handle_api_task_create(
                         }
                         Err(e) => {
                             tracing::warn!(run_id = %rid, "frontdesk task turn failed: {e:#}");
-                            // 执行失败必须让前台看见，否则任务会静静地停在那里
+                            // 推动这一单的那一轮死了：run 若仍是 Running，就如实结束为 Failed——
+                            // 只推一个 SSE 事件不够（不进补发缓冲，没人在线就丢），run 会永远「运行中」
+                            if let Ok(mut eng) = engine_for_failure.lock() {
+                                eng.fail_if_stuck(&rid, &format!("执行这一步的对话轮失败：{e}"));
+                            }
                             let _ = event_tx.send(serde_json::json!({
                                 "type": "error",
                                 "component": "task_turn",
@@ -2035,6 +2050,7 @@ async fn handle_sop_approve(
                 let config = state.config.lock().clone();
                 let history = Arc::clone(&state.api_chat_history);
                 let engine = Arc::clone(&state.sop_engine);
+                let engine_for_failure = Arc::clone(&state.sop_engine);
                 let event_tx = state.event_tx.clone();
                 let recent = Arc::clone(&state.recent_sop_results);
                 let rid = run_id.clone();
@@ -2071,6 +2087,18 @@ async fn handle_sop_approve(
                         }
                         Err(e) => {
                             tracing::warn!(run_id = %rid, "SOP auto-resume failed: {e:#}");
+                            // 批准后续跑的那一轮死了：同派活路径——仍是 Running 就如实结束为 Failed，
+                            // 否则用户批完就看着它永远「运行中」
+                            if let Ok(mut eng) = engine_for_failure.lock() {
+                                eng.fail_if_stuck(&rid, &format!("批准后续跑的对话轮失败：{e}"));
+                            }
+                            let _ = event_tx.send(serde_json::json!({
+                                "type": "error",
+                                "component": "sop_resume",
+                                "run_id": rid,
+                                "message": format!("任务 {rid} 批准后续跑失败：{e}"),
+                                "timestamp": chrono::Utc::now().timestamp(),
+                            }));
                         }
                     }
                 });

@@ -273,6 +273,34 @@ impl SopEngine {
         Ok(action)
     }
 
+    /// 驱动这一单的 agent 轮失败了（模型鉴权失败、超时……）：若它仍停在 `Running`，
+    /// 就把它如实结束为 `Failed`，失败原因记为当前这一步的结果。
+    ///
+    /// 不这样做，run 会永远挂在「运行中 · 第 N 步」——其实已经没有任何东西在推动它，
+    /// 前台只能看着它「一直在跑」（2026-09-11 实测：DeepSeek key 失效后一单停了三小时）。
+    ///
+    /// 已经停在人工门（`WaitingApproval`）或已结束的 run 不动：那一轮可能是推进到门步之后、
+    /// 写汇报时才失败的，流程状态本身是对的。返回是否真的结束了它。
+    pub fn fail_if_stuck(&mut self, run_id: &str, reason: &str) -> bool {
+        let Some(run) = self.active_runs.get_mut(run_id) else {
+            return false;
+        };
+        if run.status != SopRunStatus::Running {
+            return false;
+        }
+        let now = now_iso8601();
+        run.step_results.push(SopStepResult {
+            step_number: run.current_step,
+            status: SopStepStatus::Failed,
+            output: reason.to_string(),
+            started_at: now.clone(),
+            completed_at: Some(now),
+        });
+        warn!("SOP run {run_id}: driving turn failed, marking Failed: {reason}");
+        self.finish_run(run_id, SopRunStatus::Failed, Some(reason.to_string()));
+        true
+    }
+
     /// Cancel an active run.
     pub fn cancel_run(&mut self, run_id: &str) -> Result<()> {
         if !self.active_runs.contains_key(run_id) {
@@ -1494,6 +1522,53 @@ mod tests {
     fn cancel_unknown_run_fails() {
         let mut engine = engine_with_sops(vec![]);
         assert!(engine.cancel_run("nonexistent").is_err());
+    }
+
+    #[test]
+    fn fail_if_stuck_ends_a_running_run_whose_turn_died() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            engine.active_runs().get(&run_id).unwrap().status,
+            SopRunStatus::Running
+        );
+
+        assert!(engine.fail_if_stuck(&run_id, "模型鉴权失败（401）"));
+
+        // 不再挂在活跃列表里「一直在跑」，失败原因作为当前步的结果留下，前台读得到
+        assert!(engine.active_runs().get(&run_id).is_none());
+        let finished = engine
+            .finished_runs(None)
+            .into_iter()
+            .find(|r| r.run_id == run_id)
+            .unwrap();
+        assert_eq!(finished.status, SopRunStatus::Failed);
+        let last = finished.step_results.last().unwrap();
+        assert_eq!(last.status, SopStepStatus::Failed);
+        assert!(last.output.contains("401"));
+    }
+
+    #[test]
+    fn fail_if_stuck_leaves_a_gated_run_alone() {
+        // 那一轮可能是推进到门步之后、写汇报时才失败的——流程停在门上是对的，不能把它弄成失败
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Supervised,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(!engine.fail_if_stuck(&run_id, "late failure"));
+        assert_eq!(
+            engine.active_runs().get(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval
+        );
+        assert!(!engine.fail_if_stuck("nonexistent", "x"));
     }
 
     // ── Concurrency ─────────────────────────────────────
