@@ -65,6 +65,9 @@ pub struct Evidence {
     pub sha256: String,
     pub success: bool,
     pub turn_id: String,
+    /// 文件类工具（file_write / file_read …）操作的路径——前台据此列出「产物」
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// 账本可用性。不可用时必须给出人能看懂的原因，不能静默返回空。
@@ -141,6 +144,7 @@ pub fn evidence_for_turn(trace_path: &Path, turn_id: &str) -> Vec<Evidence> {
     // tool_call_start 提供参数，tool_call_result 提供输出；按 (iteration, tool) 配对
     let mut args_by_key: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // 完整参数（不截断），只用来抽取文件路径
     for e in &chron {
         if e.event_type == "tool_call_start" {
             let tool = payload_str(e, "tool").unwrap_or_default();
@@ -162,14 +166,14 @@ pub fn evidence_for_turn(trace_path: &Path, turn_id: &str) -> Vec<Evidence> {
         let output = payload_str(e, "output").unwrap_or_default();
         n += 1;
         let sha = sha256_hex(&output);
+        let full_args = args_by_key.get(&format!("{iter}:{tool}"));
         out.push(Evidence {
             eid: format!("E{n}-{}", &sha[..6]),
             n,
             at: e.timestamp.clone(),
             source_class: SourceClass::of_tool(&tool),
-            args_excerpt: args_by_key
-                .get(&format!("{iter}:{tool}"))
-                .map(|a| excerpt(a, 200)),
+            path: full_args.and_then(|a| path_arg(a)),
+            args_excerpt: full_args.map(|a| excerpt(a, 200)),
             output_excerpt: excerpt(&output, EXCERPT),
             output_bytes: output.len(),
             sha256: sha,
@@ -203,6 +207,72 @@ pub fn evidence_full(trace_path: &Path, turn_id: &str, eid: &str) -> Option<(Evi
         return None;
     }
     Some((meta.clone(), full))
+}
+
+/// 从工具参数（JSON）里取文件路径。只认 `path` / `file_path` 键。
+fn path_arg(args: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args).ok()?;
+    ["path", "file_path"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|p| p.as_str()))
+        .map(str::to_string)
+}
+
+/// 碰过某个 run 的全部对话轮，按时间先后。
+///
+/// 一单不止一轮：派活那一轮做到门步停下，批准后的续跑是另一轮——正式报告就是在续跑轮里
+/// 写出来的。只取一轮的话，「依据」和「产物」都会漏掉后半程。
+pub fn turns_for_run(trace_path: &Path, run_id: &str) -> Vec<String> {
+    let Ok(events) = runtime_trace::load_events(trace_path, SCAN_LIMIT, None, Some(run_id)) else {
+        return Vec::new();
+    };
+    let mut turns: Vec<String> = Vec::new();
+    // load_events 最新在前；倒过来按时间正序去重
+    for e in events.iter().rev() {
+        if let Some(t) = &e.turn_id {
+            if !turns.contains(t) {
+                turns.push(t.clone());
+            }
+        }
+    }
+    turns
+}
+
+/// 一单全部对话轮里的证据，编号跨轮连续（E1、E2… 后缀仍是内容哈希）。
+pub fn evidence_for_run(trace_path: &Path, run_id: &str) -> Vec<Evidence> {
+    let mut out: Vec<Evidence> = Vec::new();
+    for t in turns_for_run(trace_path, run_id) {
+        for mut e in evidence_for_turn(trace_path, &t) {
+            let n = u32::try_from(out.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            e.eid = format!("E{n}-{}", &e.sha256[..6]);
+            e.n = n;
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// 按跨轮编号取一条证据的全文（哈希校验不变：对不上就不给）。
+pub fn evidence_full_for_run(
+    trace_path: &Path,
+    run_id: &str,
+    eid: &str,
+) -> Option<(Evidence, String)> {
+    let mut global = 0u32;
+    for t in turns_for_run(trace_path, run_id) {
+        for e in evidence_for_turn(trace_path, &t) {
+            global = global.saturating_add(1);
+            if format!("E{global}-{}", &e.sha256[..6]) == eid {
+                let (mut meta, full) = evidence_full(trace_path, &t, &e.eid)?;
+                meta.eid = eid.to_string();
+                meta.n = global;
+                return Some((meta, full));
+            }
+        }
+    }
+    None
 }
 
 /// 把某个 SOP run 关联到它所在的对话轮：
@@ -266,6 +336,18 @@ mod tests {
         assert!(b.reason.is_some());
         // 防篡改尚未实施，任何时候都不许自称具备
         assert!(!availability(p, true).tamper_evident);
+    }
+
+    #[test]
+    fn path_arg_reads_path_keys_only() {
+        assert_eq!(
+            path_arg(r##"{"content":"# 报告","path":"case_library/a/report_final.md"}"##)
+                .as_deref(),
+            Some("case_library/a/report_final.md")
+        );
+        assert_eq!(path_arg(r#"{"file_path":"x.md"}"#).as_deref(), Some("x.md"));
+        assert_eq!(path_arg(r#"{"command":"ls"}"#), None);
+        assert_eq!(path_arg("not json"), None);
     }
 
     #[test]

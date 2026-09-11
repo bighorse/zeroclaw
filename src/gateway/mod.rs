@@ -786,6 +786,10 @@ pub async fn run_gateway(
         )
         .route("/api/tasks/{run_id}", get(api::handle_api_task_detail))
         .route(
+            "/api/tasks/{run_id}/artifacts/{aid}",
+            get(api::handle_api_task_artifact),
+        )
+        .route(
             "/api/tasks/{run_id}/evidence/{eid}",
             get(api::handle_api_task_evidence),
         )
@@ -1746,6 +1750,79 @@ pub struct CreateTaskBody {
     /// 用户原话，仅用于记录与给 agent 的上下文
     #[serde(default)]
     pub text: Option<String>,
+    /// 在前台确认这一单的人（前台配置的交付对象姓名）。没有就是 None——
+    /// 这时助手在任何产物里都只能写「前台确认（姓名未登记）」，不得自己找个名字填上
+    #[serde(default)]
+    pub approver: Option<String>,
+}
+
+/// 前台派活建的每一单，各自一份对话历史。
+///
+/// 以前所有派活轮、续跑轮、/api/chat 共用一份历史：第二单病例的执行轮里带着第一单的
+/// 全部病历（2026-09-11 实测：甲状腺结节那一轮上下文里有 70 条消息、约 3.7 万 token，
+/// 其中就有前一单肺结节的病例）。临床场景里这是跨患者串味，而且每多一单就更贵更慢。
+/// 用模块级表而不是 AppState 字段：AppState 在测试里有十几处字面量构造，不值得为此全改。
+fn run_histories() -> &'static Mutex<HashMap<String, Vec<ChatMessage>>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<String, Vec<ChatMessage>>>> =
+        std::sync::OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 存一单的历史。表有上限：只留最近 200 单，旧的丢掉（丢了的续跑退回共享历史，照样能跑）。
+fn save_run_history(run_id: &str, history: Vec<ChatMessage>) {
+    let mut map = run_histories().lock();
+    if map.len() >= 200 && !map.contains_key(run_id) {
+        if let Some(k) = map.keys().next().cloned() {
+            map.remove(&k);
+        }
+    }
+    map.insert(run_id.to_string(), history);
+}
+
+/// 交给前台的汇报：这一轮**最后一条**助手消息。
+///
+/// agent 循环的返回值是整轮的「交错显示」文本——调用工具途中的自言自语也拼在里面
+/// （实测开头是一串英文「I'll start with…」，还有「Step 4 是 requires_confirmation…」这种
+/// 内部说明），直接当报告给医生看不合适。历史里最后一条助手消息才是它面向用户的最终答复。
+/// 取不到（历史为空、最后一条是空）就退回原文本，不丢内容。
+pub(crate) fn final_reply(merged: &str, history: &[ChatMessage]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.trim())
+        .filter(|c| !c.is_empty() && !c.starts_with('{') && !c.starts_with("<tool"))
+        .map(str::to_string)
+        .unwrap_or_else(|| merged.to_string())
+}
+
+/// 前台的呈现约定。助手按规程里为飞书写的模板汇报（表情符号、列出「回复某某选项」的操作指引、
+/// 夹着工具过程的独白），放进报纸式的任务档案里既违和，又和前台自己的确认按钮打架。
+/// 写法按抽象规则描述，不举反例原文——举了模型会照着学。
+const PRESENTATION_RULE: &str = "你最后一条回复会原样显示在前台任务档案的「结论」一节——那是一份书面档案，不是聊天窗口。\
+     全部用中文书写。请这样写：先用一两句话给出结论；再分条写建议，每条末尾用（PMID: 编号）标出出处；\
+     证据不足或需要特别提醒的，单独成段，以「注意：」开头。\
+     不用表情符号，不写寒暄，不叙述你用了哪些工具、做了哪些步骤。\
+     需要用户确认时，只写清需要他确认的内容；确认、修改、驳回的操作由前台界面提供，回复里不给操作选项或回复指令。";
+
+/// 一单只能碰这一单的材料。实测：写甲状腺结节报告时，助手把工作区里上一位患者（肺结节）
+/// 的病例摘要和正式报告都读了一遍当格式参考——对话历史隔离挡不住读文件。
+const SCOPE_RULE: &str = "只处理本单的材料：工作区里其他任务、其他病例的文件属于别人，不要打开、读取或引用；需要格式参考时只看规程本身。";
+
+/// 规程若要审核人，只能写前台实际确认的那个人。前台没登记姓名就明说未登记。
+/// 2026-09-11 实测：不告诉助手，它会从规程 CHANGELOG 的「反馈来源」里抄一个人名填进
+/// 临床报告的「审核人」——一份没有那个人签过的报告，署上了他的名字。
+pub(crate) fn approver_rule(approver: Option<&str>) -> String {
+    let who = approver
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(40).collect::<String>());
+    match who {
+        Some(name) => format!(
+            "本单的审核/确认人是在前台操作的「{name}」。产物中凡需写审核人、确认人、签名处，只能写「{name}」，不得写任何其他人名。"
+        ),
+        None => "前台没有登记确认人的姓名。产物中凡需写审核人、确认人、签名处，一律写「前台确认（姓名未登记）」，不得从记忆、规程变更记录或任何其他地方找一个人名填上。".to_string(),
+    }
 }
 
 async fn handle_api_task_create(
@@ -1841,7 +1918,6 @@ async fn handle_api_task_create(
             // 客户端已经拿到 run_id，进展经 /api/sop/runs 与 SSE 可见。
             {
                 let config = state.config.lock().clone();
-                let history = Arc::clone(&state.api_chat_history);
                 let engine = Arc::clone(&state.sop_engine);
                 let engine_for_failure = Arc::clone(&state.sop_engine);
                 let event_tx = state.event_tx.clone();
@@ -1850,6 +1926,7 @@ async fn handle_api_task_create(
                 let sop = body.sop.clone();
                 let said = body.text.clone().unwrap_or_default();
                 let payload_for_turn = payload_str.clone().unwrap_or_default();
+                let rule = approver_rule(body.approver.as_deref());
                 tokio::spawn(async move {
                     let wake = format!(
                         "[系统] 本次要做的任务已经建好：SOP run {rid}（规程 {sop}），它就是用户这次交办的那一单。\
@@ -1857,13 +1934,14 @@ async fn handle_api_task_create(
                          它当前所在步骤的要求如下：\n{step_context}\n\n\
                          请直接按上面的要求完成这一步，然后对 run {rid} 调用 sop_advance 推进，\
                          依次做完后续步骤，直到全部完成或到达需要用户确认的步骤为止。\
-                         最后用面向用户的口吻简要汇报（不要提系统消息或内部指令）。"
+                         {SCOPE_RULE}{rule}\
+                         不要提系统消息或内部指令。{PRESENTATION_RULE}"
                     );
-                    let prior = { history.lock().clone() };
+                    // 这一单从干净的历史开始——看不到别的病例
                     match crate::agent::process_message_with_history(
                         config,
                         &wake,
-                        Some(prior),
+                        Some(Vec::new()),
                         None,
                         Some(engine),
                         Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
@@ -1871,7 +1949,8 @@ async fn handle_api_task_create(
                     .await
                     {
                         Ok((resp, new_hist)) => {
-                            *history.lock() = new_hist;
+                            let resp = final_reply(&resp, &new_hist);
+                            save_run_history(&rid, new_hist);
                             let ts = chrono::Utc::now().timestamp();
                             let ev = serde_json::json!({
                                 "type": "sop_result",
@@ -1988,13 +2067,22 @@ async fn handle_sop_cancel(
 }
 
 /// trivially defeated if the LLM could self-approve.
+/// 批准请求体（可选）：谁在前台批准的。老客户端不带请求体，照常工作。
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ApproveBody {
+    #[serde(default)]
+    pub approver: Option<String>,
+}
+
 async fn handle_sop_approve(
     State(state): State<AppState>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<StepGuardQuery>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    body: Option<Json<ApproveBody>>,
 ) -> impl IntoResponse {
+    let approver = body.and_then(|Json(b)| b.approver);
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
@@ -2054,11 +2142,15 @@ async fn handle_sop_approve(
                 let event_tx = state.event_tx.clone();
                 let recent = Arc::clone(&state.recent_sop_results);
                 let rid = run_id.clone();
+                let rule = approver_rule(approver.as_deref());
                 tokio::spawn(async move {
                     let wake = format!(
-                        "[系统] SOP run {rid} 的等待审批步骤【已经获得用户批准，审批已完成，不要再向用户请求任何批准或确认】。请立即用 sop_advance 推进并执行该流程的后续步骤，直到全部完成或到达下一个真正需要审批的新步骤。最后用面向用户的口吻简要汇报执行结果（不要提系统消息或内部指令）。"
+                        "[系统] SOP run {rid} 的等待审批步骤【已经获得用户批准，审批已完成，不要再向用户请求任何批准或确认】。{rule}{SCOPE_RULE}请立即用 sop_advance 推进并执行该流程的后续步骤，直到全部完成或到达下一个真正需要审批的新步骤。不要提系统消息或内部指令。{PRESENTATION_RULE}"
                     );
-                    let prior = { history.lock().clone() };
+                    // 前台派活建的单接着它自己的历史；对话或通道起的 run 没有单独历史，沿用共享的
+                    let own = run_histories().lock().get(&rid).cloned();
+                    let isolated = own.is_some();
+                    let prior = own.unwrap_or_else(|| history.lock().clone());
                     match crate::agent::process_message_with_history(
                         config,
                         &wake,
@@ -2070,7 +2162,12 @@ async fn handle_sop_approve(
                     .await
                     {
                         Ok((resp, new_hist)) => {
-                            *history.lock() = new_hist;
+                            let resp = final_reply(&resp, &new_hist);
+                            if isolated {
+                                save_run_history(&rid, new_hist);
+                            } else {
+                                *history.lock() = new_hist;
+                            }
                             // 续跑结果实时推给前台（对话里直接显示汇报），同时留一份供补发：
                             // 用户批准后往往就切走了，这一刻没有 SSE 监听者的话结果会凭空消失。
                             let ts = chrono::Utc::now().timestamp();
@@ -5482,6 +5579,66 @@ mod tests {
             0,
             "provider must not be called once the vision gate rejects the request"
         );
+    }
+}
+
+#[cfg(test)]
+mod run_history_tests {
+    use super::{run_histories, save_run_history};
+    use crate::providers::ChatMessage;
+
+    #[test]
+    fn each_run_keeps_its_own_history() {
+        save_run_history("run-iso-a", vec![ChatMessage::user("病例 A")]);
+        save_run_history("run-iso-b", vec![ChatMessage::user("病例 B")]);
+        let map = run_histories().lock();
+        assert_eq!(map["run-iso-a"][0].content, "病例 A");
+        assert_eq!(map["run-iso-b"][0].content, "病例 B");
+    }
+}
+
+#[cfg(test)]
+mod final_reply_tests {
+    use super::final_reply;
+    use crate::providers::ChatMessage;
+
+    #[test]
+    fn takes_the_last_assistant_message_not_the_merged_narration() {
+        let hist = vec![
+            ChatMessage::user("派活"),
+            ChatMessage::assistant(r#"{"tool_calls":[]}"#),
+            ChatMessage::assistant("📋 报告草稿已完成，等待审核"),
+        ];
+        let merged = "I'll start with the checks.\n\n📋 报告草稿已完成，等待审核";
+        assert_eq!(final_reply(merged, &hist), "📋 报告草稿已完成，等待审核");
+    }
+
+    #[test]
+    fn falls_back_to_merged_text_when_history_has_nothing_usable() {
+        assert_eq!(final_reply("原文", &[]), "原文");
+        let hist = vec![ChatMessage::assistant(r#"{"tool_calls":[]}"#)];
+        assert_eq!(final_reply("原文", &hist), "原文");
+    }
+}
+
+#[cfg(test)]
+mod approver_rule_tests {
+    use super::approver_rule;
+
+    #[test]
+    fn named_approver_is_the_only_allowed_signature() {
+        let r = approver_rule(Some("张医生"));
+        assert!(r.contains("「张医生」"));
+        assert!(r.contains("不得写任何其他人名"));
+    }
+
+    #[test]
+    fn unknown_approver_forbids_inventing_a_name() {
+        for a in [None, Some(""), Some("   ")] {
+            let r = approver_rule(a);
+            assert!(r.contains("姓名未登记"), "{r}");
+            assert!(r.contains("不得从记忆"), "{r}");
+        }
     }
 }
 

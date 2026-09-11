@@ -1061,6 +1061,19 @@ fn short_label(title: &str) -> String {
 /// 响应带 `{"api":"frontdesk","api_version":1}` 标记：gateway 对未匹配的 GET 走 SPA fallback
 /// 返回 200 + HTML，客户端只看状态码会把「旧版本不支持」误判成「支持但清单为空」。
 /// 有了这个标记，客户端可以确定性地判断降级。
+/// SOP 的人读标题：SOP.md 第一个一级标题，去掉结尾的「SOP」。取不到返回 None。
+fn sop_title(sop: &crate::sop::types::Sop) -> Option<String> {
+    let md = std::fs::read_to_string(sop.location.as_ref()?.join("SOP.md")).ok()?;
+    heading_title(&md)
+}
+
+fn heading_title(md: &str) -> Option<String> {
+    let line = md.lines().find(|l| l.starts_with("# "))?;
+    let t = line.trim_start_matches("# ").trim();
+    let t = t.strip_suffix("SOP").unwrap_or(t).trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 pub async fn handle_api_capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1097,7 +1110,9 @@ pub async fn handle_api_capabilities(
                     .collect();
                 serde_json::json!({
                     "name": sop.name,
-                    "title": sop.name,
+                    // 人读的名字取 SOP.md 的一级标题（「# 临床病例解读报告 SOP」→「临床病例解读报告」）；
+                    // 以前直接给 name，前台满屏都是 case-clinical-report
+                    "title": sop_title(sop).unwrap_or_else(|| sop.name.clone()),
                     "description": sop.description,
                     "version": sop.version,
                     "steps": steps,
@@ -1172,17 +1187,16 @@ pub async fn handle_api_tasks(
                 } else {
                     None
                 };
-                let evidence_count = turn
-                    .as_ref()
-                    .map(|t| {
-                        crate::ledger::evidence_for_turn(&trace_path, t)
-                            .iter()
-                            .filter(|e| {
-                                e.source_class == crate::ledger::SourceClass::External
-                            })
-                            .count()
-                    })
-                    .unwrap_or(0);
+                let evidence_count = if avail.available {
+                    crate::ledger::evidence_for_run(&trace_path, &r.run_id)
+                        .iter()
+                        .filter(|e| {
+                            e.source_class == crate::ledger::SourceClass::External && e.success
+                        })
+                        .count()
+                } else {
+                    0
+                };
                 serde_json::json!({
                     "task_id": r.run_id,
                     "run_id": r.run_id,
@@ -1264,27 +1278,166 @@ pub async fn handle_api_task_detail(
         })
     };
 
-    let turn = if avail.available {
-        crate::ledger::turn_for_run(&trace_path, &run_id)
+    let turns = if avail.available {
+        crate::ledger::turns_for_run(&trace_path, &run_id)
     } else {
-        None
+        Vec::new()
     };
-    let evidence = turn
-        .as_ref()
-        .map(|t| crate::ledger::evidence_for_turn(&trace_path, t))
-        .unwrap_or_default();
+    let evidence = if avail.available {
+        crate::ledger::evidence_for_run(&trace_path, &run_id)
+    } else {
+        Vec::new()
+    };
+    let workspace = state.config.lock().workspace_dir.clone();
+    let artifacts: Vec<serde_json::Value> = task_artifacts(&evidence, &workspace)
+        .into_iter()
+        .map(|a| serde_json::json!({"id": a.id, "path": a.rel, "bytes": a.bytes}))
+        .collect();
 
     Json(serde_json::json!({
         "api": "frontdesk",
         "api_version": 1,
         "ledger": avail,
         "task": run_json,
-        "turn_id": turn,
+        "turn_id": turns.first(),
+        "turn_ids": turns,
         "evidence": evidence,
+        // 这一单写出的文件（取自工具调用记录，且此刻仍在工作区里）。内容只走下面的 Bearer 端点
+        "artifacts": artifacts,
         // 说清楚这批证据是什么、不是什么——界面直接引用这句，不要另行编写
-        "evidence_note": "以上是这项任务所在那一轮对话里记录到的工具调用。只有向外部取数据、且调用成功的，才算依据；读本地文件的可能读的是旧缓存，助手自己写的内容不算依据。没有被记录下来的调用不在此列。",
+        "evidence_note": "以上是这项任务的各轮对话里记录到的工具调用。只有向外部取数据、且调用成功的，才算依据；读本地文件的可能读的是旧缓存，助手自己写的内容不算依据。没有被记录下来的调用不在此列。",
     }))
     .into_response()
+}
+
+/// 一单写出的一个文件。
+pub(crate) struct TaskArtifact {
+    pub id: String,
+    pub rel: String,
+    pub abs: std::path::PathBuf,
+    pub bytes: u64,
+}
+
+/// 这一单写出的文件：取自它各轮里**成功的** file_write / file_edit 调用的路径，
+/// 同一路径只算一次（取最后一次），且此刻仍在工作区里。
+/// 只有这里列出的文件能经 /api/tasks/{id}/artifacts/{aid} 取回——
+/// 前台不能借这个端点读工作区里的任意文件（比如别的病例）。
+pub(crate) fn task_artifacts(
+    evidence: &[crate::ledger::Evidence],
+    workspace: &std::path::Path,
+) -> Vec<TaskArtifact> {
+    let mut paths: Vec<String> = Vec::new();
+    for e in evidence {
+        if !(e.tool == "file_write" || e.tool == "file_edit") || !e.success {
+            continue;
+        }
+        if let Some(p) = &e.path {
+            paths.retain(|x| x != p);
+            paths.push(p.clone());
+        }
+    }
+    let Ok(root) = workspace.canonicalize() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for rel in paths {
+        let candidate = std::path::Path::new(&rel);
+        // 只接受工作区内的相对路径：绝对路径、「..」一律不要
+        if candidate.is_absolute()
+            || candidate
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let Ok(abs) = root.join(candidate).canonicalize() else {
+            continue;
+        };
+        if !abs.starts_with(&root) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&abs) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let id = format!("A{}", out.len() + 1);
+        out.push(TaskArtifact {
+            id,
+            rel,
+            abs,
+            bytes: meta.len(),
+        });
+    }
+    out
+}
+
+/// 产物单次最多回传的字节数：报告是文本，远小于此；超过就明说太大，不截半份给人看
+const ARTIFACT_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// GET /api/tasks/{run_id}/artifacts/{aid} — 这一单写出的某个文件的内容。
+/// 与证据全文同一原则：只走 Bearer 鉴权的 JSON，**不发签名 URL**——报告里是患者资料，
+/// 签名链接会被转发、被贴进聊天。
+pub async fn handle_api_task_artifact(
+    State(state): State<AppState>,
+    Path((run_id, aid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (trace_path, full) = trace_setup(&state);
+    let avail = crate::ledger::availability(&trace_path, full);
+    if !avail.available {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"api":"frontdesk","ledger":avail})),
+        )
+            .into_response();
+    }
+    let workspace = state.config.lock().workspace_dir.clone();
+    let evidence = crate::ledger::evidence_for_run(&trace_path, &run_id);
+    let Some(a) = task_artifacts(&evidence, &workspace)
+        .into_iter()
+        .find(|a| a.id == aid)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"api":"frontdesk","error":"这一单没有这个产物，或文件已不在工作区","aid":aid})),
+        )
+            .into_response();
+    };
+    if a.bytes > ARTIFACT_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"api":"frontdesk","error":"文件太大，无法在前台直接查看","bytes":a.bytes})),
+        )
+            .into_response();
+    }
+    match std::fs::read(&a.abs) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => Json(serde_json::json!({
+                "api": "frontdesk",
+                "api_version": 1,
+                "id": a.id,
+                "path": a.rel,
+                "bytes": a.bytes,
+                "content": text,
+            }))
+            .into_response(),
+            Err(_) => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(serde_json::json!({"api":"frontdesk","error":"不是文本文件，前台暂不支持查看","path":a.rel})),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"api":"frontdesk","error":format!("读取失败：{e}"),"path":a.rel})),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/tasks/{run_id}/evidence/{eid} — 证据全文。
@@ -1307,14 +1460,7 @@ pub async fn handle_api_task_evidence(
         )
             .into_response();
     }
-    let Some(turn) = crate::ledger::turn_for_run(&trace_path, &run_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"该任务没有可关联的对话轮记录","run_id":run_id})),
-        )
-            .into_response();
-    };
-    match crate::ledger::evidence_full(&trace_path, &turn, &eid) {
+    match crate::ledger::evidence_full_for_run(&trace_path, &run_id, &eid) {
         Some((meta, full_text)) => Json(serde_json::json!({
             "api": "frontdesk",
             "api_version": 1,
@@ -1433,8 +1579,8 @@ pub async fn handle_api_search(
             }
         }
         if avail.available {
-            if let Some(turn) = crate::ledger::turn_for_run(&trace_path, run_id) {
-                for e in crate::ledger::evidence_for_turn(&trace_path, &turn) {
+            {
+                for e in crate::ledger::evidence_for_run(&trace_path, run_id) {
                     let hay = format!(
                         "{} {}",
                         e.args_excerpt.clone().unwrap_or_default(),
@@ -1662,6 +1808,68 @@ pub async fn handle_api_sop_runs(
             .collect()
     };
     Json(serde_json::json!({ "runs": runs })).into_response()
+}
+
+#[cfg(test)]
+mod task_artifact_tests {
+    use super::task_artifacts;
+    use crate::ledger::{Evidence, SourceClass};
+
+    fn write(path: &str, ok: bool) -> Evidence {
+        Evidence {
+            eid: "E1-000000".into(),
+            n: 1,
+            at: String::new(),
+            tool: "file_write".into(),
+            source_class: SourceClass::SelfProduced,
+            args_excerpt: None,
+            output_excerpt: String::new(),
+            output_bytes: 0,
+            sha256: "0".repeat(64),
+            success: ok,
+            turn_id: "t".into(),
+            path: Some(path.into()),
+        }
+    }
+
+    #[test]
+    fn lists_only_files_this_task_wrote_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("case/a")).unwrap();
+        std::fs::write(ws.join("case/a/report_final.md"), "# 报告").unwrap();
+        std::fs::write(ws.join("case/a/draft.md"), "草稿").unwrap();
+        let outside = dir.path().parent().unwrap().join("outside.md");
+        let ev = vec![
+            write("case/a/draft.md", true),
+            write("case/a/report_final.md", true),
+            write("case/a/draft.md", true),   // 重写：同一路径只算一次
+            write("case/a/failed.md", false), // 写失败的不算
+            write("../outside.md", true),     // 跳出工作区的不要
+            write(outside.to_str().unwrap(), true), // 绝对路径不要
+            write("case/a/gone.md", true),    // 已不在工作区的不列
+        ];
+        let arts = task_artifacts(&ev, ws);
+        let paths: Vec<&str> = arts.iter().map(|a| a.rel.as_str()).collect();
+        assert_eq!(paths, vec!["case/a/report_final.md", "case/a/draft.md"]);
+        assert_eq!(arts[0].id, "A1");
+    }
+}
+
+#[cfg(test)]
+mod sop_title_tests {
+    use super::heading_title;
+
+    #[test]
+    fn takes_the_first_h1_without_the_sop_suffix() {
+        assert_eq!(
+            heading_title("# 临床病例解读报告 SOP\n\n正文").as_deref(),
+            Some("临床病例解读报告")
+        );
+        assert_eq!(heading_title("## 二级\n# 标题").as_deref(), Some("标题"));
+        assert_eq!(heading_title("没有标题"), None);
+        assert_eq!(heading_title("# SOP"), None);
+    }
 }
 
 #[cfg(test)]
