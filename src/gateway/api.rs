@@ -1509,7 +1509,7 @@ pub async fn handle_api_task_verdict(
         .map(|t| redact_feedback(t.trim()))
         .filter(|t| !t.is_empty());
     let valid = match kind {
-        "agree" => b.rec_id.is_some(),
+        "agree" | "retract" => b.rec_id.is_some(),
         "disagree" => b.rec_id.is_some() && text.is_some(),
         "answer" => b.qid.is_some() && text.is_some(),
         _ => false,
@@ -1522,18 +1522,30 @@ pub async fn handle_api_task_verdict(
             .into_response();
     }
     let workspace = state.config.lock().workspace_dir.clone();
+    let path = super::casebook::verdicts_path(&workspace);
+    let text: Option<String> = text.map(|t| t.chars().take(1000).collect());
+    // 幂等：同一条（同一建议 / 同一问题）的最新记录与这次完全一样，就不再追加——
+    // 实测按钮多点几下，记录里就出现三条「认可 R1」、六条同样的回答。改了主意（换答案、认可改不认同）照常记。
+    let existing = super::casebook::read_jsonl_for_run(&path, &run_id);
+    if let Some(same) = super::casebook::latest_verdict_if_same(
+        &existing,
+        kind,
+        b.rec_id.as_deref(),
+        b.qid.as_deref(),
+        text.as_deref(),
+    ) {
+        return Json(serde_json::json!({"api":"frontdesk","api_version":1,"recorded":false,"duplicate":true,"entry":same})).into_response();
+    }
     let entry = serde_json::json!({
         "run_id": run_id,
         "at": chrono::Utc::now().to_rfc3339(),
         "kind": kind,
         "rec_id": b.rec_id,
         "qid": b.qid,
-        "text": text.map(|t| t.chars().take(1000).collect::<String>()),
+        "text": text,
         "who": b.who.as_deref().map(str::trim).filter(|w| !w.is_empty()),
     });
-    if let Err(e) =
-        super::casebook::append_jsonl(&super::casebook::verdicts_path(&workspace), &entry)
-    {
+    if let Err(e) = super::casebook::append_jsonl(&path, &entry) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"api":"frontdesk","error":format!("记不下来：{e}")})),

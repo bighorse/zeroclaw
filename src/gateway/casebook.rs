@@ -279,6 +279,40 @@ pub fn read_jsonl_for_run(path: &Path, run_id: &str) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// 这一条（同一建议或同一问题）最新的一次记录，若与本次完全相同就返回它（调用方据此不再追加）。
+/// 认可 / 不认同 / 撤回 共用「建议」这一个槽位；回答按问题各占一个槽位。
+pub fn latest_verdict_if_same(
+    existing: &[serde_json::Value],
+    kind: &str,
+    rec_id: Option<&str>,
+    qid: Option<&str>,
+    text: Option<&str>,
+) -> Option<serde_json::Value> {
+    let slot = |v: &serde_json::Value| -> Option<String> {
+        match v.get("kind").and_then(|k| k.as_str())? {
+            "answer" => v
+                .get("qid")
+                .and_then(|q| q.as_str())
+                .map(|q| format!("q:{q}")),
+            _ => v
+                .get("rec_id")
+                .and_then(|r| r.as_str())
+                .map(|r| format!("r:{r}")),
+        }
+    };
+    let want = match kind {
+        "answer" => format!("q:{}", qid?),
+        _ => format!("r:{}", rec_id?),
+    };
+    let last = existing
+        .iter()
+        .rev()
+        .find(|v| slot(v).as_deref() == Some(&want))?;
+    let same_kind = last.get("kind").and_then(|k| k.as_str()) == Some(kind);
+    let same_text = last.get("text").and_then(|t| t.as_str()) == text;
+    (same_kind && same_text).then(|| last.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +404,32 @@ mod tests {
         assert!(recs[1].get("verified").is_none(), "模型自称的核验不作数");
         assert_eq!(a["checks"]["binding_violations"], 2);
         assert_eq!(a["rules"][0]["evidence_status"][0]["verified"], true);
+    }
+
+    #[test]
+    fn repeated_clicks_do_not_pile_up_but_changes_are_kept() {
+        let v = |kind: &str, rec: Option<&str>, q: Option<&str>, text: Option<&str>| serde_json::json!({"kind": kind, "rec_id": rec, "qid": q, "text": text});
+        let log = vec![
+            v("agree", Some("R1"), None, None),
+            v("answer", None, Some("Q1"), Some("C-TIRADS")),
+        ];
+        assert!(latest_verdict_if_same(&log, "agree", Some("R1"), None, None).is_some());
+        assert!(
+            latest_verdict_if_same(&log, "answer", None, Some("Q1"), Some("C-TIRADS")).is_some()
+        );
+        // 改了主意：照常记
+        assert!(
+            latest_verdict_if_same(&log, "answer", None, Some("Q1"), Some("ACR TI-RADS")).is_none()
+        );
+        assert!(latest_verdict_if_same(&log, "disagree", Some("R1"), None, Some("不对")).is_none());
+        // 别的建议、别的问题：互不相干
+        assert!(latest_verdict_if_same(&log, "agree", Some("R2"), None, None).is_none());
+        let mut log2 = log.clone();
+        log2.push(v("retract", Some("R1"), None, None));
+        assert!(
+            latest_verdict_if_same(&log2, "agree", Some("R1"), None, None).is_none(),
+            "撤回后再认可要记"
+        );
     }
 
     #[test]
