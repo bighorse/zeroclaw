@@ -624,6 +624,7 @@ mod tests {
             step_results,
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         }
     }
 
@@ -1185,6 +1186,7 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         };
         audit.log_run_start(&run).await.unwrap();
 
@@ -1283,6 +1285,7 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         };
         audit.log_run_start(&running_run).await.unwrap();
         audit.log_approval(&running_run, 1).await.unwrap();

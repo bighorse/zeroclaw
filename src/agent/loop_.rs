@@ -2350,17 +2350,12 @@ pub(crate) async fn run_tool_call_loop(
         period,
     }) = crate::cost::pre_call_budget_state(cost_tracker)
     {
-        let period_cn = match period {
-            crate::cost::UsagePeriod::Day => "今日",
-            crate::cost::UsagePeriod::Month => "本月",
-            crate::cost::UsagePeriod::Session => "本次会话",
-        };
-        anyhow::bail!(
-            "{period_cn}额度已用完（已用 ¥{:.2} / 上限 ¥{:.2}）。请联系管理员提升额度，或等{}重置后再用。",
+        return Err(crate::cost::BudgetExceededError {
             current_usd,
             limit_usd,
-            if matches!(period, crate::cost::UsagePeriod::Day) {"次日零点"} else {"下月初"},
-        );
+            period,
+        }
+        .into());
     }
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
@@ -2720,14 +2715,13 @@ pub(crate) async fn run_tool_call_loop(
                 period,
             }) = &budget_check
             {
-                anyhow::bail!(
-                    "Cost budget exceeded during agent loop: ${:.4} / ${:.2} USD ({:?}). \
-                     Aborting before further LLM calls. Raise the limit in [cost] or \
-                     wait for the period to reset.",
-                    current_usd,
-                    limit_usd,
-                    period,
-                );
+                // 与开头的预检同一个错误类型：对用户是同一句中文，调用方也能认出是额度用完
+                return Err(crate::cost::BudgetExceededError {
+                    current_usd: *current_usd,
+                    limit_usd: *limit_usd,
+                    period: *period,
+                }
+                .into());
             }
         }
 

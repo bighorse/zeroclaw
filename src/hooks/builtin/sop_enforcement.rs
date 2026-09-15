@@ -714,6 +714,7 @@ mod tests {
                 step_results: vec![],
                 waiting_since: None,
                 llm_calls_saved: 0,
+                failure_kind: None,
             };
             eng.active_runs_mut_for_test()
                 .insert(run.run_id.clone(), run);

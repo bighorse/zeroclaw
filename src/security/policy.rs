@@ -87,6 +87,8 @@ pub struct SecurityPolicy {
     pub forbidden_paths: Vec<String>,
     pub readonly_prefixes: Vec<String>,
     pub noread_prefixes: Vec<String>,
+    /// `noread_prefixes` 的例外（见 `AutonomyConfig::noread_exempt`）
+    pub noread_exempt: Vec<String>,
     pub allowed_roots: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
@@ -119,6 +121,7 @@ impl Default for SecurityPolicy {
             ],
             readonly_prefixes: Vec::new(),
             noread_prefixes: Vec::new(),
+            noread_exempt: Vec::new(),
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
                 "/etc".into(),
@@ -869,7 +872,7 @@ impl SecurityPolicy {
             if cand.starts_with('-') || cand.is_empty() {
                 continue;
             }
-            if self.matches_prefix(cand, &self.noread_prefixes) {
+            if self.is_noread(cand) {
                 return Some(cand.to_string());
             }
         }
@@ -952,12 +955,9 @@ impl SecurityPolicy {
     /// rewrite its own skills/persona (self-modification guard).
     /// True if `path` (workspace-relative) matches any of `prefixes` (dir
     /// prefix, exact file, or basename). Shared by read/write guards.
-    fn matches_prefix(&self, path: &str, prefixes: &[String]) -> bool {
-        if prefixes.is_empty() {
-            return false;
-        }
-        // 归一化到"相对 workspace 根"的形式，覆盖 LLM 尝试的所有绕过写法：
-        // 绝对路径、workspace/ 前缀、./ 前缀、反斜杠。
+    /// 归一化到"相对 workspace 根"的形式，覆盖 LLM 尝试的所有绕过写法：
+    /// 绝对路径、workspace/ 前缀、./ 前缀、反斜杠。
+    fn workspace_rel(&self, path: &str) -> String {
         let expanded = expand_user_path(path);
         let mut rel = if expanded.is_absolute() {
             expanded
@@ -971,6 +971,14 @@ impl SecurityPolicy {
         if let Some(stripped) = rel.strip_prefix("workspace/") {
             rel = stripped.to_string();
         }
+        rel
+    }
+
+    fn matches_prefix(&self, path: &str, prefixes: &[String]) -> bool {
+        if prefixes.is_empty() {
+            return false;
+        }
+        let rel = self.workspace_rel(path);
         let base = rel.rsplit('/').next().unwrap_or(&rel);
         for pref in prefixes {
             let pref: &str = pref.trim_start_matches("./");
@@ -985,7 +993,39 @@ impl SecurityPolicy {
     /// Used by file_read so the agent cannot dump its own skills/persona to a
     /// user. Reads outside the noread set are unaffected.
     pub fn is_read_path_allowed(&self, path: &str) -> bool {
-        self.is_path_allowed(path) && !self.matches_prefix(path, &self.noread_prefixes)
+        self.is_path_allowed(path) && !self.is_noread(path)
+    }
+
+    /// 命中 `noread_prefixes` 且不在 `noread_exempt` 例外里。
+    fn is_noread(&self, path: &str) -> bool {
+        self.matches_prefix(path, &self.noread_prefixes) && !self.matches_noread_exempt(path)
+    }
+
+    /// 例外按路径段匹配：`*` 只匹配一段；以 `/` 结尾时路径必须在该目录之下（比例外多至少一段）。
+    /// 带 `..`、空段或 `.` 段的路径一律不算例外，免得 `sops/x/references/../SOP.md` 绕过。
+    fn matches_noread_exempt(&self, path: &str) -> bool {
+        if self.noread_exempt.is_empty() {
+            return false;
+        }
+        let rel = self.workspace_rel(path);
+        let segs: Vec<&str> = rel.split('/').collect();
+        if segs.iter().any(|s| s.is_empty() || *s == ".." || *s == ".") {
+            return false;
+        }
+        self.noread_exempt.iter().any(|pat| {
+            let pat = pat.trim_start_matches("./");
+            let (pat, dir) = match pat.strip_suffix('/') {
+                Some(p) => (p, true),
+                None => (pat, false),
+            };
+            let psegs: Vec<&str> = pat.split('/').collect();
+            let len_ok = if dir {
+                segs.len() > psegs.len()
+            } else {
+                segs.len() == psegs.len()
+            };
+            len_ok && psegs.iter().zip(&segs).all(|(p, s)| *p == "*" || p == s)
+        })
     }
 
     pub fn is_write_path_allowed(&self, path: &str) -> bool {
@@ -1176,6 +1216,7 @@ impl SecurityPolicy {
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             readonly_prefixes: autonomy_config.readonly_prefixes.clone(),
             noread_prefixes: autonomy_config.noread_prefixes.clone(),
+            noread_exempt: autonomy_config.noread_exempt.clone(),
             allowed_roots: autonomy_config
                 .allowed_roots
                 .iter()
@@ -1546,6 +1587,54 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn noread_exempt_opens_only_the_listed_subtree() {
+        let mut cfg = crate::config::AutonomyConfig::default();
+        cfg.workspace_only = true;
+        cfg.noread_prefixes = vec!["sops/".into(), "USER.md".into()];
+        cfg.noread_exempt = vec!["sops/*/references/".into()];
+        let p = SecurityPolicy::from_config(&cfg, std::path::Path::new("/tmp/ws"));
+
+        // 规程参考样例放开：三种路径写法、file_read 与 cat 都能读
+        assert!(
+            p.is_read_path_allowed("sops/zjb-monthly-workflow/references/plan.sidecar.sample.json")
+        );
+        assert!(p.is_read_path_allowed("/tmp/ws/sops/zjb-ai-search/references/result-schema.md"));
+        assert!(p.is_read_path_allowed("./sops/zjb-ai-search/references/result-schema.md"));
+        assert!(p
+            .noread_command_argument("cat sops/zjb-ai-search/references/result-schema.md")
+            .is_none());
+        assert!(p
+            .noread_command_argument("head -20 sops/zjb-ai-search/references/deep/x.md")
+            .is_none());
+
+        // 规程正文和其它文件照旧挡住
+        assert!(!p.is_read_path_allowed("sops/zjb-ai-search/SOP.md"));
+        assert!(!p.is_read_path_allowed("sops/zjb-ai-search/SOP.toml"));
+        assert!(p
+            .noread_command_argument("cat sops/zjb-ai-search/SOP.md")
+            .is_some());
+        // 目录例外必须真的在目录之下；少一段、多一段通配都不算
+        assert!(!p.is_read_path_allowed("sops/zjb-ai-search/references"));
+        assert!(!p.is_read_path_allowed("sops/references/x.json"));
+        assert!(!p.is_read_path_allowed("sops/a/b/references/x.json"));
+        // 用 .. 从例外目录绕回规程正文：不算例外
+        assert!(p
+            .noread_command_argument("cat sops/zjb-ai-search/references/../SOP.md")
+            .is_some());
+        assert!(!p.is_read_path_allowed("sops/zjb-ai-search/references/./../SOP.md"));
+        assert!(p
+            .noread_command_argument("cat sops/x/references//../SOP.md")
+            .is_some());
+        // 例外不影响按文件名挡的项，也不放宽解释器内联读
+        assert!(!p.is_read_path_allowed("USER.md"));
+        assert!(p
+            .noread_command_argument(
+                "python3 -c \"print(open('sops/x/references/a.json').read())\""
+            )
+            .is_some());
     }
 
     #[test]

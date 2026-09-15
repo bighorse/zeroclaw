@@ -348,6 +348,10 @@ pub struct SopRun {
     /// Number of LLM calls saved by deterministic execution in this run.
     #[serde(default)]
     pub llm_calls_saved: u64,
+    /// 失败时的机器可读类型（`budget_exceeded` 额度用完 / `turn_failed` 执行轮出错 /
+    /// `not_advanced` 这一轮没推进任何步骤），让派活方不必去匹配失败文案。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
 }
 
 // ── Deterministic workflow state (persistence + resume) ──────────
@@ -637,6 +641,7 @@ path = "/sop/test"
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();

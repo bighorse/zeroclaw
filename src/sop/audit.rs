@@ -140,6 +140,7 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         }
     }
 

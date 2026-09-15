@@ -1965,9 +1965,10 @@ async fn handle_api_task_create(
                             {
                                 if let Ok(mut eng) = engine_for_failure.lock() {
                                     if eng.is_untouched(&rid) {
-                                        eng.fail_if_stuck(
+                                        eng.fail_if_stuck_with_kind(
                                             &rid,
                                             "助手这一轮结束时没有推进这一单（没有完成任何步骤），流程已中止。可以重新派活。",
+                                            Some("not_advanced"),
                                         );
                                     }
                                 }
@@ -1988,7 +1989,17 @@ async fn handle_api_task_create(
                             // 推动这一单的那一轮死了：run 若仍是 Running，就如实结束为 Failed——
                             // 只推一个 SSE 事件不够（不进补发缓冲，没人在线就丢），run 会永远「运行中」
                             if let Ok(mut eng) = engine_for_failure.lock() {
-                                eng.fail_if_stuck(&rid, &format!("执行这一步的对话轮失败：{e}"));
+                                // 额度用完单独标出来：派活方要把它显示成「额度用完」而不是「助手出错」
+                                let kind = if crate::cost::is_budget_exceeded(&e) {
+                                    "budget_exceeded"
+                                } else {
+                                    "turn_failed"
+                                };
+                                eng.fail_if_stuck_with_kind(
+                                    &rid,
+                                    &format!("执行这一步的对话轮失败：{e}"),
+                                    Some(kind),
+                                );
                             }
                             let _ = event_tx.send(serde_json::json!({
                                 "type": "error",

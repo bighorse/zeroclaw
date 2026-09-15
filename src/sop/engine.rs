@@ -177,6 +177,7 @@ impl SopEngine {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         };
 
         self.active_runs.insert(run_id.clone(), run);
@@ -322,12 +323,23 @@ impl SopEngine {
     }
 
     pub fn fail_if_stuck(&mut self, run_id: &str, reason: &str) -> bool {
+        self.fail_if_stuck_with_kind(run_id, reason, None)
+    }
+
+    /// 同 [`Self::fail_if_stuck`]，另记下失败类型（见 `SopRun::failure_kind`）。
+    pub fn fail_if_stuck_with_kind(
+        &mut self,
+        run_id: &str,
+        reason: &str,
+        kind: Option<&str>,
+    ) -> bool {
         let Some(run) = self.active_runs.get_mut(run_id) else {
             return false;
         };
         if run.status != SopRunStatus::Running {
             return false;
         }
+        run.failure_kind = kind.map(str::to_string);
         let now = now_iso8601();
         run.step_results.push(SopStepResult {
             step_number: run.current_step,
@@ -486,6 +498,7 @@ impl SopEngine {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         };
 
         self.active_runs.insert(run_id.clone(), run);
@@ -1661,6 +1674,34 @@ mod tests {
         assert!(!engine.fail_if_stuck("nonexistent", "x"));
     }
 
+    #[test]
+    fn fail_if_stuck_with_kind_records_the_kind_and_old_runs_default_to_none() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(engine.fail_if_stuck_with_kind(
+            &run_id,
+            "执行这一步的对话轮失败：今日额度已用完",
+            Some("budget_exceeded")
+        ));
+        let finished = engine.get_run(&run_id).unwrap();
+        assert_eq!(finished.failure_kind.as_deref(), Some("budget_exceeded"));
+
+        // 老版本落盘的 run 没有这个字段，读回来是 None；None 时也不写出这个键
+        let mut v = serde_json::to_value(finished).unwrap();
+        v.as_object_mut().unwrap().remove("failure_kind");
+        let old: SopRun = serde_json::from_value(v).unwrap();
+        assert_eq!(old.failure_kind, None);
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("failure_kind")
+            .is_none());
+    }
+
     // ── Concurrency ─────────────────────────────────────
 
     #[test]
@@ -1992,6 +2033,7 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         };
         let ctx = format_step_context(&sop, &run, &sop.steps[0]);
         assert!(ctx.contains("pump-shutdown"));

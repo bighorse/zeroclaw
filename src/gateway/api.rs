@@ -69,6 +69,22 @@ pub struct CronAddBody {
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
+
+/// 失败单的原因：`kind` 是机器可读的类型（额度用完 / 执行轮出错 / 没推进步骤，老数据为 null），
+/// `message` 取失败那一步记下的文字。非失败单返回 null。
+fn task_failure(r: &crate::sop::types::SopRun) -> serde_json::Value {
+    if r.status != crate::sop::types::SopRunStatus::Failed {
+        return serde_json::Value::Null;
+    }
+    let message = r
+        .step_results
+        .iter()
+        .rev()
+        .find(|sr| sr.status == crate::sop::types::SopStepStatus::Failed)
+        .map(|sr| sr.output.chars().take(500).collect::<String>());
+    serde_json::json!({"kind": r.failure_kind, "message": message})
+}
+
 pub async fn handle_api_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1208,6 +1224,7 @@ pub async fn handle_api_tasks(
                     "started_at": r.started_at,
                     "waiting_since": r.waiting_since,
                     "completed_at": r.completed_at,
+                    "failure": task_failure(r),
                     "trigger_payload": r.trigger_event.payload.as_ref().map(|p| p.chars().take(1500).collect::<String>()),
                     "turn_id": turn,
                     "external_evidence_count": evidence_count,
@@ -1303,6 +1320,7 @@ pub async fn handle_api_task_detail(
             "started_at": r.started_at,
             "waiting_since": r.waiting_since,
             "completed_at": r.completed_at,
+            "failure": task_failure(r),
             "trigger_payload": r.trigger_event.payload.clone(),
             "step_results": r.step_results.iter().map(|sr| serde_json::json!({
                 "step": sr.step_number,
@@ -3021,5 +3039,76 @@ mod tests {
             .embedding_routes
             .iter()
             .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+    }
+}
+
+#[cfg(test)]
+mod task_failure_tests {
+    use super::task_failure;
+    use crate::sop::types::{
+        SopEvent, SopRun, SopRunStatus, SopStepResult, SopStepStatus, SopTriggerSource,
+    };
+
+    fn run(status: SopRunStatus, kind: Option<&str>, steps: Vec<(SopStepStatus, &str)>) -> SopRun {
+        SopRun {
+            run_id: "run-1".into(),
+            sop_name: "zjb-ai-search".into(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: "2026-09-15T04:42:09Z".into(),
+            },
+            status,
+            current_step: 1,
+            total_steps: 5,
+            started_at: "2026-09-15T04:42:09Z".into(),
+            completed_at: None,
+            step_results: steps
+                .into_iter()
+                .enumerate()
+                .map(|(i, (status, output))| SopStepResult {
+                    step_number: i as u32 + 1,
+                    status,
+                    output: output.into(),
+                    started_at: String::new(),
+                    completed_at: None,
+                })
+                .collect(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+            failure_kind: kind.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn failed_run_reports_kind_and_the_failed_step_text() {
+        let r = run(
+            SopRunStatus::Failed,
+            Some("budget_exceeded"),
+            vec![
+                (SopStepStatus::Completed, "读完配置"),
+                (
+                    SopStepStatus::Failed,
+                    "执行这一步的对话轮失败：今日额度已用完",
+                ),
+            ],
+        );
+        let v = task_failure(&r);
+        assert_eq!(v["kind"], "budget_exceeded");
+        assert_eq!(v["message"], "执行这一步的对话轮失败：今日额度已用完");
+    }
+
+    #[test]
+    fn non_failed_runs_have_no_failure_and_old_failed_runs_have_null_kind() {
+        assert!(task_failure(&run(SopRunStatus::Completed, None, vec![])).is_null());
+        assert!(task_failure(&run(SopRunStatus::Running, None, vec![])).is_null());
+        let old = task_failure(&run(
+            SopRunStatus::Failed,
+            None,
+            vec![(SopStepStatus::Failed, "x")],
+        ));
+        assert!(old["kind"].is_null());
+        assert_eq!(old["message"], "x");
     }
 }

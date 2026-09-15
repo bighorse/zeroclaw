@@ -109,6 +109,35 @@ pub enum BudgetCheck {
     },
 }
 
+/// 额度用完、这一轮被拦下时返回的错误。做成具体类型而不是一句文本，是为了让
+/// 调用方（比如任务执行轮失败时）沿错误链认出「额度用完」，而不必去匹配文案。
+///
+/// 金额单位跟 `[cost]` 一致：价格表与限额都按美元配置，所以显示美元。之前写成
+/// ¥ 会让人把 $20 看成 ¥20，低估七倍多。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetExceededError {
+    pub current_usd: f64,
+    pub limit_usd: f64,
+    pub period: UsagePeriod,
+}
+
+impl std::fmt::Display for BudgetExceededError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (period, reset) = match self.period {
+            UsagePeriod::Day => ("今日", "次日零点重置后"),
+            UsagePeriod::Month => ("本月", "下月初重置后"),
+            UsagePeriod::Session => ("本次会话", "开启新会话后"),
+        };
+        write!(
+            f,
+            "{period}额度已用完（已用 ${:.2} / 上限 ${:.2}，美元）。请联系管理员提升额度，或等{reset}再用。",
+            self.current_usd, self.limit_usd,
+        )
+    }
+}
+
+impl std::error::Error for BudgetExceededError {}
+
 /// Cost summary for reporting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostSummary {

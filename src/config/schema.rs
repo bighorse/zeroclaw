@@ -2480,6 +2480,12 @@ pub struct AutonomyConfig {
     /// daemon still loads these at startup via direct fs (not the agent tools).
     #[serde(default)]
     pub noread_prefixes: Vec<String>,
+
+    /// `noread_prefixes` 的例外：命中这里的路径仍然可读。按路径段匹配，`*` 只匹配一段，
+    /// 以 `/` 结尾表示该目录下的所有文件，例如 `sops/*/references/` 放开规程的参考样例、
+    /// 同时仍挡住 `sops/*/SOP.md`。带 `..` 的路径一律不算例外。
+    #[serde(default)]
+    pub noread_exempt: Vec<String>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -2549,6 +2555,7 @@ impl Default for AutonomyConfig {
             allowed_roots: Vec::new(),
             readonly_prefixes: Vec::new(),
             noread_prefixes: Vec::new(),
+            noread_exempt: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
         }
     }
@@ -6067,6 +6074,7 @@ default_temperature = 0.7
             },
             autonomy: AutonomyConfig {
                 noread_prefixes: Vec::new(),
+                noread_exempt: Vec::new(),
                 readonly_prefixes: Vec::new(),
                 level: AutonomyLevel::Full,
                 workspace_only: false,

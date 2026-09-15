@@ -5,7 +5,9 @@ pub mod types;
 #[allow(unused_imports)]
 pub use tracker::CostTracker;
 #[allow(unused_imports)]
-pub use types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod};
+pub use types::{
+    BudgetCheck, BudgetExceededError, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod,
+};
 
 use crate::config::schema::{CostConfig, ModelPricing};
 use std::path::Path;
@@ -228,6 +230,12 @@ pub fn apply_allow_override(check: BudgetCheck, allow_override: bool) -> BudgetC
 /// underlying budget check errored; callers should treat `None` as
 /// "proceed" (fail-open — missing budget data should never block user
 /// requests, only clear over-limit states should).
+/// 错误链里有没有「额度用完」（中间可能被包了几层 context）。
+pub fn is_budget_exceeded(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<BudgetExceededError>().is_some())
+}
+
 pub fn pre_call_budget_state(tracker: Option<&Arc<CostTracker>>) -> Option<BudgetCheck> {
     let tracker = tracker?;
     match tracker.check_budget(0.0) {
@@ -247,6 +255,44 @@ mod tests {
     use super::*;
     use crate::providers::traits::TokenUsage as ProviderTokenUsage;
     use tempfile::TempDir;
+
+    #[test]
+    fn budget_exceeded_is_found_through_context_and_says_dollars() {
+        let err = anyhow::Error::from(BudgetExceededError {
+            current_usd: 20.03,
+            limit_usd: 20.0,
+            period: UsagePeriod::Day,
+        })
+        .context("执行这一步的对话轮失败");
+        assert!(is_budget_exceeded(&err));
+        assert!(!is_budget_exceeded(&anyhow::anyhow!("模型鉴权失败（401）")));
+
+        let msg = BudgetExceededError {
+            current_usd: 20.03,
+            limit_usd: 20.0,
+            period: UsagePeriod::Day,
+        }
+        .to_string();
+        assert!(msg.starts_with("今日额度已用完"), "{msg}");
+        assert!(
+            msg.contains("$20.03") && msg.contains("$20.00") && msg.contains("美元"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains('¥'),
+            "限额按美元配置，不能显示成人民币：{msg}"
+        );
+        let month = BudgetExceededError {
+            current_usd: 61.0,
+            limit_usd: 60.0,
+            period: UsagePeriod::Month,
+        }
+        .to_string();
+        assert!(
+            month.starts_with("本月额度已用完") && month.contains("下月初"),
+            "{month}"
+        );
+    }
 
     fn price(input: f64, output: f64) -> ModelPricing {
         ModelPricing { input, output }

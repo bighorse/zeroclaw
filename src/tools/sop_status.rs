@@ -381,6 +381,7 @@ mod tests {
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         };
         collector.record_run_complete(&run);
 
@@ -417,6 +418,7 @@ mod tests {
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            failure_kind: None,
         };
         collector.record_run_complete(&run);
 
