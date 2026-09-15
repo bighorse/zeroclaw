@@ -1263,7 +1263,9 @@ pub async fn handle_api_task_detail(
                 )
                     .into_response();
             }
-            let evidence = crate::ledger::evidence_for_run(&trace_path, &run_id);
+            let with_output = crate::ledger::evidence_with_output_for_run(&trace_path, &run_id);
+            let evidence: Vec<crate::ledger::Evidence> =
+                with_output.iter().map(|(e, _)| e.clone()).collect();
             let workspace = state.config.lock().workspace_dir.clone();
             let artifacts: Vec<serde_json::Value> = task_artifacts(&evidence, &workspace)
                 .into_iter()
@@ -1280,6 +1282,7 @@ pub async fn handle_api_task_detail(
                 "turn_ids": turns,
                 "evidence": evidence,
                 "artifacts": artifacts,
+                "casebook": task_casebook(&state, &run_id, &with_output),
                 "evidence_note": "服务端已不保留这一单的执行状态（助手重启过），以上工具调用与产物取自落盘的调用记录。只有向外部取数据、且调用成功的，才算依据；读本地文件的可能读的是旧缓存，助手自己写的内容不算依据。",
             }))
             .into_response();
@@ -1313,11 +1316,13 @@ pub async fn handle_api_task_detail(
     } else {
         Vec::new()
     };
-    let evidence = if avail.available {
-        crate::ledger::evidence_for_run(&trace_path, &run_id)
+    let with_output = if avail.available {
+        crate::ledger::evidence_with_output_for_run(&trace_path, &run_id)
     } else {
         Vec::new()
     };
+    let evidence: Vec<crate::ledger::Evidence> =
+        with_output.iter().map(|(e, _)| e.clone()).collect();
     let workspace = state.config.lock().workspace_dir.clone();
     let artifacts: Vec<serde_json::Value> = task_artifacts(&evidence, &workspace)
         .into_iter()
@@ -1332,6 +1337,7 @@ pub async fn handle_api_task_detail(
         "turn_id": turns.first(),
         "turn_ids": turns,
         "evidence": evidence,
+        "casebook": task_casebook(&state, &run_id, &with_output),
         // 这一单写出的文件（取自工具调用记录，且此刻仍在工作区里）。内容只走下面的 Bearer 端点
         "artifacts": artifacts,
         "reports": reports_for_run(&state, &run_id),
@@ -1339,6 +1345,203 @@ pub async fn handle_api_task_detail(
         "evidence_note": "以上是这项任务的各轮对话里记录到的工具调用。只有向外部取数据、且调用成功的，才算依据；读本地文件的可能读的是旧缓存，助手自己写的内容不算依据。没有被记录下来的调用不在此列。",
     }))
     .into_response()
+}
+
+/// 一单的可核对信息：引用核验、结构化结论（逐条核验）、人工决定记录、逐条认可 / 不认同。
+/// 全部由运行时从留存记录算出；模型写的任何「已核」字样都不参与。
+pub(crate) fn task_casebook(
+    state: &AppState,
+    run_id: &str,
+    evidence: &[(crate::ledger::Evidence, String)],
+) -> serde_json::Value {
+    use super::casebook as cb;
+    let workspace = state.config.lock().workspace_dir.clone();
+    let plain: Vec<crate::ledger::Evidence> = evidence.iter().map(|(e, _)| e.clone()).collect();
+    let arts = task_artifacts(&plain, &workspace);
+    let paths: Vec<(String, std::path::PathBuf)> = arts
+        .iter()
+        .map(|a| (a.rel.clone(), a.abs.clone()))
+        .collect();
+
+    // 引用：取正式报告（没有就取草稿）；都没有，就取最后一条汇报
+    let (report_rel, report_text) = match cb::pick_report(&paths) {
+        Some((rel, abs)) => (
+            Some(rel.clone()),
+            std::fs::read_to_string(abs).unwrap_or_default(),
+        ),
+        None => (
+            None,
+            reports_for_run(state, run_id)
+                .last()
+                .and_then(|r| {
+                    r.get("response")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default(),
+        ),
+    };
+    let citations = cb::verify_citations(&cb::extract_pmids(&report_text), evidence);
+    let verified = citations.iter().filter(|c| c.verified).count();
+
+    // 结构化结论：规程产出的 conclusion.json（同一单写的，且在工作区里）
+    let conclusion = paths
+        .iter()
+        .rev()
+        .find(|(rel, _)| rel.ends_with("conclusion.json"))
+        .map(|(rel, abs)| {
+            match std::fs::read_to_string(abs)
+                .map_err(|e| e.to_string())
+                .and_then(|raw| {
+                    serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string())
+                }) {
+                Ok(v) => {
+                    serde_json::json!({"path": rel, "data": cb::annotate_conclusion(v, evidence)})
+                }
+                Err(e) => {
+                    serde_json::json!({"path": rel, "error": format!("结构化结论读不出来：{e}")})
+                }
+            }
+        });
+
+    serde_json::json!({
+        "report": report_rel,
+        "citations": citations,
+        "citation_summary": {"total": citations.len(), "verified": verified},
+        "conclusion": conclusion,
+        "decisions": cb::read_jsonl_for_run(&cb::decisions_path(&workspace), run_id),
+        "verdicts": cb::read_jsonl_for_run(&cb::verdicts_path(&workspace), run_id),
+    })
+}
+
+/// 人工决定（批准 / 驳回 / 停止）留痕：谁、何时、哪一步，以及**做决定时**可核对的状况。
+pub(crate) fn record_decision(
+    state: &AppState,
+    headers: &HeaderMap,
+    run_id: &str,
+    step: Option<u32>,
+    decision: &str,
+    who: Option<&str>,
+    reason: Option<&str>,
+) {
+    use super::casebook as cb;
+    let (trace_path, full) = trace_setup(state);
+    let evidence = if crate::ledger::availability(&trace_path, full).available {
+        crate::ledger::evidence_with_output_for_run(&trace_path, run_id)
+    } else {
+        Vec::new()
+    };
+    let book = task_casebook(state, run_id, &evidence);
+    let workspace = state.config.lock().workspace_dir.clone();
+    let report_sha = book
+        .get("report")
+        .and_then(|r| r.as_str())
+        .and_then(|rel| std::fs::read(workspace.join(rel)).ok())
+        .map(|bytes| {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&bytes))
+        });
+    let device = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .and_then(cb::device_fingerprint);
+    let entry = serde_json::json!({
+        "run_id": run_id,
+        "at": chrono::Utc::now().to_rfc3339(),
+        "decision": decision,
+        "step": step,
+        "who": who.map(str::trim).filter(|w| !w.is_empty()),
+        "device": device,
+        "reason": reason,
+        "basis": {
+            "citations_total": book["citation_summary"]["total"],
+            "citations_verified": book["citation_summary"]["verified"],
+            "external_calls": evidence.iter().filter(|(e, _)| e.source_class == crate::ledger::SourceClass::External && e.success).count(),
+            "report": book.get("report"),
+            "report_sha256": report_sha,
+            "binding_violations": book.pointer("/conclusion/data/checks/binding_violations"),
+        },
+    });
+    if let Err(e) = cb::append_jsonl(&cb::decisions_path(&workspace), &entry) {
+        tracing::error!(run_id = %run_id, "decision record write failed: {e}");
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct VerdictBody {
+    /// agree | disagree | answer
+    pub kind: String,
+    /// 针对哪一条建议（agree / disagree）
+    #[serde(default)]
+    pub rec_id: Option<String>,
+    /// 针对哪一个问题（answer）
+    #[serde(default)]
+    pub qid: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub who: Option<String>,
+}
+
+/// POST /api/tasks/{run_id}/verdicts —— 快环：逐条认可 / 不认同，或回答「助手不确定的」问题。
+/// 只记录，不改结论、不改规程——它是评测样本与修订建议的原料。
+pub async fn handle_api_task_verdict(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<VerdictBody>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(Json(b)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"api":"frontdesk","error":"缺少请求体"})),
+        )
+            .into_response();
+    };
+    let kind = b.kind.trim();
+    let text = b
+        .text
+        .as_deref()
+        .map(|t| redact_feedback(t.trim()))
+        .filter(|t| !t.is_empty());
+    let valid = match kind {
+        "agree" => b.rec_id.is_some(),
+        "disagree" => b.rec_id.is_some() && text.is_some(),
+        "answer" => b.qid.is_some() && text.is_some(),
+        _ => false,
+    };
+    if !valid {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"api":"frontdesk","error":"需要 kind=agree 带 rec_id；disagree 带 rec_id 和一句理由；answer 带 qid 和回答"})),
+        )
+            .into_response();
+    }
+    let workspace = state.config.lock().workspace_dir.clone();
+    let entry = serde_json::json!({
+        "run_id": run_id,
+        "at": chrono::Utc::now().to_rfc3339(),
+        "kind": kind,
+        "rec_id": b.rec_id,
+        "qid": b.qid,
+        "text": text.map(|t| t.chars().take(1000).collect::<String>()),
+        "who": b.who.as_deref().map(str::trim).filter(|w| !w.is_empty()),
+    });
+    if let Err(e) =
+        super::casebook::append_jsonl(&super::casebook::verdicts_path(&workspace), &entry)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"api":"frontdesk","error":format!("记不下来：{e}")})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"api":"frontdesk","api_version":1,"recorded":true,"entry":entry}))
+        .into_response()
 }
 
 /// 这一单的助手汇报（sop_result），取自补发缓冲。
@@ -2217,6 +2420,7 @@ mod task_artifact_tests {
             success: ok,
             turn_id: "t".into(),
             path: Some(path.into()),
+            url: None,
         }
     }
 

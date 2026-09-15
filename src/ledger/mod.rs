@@ -68,6 +68,9 @@ pub struct Evidence {
     /// 文件类工具（file_write / file_read …）操作的路径——前台据此列出「产物」
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// 网络类工具请求的地址（http_request 等）——「取自哪里」
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// 账本可用性。不可用时必须给出人能看懂的原因，不能静默返回空。
@@ -131,6 +134,15 @@ fn payload_str(ev: &RuntimeTraceEvent, key: &str) -> Option<String> {
 
 /// 取某一轮（turn）里的全部工具调用，按时间顺序编号成证据。
 pub fn evidence_for_turn(trace_path: &Path, turn_id: &str) -> Vec<Evidence> {
+    evidence_with_output_for_turn(trace_path, turn_id)
+        .into_iter()
+        .map(|(e, _)| e)
+        .collect()
+}
+
+/// 同 [`evidence_for_turn`]，但连同每次调用的**完整输出**一起给出（核对 PMID 之类要用全文，
+/// 摘要是截断的）。一次扫描，不必为每条证据再读一遍 trace。
+pub fn evidence_with_output_for_turn(trace_path: &Path, turn_id: &str) -> Vec<(Evidence, String)> {
     let Ok(events) = runtime_trace::load_events(trace_path, SCAN_LIMIT, None, None) else {
         return Vec::new();
     };
@@ -167,12 +179,13 @@ pub fn evidence_for_turn(trace_path: &Path, turn_id: &str) -> Vec<Evidence> {
         n += 1;
         let sha = sha256_hex(&output);
         let full_args = args_by_key.get(&format!("{iter}:{tool}"));
-        out.push(Evidence {
+        let ev = Evidence {
             eid: format!("E{n}-{}", &sha[..6]),
             n,
             at: e.timestamp.clone(),
             source_class: SourceClass::of_tool(&tool),
             path: full_args.and_then(|a| path_arg(a)),
+            url: full_args.and_then(|a| url_arg(a)),
             args_excerpt: full_args.map(|a| excerpt(a, 200)),
             output_excerpt: excerpt(&output, EXCERPT),
             output_bytes: output.len(),
@@ -180,7 +193,8 @@ pub fn evidence_for_turn(trace_path: &Path, turn_id: &str) -> Vec<Evidence> {
             success: e.success.unwrap_or(true),
             turn_id: turn_id.to_string(),
             tool,
-        });
+        };
+        out.push((ev, output));
     }
     out
 }
@@ -216,6 +230,28 @@ fn path_arg(args: &str) -> Option<String> {
         .iter()
         .find_map(|k| v.get(*k).and_then(|p| p.as_str()))
         .map(str::to_string)
+}
+
+/// 从工具参数里取请求地址（`url` 键）。
+fn url_arg(args: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args).ok()?;
+    v.get("url").and_then(|u| u.as_str()).map(str::to_string)
+}
+
+/// 一单全部对话轮里的证据连同完整输出，编号与 [`evidence_for_run`] 一致。
+pub fn evidence_with_output_for_run(trace_path: &Path, run_id: &str) -> Vec<(Evidence, String)> {
+    let mut out: Vec<(Evidence, String)> = Vec::new();
+    for t in turns_for_run(trace_path, run_id) {
+        for (mut e, full) in evidence_with_output_for_turn(trace_path, &t) {
+            let n = u32::try_from(out.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            e.eid = format!("E{n}-{}", &e.sha256[..6]);
+            e.n = n;
+            out.push((e, full));
+        }
+    }
+    out
 }
 
 /// 碰过某个 run 的全部对话轮，按时间先后。

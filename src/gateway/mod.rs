@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod casebook;
 pub mod signed_url;
 pub mod sse;
 pub mod static_files;
@@ -792,6 +793,10 @@ pub async fn run_gateway(
         .route(
             "/api/tasks/{run_id}/artifacts/{aid}",
             get(api::handle_api_task_artifact),
+        )
+        .route(
+            "/api/tasks/{run_id}/verdicts",
+            post(api::handle_api_task_verdict),
         )
         .route(
             "/api/tasks/{run_id}/evidence/{eid}",
@@ -2064,12 +2069,14 @@ async fn handle_sop_cancel(
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
             }
         };
-        engine.cancel_run(&run_id)
+        let step = engine.get_run(&run_id).map(|r| r.current_step);
+        engine.cancel_run(&run_id).map(|()| step)
     };
 
     match result {
-        Ok(()) => {
+        Ok(step) => {
             tracing::info!(run_id = %run_id, "SOP cancel: run cancelled by user");
+            api::record_decision(&state, &headers, &run_id, step, "stopped", None, None);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"status":"cancelled","run_id":run_id})),
@@ -2142,12 +2149,22 @@ async fn handle_sop_approve(
                 return (StatusCode::CONFLICT, Json(err));
             }
         }
-        engine.approve_step(&run_id)
+        let step = engine.get_run(&run_id).map(|r| r.current_step);
+        engine.approve_step(&run_id).map(|a| (a, step))
     };
 
     match result {
-        Ok(action) => {
+        Ok((action, step)) => {
             tracing::info!(run_id = %run_id, "SOP approve: run advanced");
+            api::record_decision(
+                &state,
+                &headers,
+                &run_id,
+                step,
+                "approved",
+                approver.as_deref(),
+                None,
+            );
             // 批准即续跑：唤醒 LLM 执行后续步骤（与 Lark 通道的 wake_msg 同构）。
             // 不阻塞本响应；进展经 /api/sop/runs 轮询可见，结果并入 /api/chat 会话历史。
             {
@@ -2321,12 +2338,22 @@ async fn handle_sop_reject(
                 return (StatusCode::CONFLICT, Json(err));
             }
         }
-        engine.reject_step(&run_id, reason.clone())
+        let step = engine.get_run(&run_id).map(|r| r.current_step);
+        engine.reject_step(&run_id, reason.clone()).map(|()| step)
     };
 
     match result {
-        Ok(()) => {
+        Ok(step) => {
             tracing::info!(run_id = %run_id, "SOP reject: run cancelled");
+            api::record_decision(
+                &state,
+                &headers,
+                &run_id,
+                step,
+                "rejected",
+                None,
+                reason.as_deref(),
+            );
             let body = serde_json::json!({
                 "status": "rejected",
                 "run_id": run_id,
