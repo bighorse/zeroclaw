@@ -775,6 +775,10 @@ pub async fn run_gateway(
         .route("/api/status", get(api::handle_api_status))
         .route("/api/sop/runs", get(api::handle_api_sop_runs))
         .route("/api/capabilities", get(api::handle_api_capabilities))
+        .route(
+            "/api/sops/{name}/changelog",
+            get(api::handle_api_sop_changelog),
+        )
         .route("/api/search", get(api::handle_api_search))
         .route(
             "/api/feedback",
@@ -1951,6 +1955,18 @@ async fn handle_api_task_create(
                         Ok((resp, new_hist)) => {
                             let resp = final_reply(&resp, &new_hist);
                             save_run_history(&rid, new_hist);
+                            // 这一轮正常结束，却从没推进过这一单（比如模型另起了一单去做）：
+                            // 不能让它永远停在第 1 步「进行中」——标为失败并写明原因
+                            {
+                                if let Ok(mut eng) = engine_for_failure.lock() {
+                                    if eng.is_untouched(&rid) {
+                                        eng.fail_if_stuck(
+                                            &rid,
+                                            "助手这一轮结束时没有推进这一单（没有完成任何步骤），流程已中止。可以重新派活。",
+                                        );
+                                    }
+                                }
+                            }
                             let ts = chrono::Utc::now().timestamp();
                             let ev = serde_json::json!({
                                 "type": "sop_result",

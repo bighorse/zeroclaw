@@ -80,6 +80,19 @@ impl Tool for SopExecuteTool {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {e}"))?;
 
+            // 硬拦截：重复一单刚建好、还没推进的 run（提示词拦不住，实测会重复起单）
+            if let Some(existing) = engine.untouched_duplicate(sop_name, event.payload.as_deref()) {
+                let msg = format!(
+                    "Not started: SOP '{sop_name}' already has run {existing} for this same task, created moments ago and not yet advanced. \
+                     Do not start another run. Complete its current step, then call sop_advance with run_id {existing}."
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: msg.clone(),
+                    error: Some(msg),
+                });
+            }
+
             match engine.start_run(sop_name, event) {
                 Ok(action) => {
                     let run_id = action_run_id(&action);

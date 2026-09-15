@@ -281,6 +281,46 @@ impl SopEngine {
     ///
     /// 已经停在人工门（`WaitingApproval`）或已结束的 run 不动：那一轮可能是推进到门步之后、
     /// 写汇报时才失败的，流程状态本身是对的。返回是否真的结束了它。
+    /// 一单建立后还没被推进过：运行中、停在第 1 步、没有任何步骤结果。
+    pub fn is_untouched(&self, run_id: &str) -> bool {
+        self.active_runs.get(run_id).is_some_and(|r| {
+            r.status == SopRunStatus::Running && r.current_step == 1 && r.step_results.is_empty()
+        })
+    }
+
+    /// 模型想再起一单，但其实是在重复一单刚建好、还没推进的 run：返回那一单的 id。
+    ///
+    /// 判定只认两种确凿情形，免得挡住「一次交办好几个病例」这类正当的连续起单：
+    /// ① 参数里直接引用了那一单的 run_id；② 参数的正文与那一单一模一样。
+    /// 2026-09-15 实测：前台已建好 run-…-0002，DeepSeek 在执行轮里又 sop_execute 了一单
+    /// （参数里还带着 0002 的 run_id），推进的是新的那单，0002 永远停在第 1 步。
+    pub fn untouched_duplicate(&self, sop_name: &str, payload: Option<&str>) -> Option<String> {
+        let payload = payload?.trim();
+        if payload.is_empty() {
+            return None;
+        }
+        let body = |p: &str| -> String {
+            serde_json::from_str::<serde_json::Value>(p)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                .unwrap_or_else(|| p.to_string())
+                .split_whitespace()
+                .collect::<String>()
+        };
+        let wanted = body(payload);
+        self.active_runs
+            .values()
+            .filter(|r| r.sop_name == sop_name && self.is_untouched(&r.run_id))
+            .find(|r| {
+                payload.contains(&r.run_id)
+                    || r.trigger_event
+                        .payload
+                        .as_deref()
+                        .is_some_and(|p| !wanted.is_empty() && body(p) == wanted)
+            })
+            .map(|r| r.run_id.clone())
+    }
+
     pub fn fail_if_stuck(&mut self, run_id: &str, reason: &str) -> bool {
         let Some(run) = self.active_runs.get_mut(run_id) else {
             return false;
@@ -1426,6 +1466,56 @@ mod tests {
     fn start_run_unknown_sop_fails() {
         let mut engine = engine_with_sops(vec![]);
         assert!(engine.start_run("nonexistent", manual_event()).is_err());
+    }
+
+    #[test]
+    fn duplicate_of_an_untouched_run_is_detected_only_on_hard_evidence() {
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.max_concurrent = 5;
+        let mut engine = engine_with_sops(vec![sop]);
+        let ev = |p: &str| SopEvent {
+            payload: Some(p.into()),
+            ..manual_event()
+        };
+        let first = engine
+            .start_run("s1", ev(r#"{"text":"女，39岁，BI-RADS 4b"}"#))
+            .unwrap();
+        let rid = extract_run_id(&first).to_string();
+
+        // 参数里引用了那一单的 run_id → 重复
+        let with_id = format!(r#"{{"text":"改写过的描述","run_id":"{rid}"}}"#);
+        assert_eq!(
+            engine.untouched_duplicate("s1", Some(&with_id)),
+            Some(rid.clone())
+        );
+        // 正文一模一样（空白不同也算）→ 重复
+        assert_eq!(
+            engine.untouched_duplicate("s1", Some(r#"{"text":"女，39岁， BI-RADS 4b"}"#)),
+            Some(rid.clone())
+        );
+        // 另一个病例 → 不是重复（一次交办几个病例是正当的）
+        assert_eq!(
+            engine.untouched_duplicate("s1", Some(r#"{"text":"男，58岁，肝结节"}"#)),
+            None
+        );
+        // 别的规程 → 不相干
+        assert_eq!(engine.untouched_duplicate("other", Some(&with_id)), None);
+
+        // 那一单一旦推进过，就不再算「刚建好没动」
+        engine
+            .advance_step(
+                &rid,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "done".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+        assert!(!engine.is_untouched(&rid));
+        assert_eq!(engine.untouched_duplicate("s1", Some(&with_id)), None);
     }
 
     #[test]

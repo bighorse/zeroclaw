@@ -1673,25 +1673,175 @@ pub async fn handle_api_search(
 
 #[derive(Debug, serde::Deserialize)]
 pub struct FeedbackBody {
-    /// 来源任务（可选，但强烈建议带上——修订要能追溯到具体场景）
+    /// 来源任务的 run_id（可选，但强烈建议带上——修订要能追溯到具体场景）
     #[serde(default)]
     pub task_id: Option<String>,
     #[serde(default)]
     pub sop: Option<String>,
     /// 用户原话
     pub text: String,
+    /// 提出人（前台登记的交付对象姓名；未登记为 None）
+    #[serde(default)]
+    pub proposer: Option<String>,
 }
 
-fn feedback_path(state: &AppState) -> std::path::PathBuf {
-    let cfg = state.config.lock();
-    cfg.workspace_dir.join("feedback").join("outbox.jsonl")
+/// 反馈目录。平台侧的收集器（lobster-feedback.path）监视的是 `outbox/` **目录**，
+/// 一条反馈一个三段式 md 文件——取走即处理。
+///
+/// 2026-09-14 实测：前台以前把建议追加进 `outbox.jsonl`（与 outbox/ 目录同级的一个文件），
+/// 收集器根本不看它：提交了、界面也说「已记入」，但永远不会有人处理。
+fn feedback_dir(state: &AppState) -> std::path::PathBuf {
+    state.config.lock().workspace_dir.join("feedback")
 }
 
-/// POST /api/feedback —— 规程修订建议回流（P2）。
+/// 前台提交记录的索引（只用来列表和追踪状态；处理流程读的是 outbox/ 里的 md）
+const FEEDBACK_INDEX: &str = "frontdesk-submitted.jsonl";
+/// 旧版前台写的文件：里面的建议从未进入处理流程
+const FEEDBACK_LEGACY: &str = "outbox.jsonl";
+/// 在 outbox/ 里放了这么久还没被取走，说明这台助手没接入平台的处理流程
+const FEEDBACK_STALE_SECS: i64 = 3600;
+
+/// 与平台收集器同一套兜底脱敏（手机号 / 证件号 / 邮箱），写盘前先做一遍
+pub(crate) fn redact_feedback(text: &str) -> String {
+    static RULES: std::sync::OnceLock<[(regex::Regex, &'static str); 3]> =
+        std::sync::OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        [
+            (regex::Regex::new(r"1[3-9][0-9]{9}").unwrap(), "〈手机号〉"),
+            (
+                regex::Regex::new(r"[0-9]{17}[0-9Xx]").unwrap(),
+                "〈证件号〉",
+            ),
+            (
+                regex::Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+").unwrap(),
+                "〈邮箱〉",
+            ),
+        ]
+    });
+    // 先证件号（18 位）再手机号（11 位），免得证件号里的一段被当成手机号
+    let t = rules[1].0.replace_all(text, rules[1].1);
+    let t = rules[0].0.replace_all(&t, rules[0].1);
+    rules[2].0.replace_all(&t, rules[2].1).into_owned()
+}
+
+/// 三段式反馈文件（平台 README 规定的格式）。反馈编号写进文件，处理时要求写进 CHANGELOG，
+/// 前台据此判断「已并入」——不靠任何人手工回填状态。
+pub(crate) fn feedback_markdown(
+    id: &str,
+    text: &str,
+    sop: Option<&str>,
+    sop_version: Option<&str>,
+    task: Option<&str>,
+    run: Option<(&str, u32, &str)>,
+    artifacts: &[String],
+    proposer: Option<&str>,
+) -> String {
+    let sop_label = match (sop, sop_version) {
+        (Some(s), Some(v)) => format!("规程 {s}（v{v}）"),
+        (Some(s), None) => format!("规程 {s}"),
+        _ => "（未指明规程）".to_string(),
+    };
+    let mut scene = match (run, task) {
+        (Some((rid, step, status)), _) => {
+            format!("任务 {rid}，提出时位于第 {step} 步（状态 {status}）。")
+        }
+        // 引擎忘了这一单（助手重启过）——编号仍然有效，产物与调用记录都还在
+        (None, Some(t)) => format!("任务 {t}（助手重启过，服务端已不保留它的执行状态）。"),
+        (None, None) => "未关联具体任务。".to_string(),
+    };
+    if !artifacts.is_empty() {
+        scene.push_str("\n\n该任务写出的文件（相对助手工作区）：\n");
+        for a in artifacts {
+            scene.push_str("- ");
+            scene.push_str(a);
+            scene.push('\n');
+        }
+    }
+    let who = proposer
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("前台用户（姓名未登记）");
+    format!(
+        "<!-- feedback_id: {id} -->\n\
+         ## 现象\n\
+         使用者在前台对{sop_label}提出修订建议（见「期望」，为使用者原话）。\n\n\
+         ## 复现路径\n\
+         {scene}\n\n\
+         ## 期望\n\
+         {text}\n\n\
+         ---\n\
+         - 反馈编号：{id}\n\
+         - 来源：前台「规程共建」\n\
+         - 提出人：{who}\n\
+         - 处理要求：若据此修订规程，请在 CHANGELOG 该版本的「反馈来源」里写明反馈编号 {id}；前台据此向提出人显示「已并入该版本」。\n"
+    )
+}
+
+/// 一条建议此刻的真实状态，只从能看到的事实推出来：
+/// 文件还在 outbox/ = 等平台来取；已被取走 = 平台在处理（或没采纳）；
+/// 规程 CHANGELOG 里出现了它的编号 = 已并入那一版。
+fn feedback_state(
+    entry: &serde_json::Value,
+    outbox: &std::path::Path,
+    changelog_of: &dyn Fn(&str) -> Option<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(sop) = entry.get("sop").and_then(|v| v.as_str()) {
+        if !id.is_empty() {
+            if let Some(log) = changelog_of(sop) {
+                if let Some(version) = changelog_version_mentioning(&log, id) {
+                    return serde_json::json!({"state": "merged", "merged_version": version});
+                }
+            }
+        }
+    }
+    if !file.is_empty() && outbox.join(file).exists() {
+        let waited = entry
+            .get("at")
+            .and_then(|v| v.as_str())
+            .and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok())
+            .map(|a| (now - a.with_timezone(&chrono::Utc)).num_seconds())
+            .unwrap_or(0);
+        return serde_json::json!({
+            "state": "queued",
+            "waited_secs": waited,
+            "stale": waited > FEEDBACK_STALE_SECS,
+        });
+    }
+    serde_json::json!({"state": "collected"})
+}
+
+/// CHANGELOG 里提到某个反馈编号的那一节的版本号（节标题形如 `## v1.3.0 — …`）
+pub(crate) fn changelog_version_mentioning(log: &str, id: &str) -> Option<String> {
+    let mut current: Option<String> = None;
+    for line in log.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            current = rest
+                .split_whitespace()
+                .next()
+                .map(|v| v.trim_start_matches('v').to_string());
+        } else if line.contains(id) {
+            return current;
+        }
+    }
+    None
+}
+
+fn sop_changelog(state: &AppState, sop: &str) -> Option<String> {
+    let dir = {
+        let engine = state.sop_engine.lock().ok()?;
+        engine.get_sop(sop)?.location.clone()?
+    };
+    std::fs::read_to_string(dir.join("CHANGELOG.md")).ok()
+}
+
+/// POST /api/feedback —— 规程修订建议回流。
 ///
 /// 重要：**只记录，不自改**。助手不得据此修改自己的规程或人格——那条红线是刻意的
-/// （见「反馈闭环」约定）。这里把建议写进 outbox，由研发侧的流程产出修订草案、
-/// 人工评审后并入。接口如实回报 `applied: false`，界面也必须这么说。
+/// （见「反馈闭环」约定）。建议以三段式 md 写进 feedback/outbox/，由平台的收集器取走、
+/// 出修订草案、人工确认后发布。接口如实回报 `applied: false`，界面也必须这么说。
 pub async fn handle_api_feedback_create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1703,47 +1853,102 @@ pub async fn handle_api_feedback_create(
     let Some(Json(b)) = body else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"缺少请求体，需要 {\"text\": \"...\"}"})),
+            Json(serde_json::json!({"api":"frontdesk","error":"缺少请求体，需要 {\"text\": \"...\"}"})),
         )
             .into_response();
     };
-    let text = b.text.trim();
+    let text = redact_feedback(b.text.trim());
     if text.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"修订建议不能为空"})),
+            Json(serde_json::json!({"api":"frontdesk","error":"修订建议不能为空"})),
         )
             .into_response();
     }
+    let text: String = text.chars().take(2000).collect();
 
-    let entry = serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
-        "task_id": b.task_id,
-        "sop": b.sop,
-        "text": text.chars().take(2000).collect::<String>(),
-        "state": "pending_review",
-    });
+    let (sop_version, run) = {
+        let engine = state.sop_engine.lock().unwrap();
+        let version = b
+            .sop
+            .as_deref()
+            .and_then(|s| engine.get_sop(s))
+            .map(|s| s.version.clone());
+        let run = b.task_id.as_deref().and_then(|rid| {
+            engine
+                .get_run(rid)
+                .map(|r| (r.run_id.clone(), r.current_step, r.status.to_string()))
+        });
+        (version, run)
+    };
 
-    let path = feedback_path(&state);
-    if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("无法写入修订记录：{e}")})),
-            )
-                .into_response();
+    let now = chrono::Utc::now();
+    let id = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(text.as_bytes());
+        h.update(now.to_rfc3339().as_bytes());
+        let hex = format!("{:x}", h.finalize());
+        format!("FB-{}-{}", now.format("%Y%m%d"), &hex[..6])
+    };
+    let file = format!("{}-frontdesk.md", id);
+    let artifacts: Vec<String> = match b.task_id.as_deref() {
+        Some(rid) => {
+            let (trace_path, full) = trace_setup(&state);
+            if crate::ledger::availability(&trace_path, full).available {
+                let workspace = state.config.lock().workspace_dir.clone();
+                task_artifacts(
+                    &crate::ledger::evidence_for_run(&trace_path, rid),
+                    &workspace,
+                )
+                .into_iter()
+                .map(|a| a.rel)
+                .filter(|p| !p.rsplit('/').next().unwrap_or("").starts_with('.'))
+                .collect()
+            } else {
+                Vec::new()
+            }
         }
-    }
-    let line = format!("{entry}\n");
-    let write = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-    if let Err(e) = write {
+        None => Vec::new(),
+    };
+    let md = feedback_markdown(
+        &id,
+        &text,
+        b.sop.as_deref(),
+        sop_version.as_deref(),
+        b.task_id.as_deref(),
+        run.as_ref().map(|(r, s, st)| (r.as_str(), *s, st.as_str())),
+        &artifacts,
+        b.proposer.as_deref(),
+    );
+
+    let dir = feedback_dir(&state);
+    let outbox = dir.join("outbox");
+    let written = std::fs::create_dir_all(&outbox)
+        .and_then(|()| std::fs::write(outbox.join(&file), md.as_bytes()))
+        .and_then(|()| {
+            let entry = serde_json::json!({
+                "id": id,
+                "at": now.to_rfc3339(),
+                "task_id": b.task_id,
+                "sop": b.sop,
+                "sop_version": sop_version,
+                "proposer": b.proposer,
+                "text": text,
+                "file": file,
+            });
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(FEEDBACK_INDEX))
+                .and_then(|mut f| {
+                    std::io::Write::write_all(&mut f, format!("{entry}\n").as_bytes())
+                })
+        });
+    if let Err(e) = written {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("无法写入修订记录：{e}")})),
+            Json(serde_json::json!({"api":"frontdesk","error": format!("无法写入修订建议：{e}")})),
         )
             .into_response();
     }
@@ -1752,15 +1957,16 @@ pub async fn handle_api_feedback_create(
         "api": "frontdesk",
         "api_version": 1,
         "recorded": true,
+        "id": id,
         // 说清楚它现在是什么状态：已记录 ≠ 已生效
         "applied": false,
-        "state": "pending_review",
-        "note": "您的意见已记入修订待办。助手不会据此自行修改规程——修订须由研发出草案、人工评审后并入，并在生效后署您的名。",
+        "state": "queued",
+        "note": format!("已记下（编号 {id}），等平台取走处理。助手不会据此自行修改规程：平台会出修订草案，经人工确认后才发布；并入后这里会显示所在版本。"),
     }))
     .into_response()
 }
 
-/// GET /api/feedback —— 已提交的修订建议（供「规程共建」一节显示）。
+/// GET /api/feedback —— 前台提交过的修订建议，各自附上从事实推出的状态。
 pub async fn handle_api_feedback_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1768,23 +1974,102 @@ pub async fn handle_api_feedback_list(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let path = feedback_path(&state);
-    let items: Vec<serde_json::Value> = std::fs::read_to_string(&path)
-        .map(|raw| {
-            raw.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                .collect()
+    let dir = feedback_dir(&state);
+    let outbox = dir.join("outbox");
+    let read = |name: &str| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join(name))
+            .map(|raw| {
+                raw.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let now = chrono::Utc::now();
+    let submitted = read(FEEDBACK_INDEX);
+    // 涉及到的规程各读一次 CHANGELOG
+    let mut logs: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for e in &submitted {
+        if let Some(sop) = e.get("sop").and_then(|v| v.as_str()) {
+            logs.entry(sop.to_string())
+                .or_insert_with(|| sop_changelog(&state, sop));
+        }
+    }
+    let changelog_of = |sop: &str| -> Option<String> { logs.get(sop).cloned().flatten() };
+
+    let mut items: Vec<serde_json::Value> = read(FEEDBACK_LEGACY)
+        .into_iter()
+        .map(|mut e| {
+            // 旧版前台写进 outbox.jsonl 的：从来没有进入处理流程，照实标出来
+            e["state"] = serde_json::json!("unrouted");
+            e
         })
-        .unwrap_or_default();
-    let recent: Vec<serde_json::Value> = items.into_iter().rev().take(50).collect();
+        .collect();
+    for mut e in submitted {
+        let st = feedback_state(&e, &outbox, &changelog_of, now);
+        if let (Some(obj), Some(extra)) = (e.as_object_mut(), st.as_object()) {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        items.push(e);
+    }
+    items.sort_by(|a, b| {
+        b.get("at")
+            .and_then(|v| v.as_str())
+            .cmp(&a.get("at").and_then(|v| v.as_str()))
+    });
+    items.truncate(100);
     Json(serde_json::json!({
         "api": "frontdesk",
         "api_version": 1,
-        "items": recent,
-        "note": "这些是已记录、等待研发评审的修订建议。助手不会自行改动规程。",
+        "items": items,
+        "note": "修订建议只会交给平台处理，助手不会自行改动规程。状态依据：文件是否已被平台取走，以及规程变更记录里是否出现了该建议的编号。",
     }))
     .into_response()
+}
+
+/// GET /api/sops/{name}/changelog —— 规程的版本史（「进化」一节）。原文返回，前台只排版不改写。
+pub async fn handle_api_sop_changelog(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let version =
+        {
+            let engine = state.sop_engine.lock().unwrap();
+            match engine.get_sop(&name) {
+                Some(s) => s.version.clone(),
+                None => return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"api":"frontdesk","error":"没有这个规程","sop":name})),
+                )
+                    .into_response(),
+            }
+        };
+    match sop_changelog(&state, &name) {
+        Some(log) => Json(serde_json::json!({
+            "api": "frontdesk",
+            "api_version": 1,
+            "sop": name,
+            "version": version,
+            "changelog": log.chars().take(60_000).collect::<String>(),
+        }))
+        .into_response(),
+        None => Json(serde_json::json!({
+            "api": "frontdesk",
+            "api_version": 1,
+            "sop": name,
+            "version": version,
+            "changelog": serde_json::Value::Null,
+        }))
+        .into_response(),
+    }
 }
 
 /// `/api/sop/runs` 的查询参数。
@@ -1858,6 +2143,59 @@ pub async fn handle_api_sop_runs(
             .collect()
     };
     Json(serde_json::json!({ "runs": runs })).into_response()
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::{changelog_version_mentioning, feedback_markdown, redact_feedback};
+
+    #[test]
+    fn redacts_phone_id_and_email_before_writing() {
+        let t = redact_feedback("联系 13812345678，证件 11010519491231002X，邮箱 a.b@x.cn");
+        assert!(
+            !t.contains("13812345678") && t.contains("〈手机号〉"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("11010519491231002X") && t.contains("〈证件号〉"),
+            "{t}"
+        );
+        assert!(!t.contains("a.b@x.cn") && t.contains("〈邮箱〉"), "{t}");
+    }
+
+    #[test]
+    fn markdown_follows_the_platform_three_part_contract() {
+        let md = feedback_markdown(
+            "FB-20260914-abc123",
+            "今后超声分级要写明体系",
+            Some("case-clinical-report"),
+            Some("1.2.1"),
+            Some("run-1"),
+            Some(("run-1", 4, "waiting_approval")),
+            &["case_library/a/report_final.md".to_string()],
+            None,
+        );
+        for h in ["## 现象", "## 复现路径", "## 期望"] {
+            assert!(md.contains(h), "missing {h}");
+        }
+        assert!(md.contains("今后超声分级要写明体系"));
+        assert!(md.contains("FB-20260914-abc123"));
+        assert!(md.contains("姓名未登记"));
+        assert!(md.contains("case_library/a/report_final.md"));
+    }
+
+    #[test]
+    fn merged_version_comes_from_the_changelog_section_that_names_the_id() {
+        let log = "# CHANGELOG\n\n## v1.3.0 — 2026-09-14（x）\n**反馈来源：** 前台 FB-20260914-abc123\n\n## v1.2.1 — 2026-06-09\n无关\n";
+        assert_eq!(
+            changelog_version_mentioning(log, "FB-20260914-abc123").as_deref(),
+            Some("1.3.0")
+        );
+        assert_eq!(
+            changelog_version_mentioning(log, "FB-20260914-zzzzzz"),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
