@@ -2370,6 +2370,19 @@ pub(crate) async fn run_tool_call_loop(
         .collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
+    // 把本轮循环挂到调用方那一轮上（设了标识才记；没设就什么也不做）
+    let _ = CHAT_TURN_TAG.try_with(|tag| {
+        runtime_trace::record_event(
+            "turn_link",
+            Some(channel_name),
+            None,
+            None,
+            Some(&turn_id),
+            Some(true),
+            None,
+            serde_json::json!({ "chat_turn_id": tag }),
+        );
+    });
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
     // Tracks signatures of failed calls so the model may retry each once.
     // On first failure the signature is removed from seen_tool_signatures and
@@ -3897,8 +3910,17 @@ pub async fn process_message(
     session_id: Option<&str>,
 ) -> Result<String> {
     let (response, _) =
-        process_message_inner(config, message, None, None, None, session_id).await?;
+        process_message_inner(config, message, None, None, None, session_id, None).await?;
     Ok(response)
+}
+
+tokio::task_local! {
+    /// 调用方给这一轮起的标识（网关 /api/chat 的 `turn_id`）。工具调用循环生成自己的
+    /// `turn_id` 之后，记一条 `turn_link` 事件把两者对上，调用方才能按台账核验这一轮的引用。
+    ///
+    /// 不直接拿调用方的标识当 `turn_id`：一次问答可能跑好几轮循环（上下文溢出重试、SOP nudge），
+    /// 台账按「iteration:tool」配对参数与输出，共用一个 `turn_id` 会让编号相撞。
+    static CHAT_TURN_TAG: String;
 }
 
 /// Like [`process_message`] but supports persistent multi-turn history and an
@@ -3910,6 +3932,12 @@ pub async fn process_message(
 /// - `prior_history = None`  → fresh chat (system prompt + new user message)
 /// - `prior_history = Some(h)` → append the new user message to `h` and run.
 ///   The caller is responsible for ensuring `h[0]` is the system prompt.
+///
+/// `extra_system_rule` is appended to the system prompt for this turn. Callers
+/// that need a presentation rule use it instead of prefixing the user message:
+/// the user message doubles as the memory recall query and is kept in history
+/// every turn, so a rule glued to it skews recall and piles up tokens. h[0] is
+/// rebuilt each turn, so the caller must pass the rule on every turn.
 pub async fn process_message_with_history(
     config: Config,
     message: &str,
@@ -3917,6 +3945,9 @@ pub async fn process_message_with_history(
     external_observer: Option<Arc<dyn Observer>>,
     external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     session_id: Option<&str>,
+    extra_system_rule: Option<&str>,
+    // 调用方这一轮的标识，用来在证据台账里认领本轮的工具调用（见 CHAT_TURN_TAG）
+    trace_tag: Option<&str>,
 ) -> Result<(String, Vec<ChatMessage>)> {
     // 2026-05-14 V27 daemon hang isolation: run the entire agent loop on
     // a brand-new single-thread tokio runtime. The main daemon
@@ -3934,6 +3965,8 @@ pub async fn process_message_with_history(
     // remaining workers.
     let message = message.to_string();
     let session_id = session_id.map(str::to_string);
+    let extra_system_rule = extra_system_rule.map(str::to_string);
+    let trace_tag = trace_tag.map(str::to_string);
     tokio::task::block_in_place(move || {
         let isolated_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3941,15 +3974,20 @@ pub async fn process_message_with_history(
             .build()
             .map_err(|e| anyhow::anyhow!("isolated agent runtime build failed: {e}"))?;
         isolated_rt.block_on(async move {
-            process_message_inner(
+            let turn = process_message_inner(
                 config,
                 &message,
                 prior_history,
                 external_observer,
                 external_sop_engine,
                 session_id.as_deref(),
-            )
-            .await
+                extra_system_rule.as_deref(),
+            );
+            // task_local 不跨运行时，所以必须在这个隔离运行时**里面**加作用域
+            match trace_tag {
+                Some(tag) => CHAT_TURN_TAG.scope(tag, turn).await,
+                None => turn.await,
+            }
         })
     })
 }
@@ -3963,6 +4001,8 @@ async fn process_message_inner(
     // 读的是同一个 engine（否则每请求新建 → 审批永远 404 的 split-brain）
     external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     session_id: Option<&str>,
+    // 本轮追加到 system prompt 末尾的呈现规则（问答窗口用；见 process_message_with_history）
+    extra_system_rule: Option<&str>,
 ) -> Result<(String, Vec<ChatMessage>)> {
     // 确保共享 CostTracker 已初始化（幂等）：gateway-only 部署也能记账
     let _ = crate::cost::shared_tracker(&config.cost, &config.workspace_dir);
@@ -4141,6 +4181,10 @@ async fn process_message_inner(
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
+    if let Some(rule) = extra_system_rule.map(str::trim).filter(|r| !r.is_empty()) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(rule);
     }
 
     let mem_context = build_context(

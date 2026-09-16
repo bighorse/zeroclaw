@@ -19,7 +19,11 @@ const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 pub struct Skill {
     pub name: String,
     pub description: String,
-    pub version: String,
+    /// Declared version. `None` means the skill file does not state one —
+    /// the API serialises it as null and callers show "unknown" rather than
+    /// a made-up number.
+    #[serde(default)]
+    pub version: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
     #[serde(default)]
@@ -408,7 +412,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
     Ok(Skill {
         name: manifest.skill.name,
         description: manifest.skill.description,
-        version: manifest.skill.version,
+        version: Some(manifest.skill.version),
         author: manifest.skill.author,
         tags: manifest.skill.tags,
         tools: manifest.tools,
@@ -429,7 +433,10 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     Ok(Skill {
         name,
         description: extract_description(&content),
-        version: "0.1.0".to_string(),
+        // Read the version the file actually declares. It used to be hardcoded
+        // to "0.1.0", so every SKILL.md skill reported the same version no
+        // matter what its YAML front matter said.
+        version: extract_frontmatter_version(&content),
         author: None,
         tags: Vec::new(),
         tools: Vec::new(),
@@ -449,13 +456,67 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
     Ok(Skill {
         name,
         description: extract_description(&content),
-        version: "open-skills".to_string(),
+        version: Some("open-skills".to_string()),
         author: Some("besoeasy/open-skills".to_string()),
         tags: vec!["open-skills".to_string()],
         tools: Vec::new(),
         prompts: vec![content],
         location: Some(path.to_path_buf()),
     })
+}
+
+/// Strip surrounding quotes from a YAML scalar and reject empty values.
+fn yaml_scalar(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let s = s
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .or_else(|| s.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))
+        .unwrap_or(s)
+        .trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Version declared in a SKILL.md YAML front matter: either a top-level
+/// `version:` or a `version:` one level inside a top-level `metadata:` block.
+/// Anything deeper, or a `version:` belonging to some other block, is ignored —
+/// it would not be the skill's own version.
+///
+/// Returns `None` when the file has no front matter or states no version;
+/// callers must keep that as "unknown" instead of inventing a number.
+fn extract_frontmatter_version(content: &str) -> Option<String> {
+    let body = content.trim_start_matches('\u{feff}').strip_prefix("---")?;
+    // The opening `---` must be a line of its own, otherwise it is not front matter.
+    let body = body.strip_prefix('\r').unwrap_or(body).strip_prefix('\n')?;
+    let end = body
+        .lines()
+        .position(|l| matches!(l.trim_end(), "---" | "..."))?;
+    // Indentation of the `metadata:` block's own keys, learned from its first key.
+    let mut metadata_indent: Option<Option<usize>> = None;
+    for line in body.lines().take(end) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 {
+            if let Some(v) = trimmed.strip_prefix("version:") {
+                return yaml_scalar(v);
+            }
+            metadata_indent = (trimmed == "metadata:").then_some(None);
+            continue;
+        }
+        let Some(depth) = metadata_indent.as_mut() else {
+            continue;
+        };
+        let key_indent = *depth.get_or_insert(indent);
+        if indent == key_indent {
+            if let Some(v) = trimmed.strip_prefix("version:") {
+                return yaml_scalar(v);
+            }
+        }
+    }
+    None
 }
 
 fn extract_description(content: &str) -> String {
@@ -871,7 +932,13 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                     println!(
                         "  {} {} — {}",
                         console::style(&skill.name).white().bold(),
-                        console::style(format!("v{}", skill.version)).dim(),
+                        console::style(
+                            skill.version.as_deref().map_or_else(
+                                || "(version unknown)".to_string(),
+                                |v| format!("v{v}")
+                            )
+                        )
+                        .dim(),
                         skill.description
                     );
                     if !skill.tools.is_empty() {
@@ -1083,6 +1150,59 @@ command = "echo hello"
     }
 
     #[test]
+    fn md_skill_version_is_read_from_front_matter_or_left_unknown() {
+        let nested = "---\nname: pubmed-search\nmetadata:\n  version: 1.3.0\n---\n# body\n";
+        assert_eq!(
+            extract_frontmatter_version(nested).as_deref(),
+            Some("1.3.0")
+        );
+        // BOM + CRLF + quoted scalar
+        let quoted = "\u{feff}---\r\nname: x\r\nversion: \"2.1\"\r\n---\r\n# body\r\n";
+        assert_eq!(extract_frontmatter_version(quoted).as_deref(), Some("2.1"));
+        // No front matter at all — unknown, not a made-up default
+        assert_eq!(
+            extract_frontmatter_version("# SKILL.md — deep-research\nversion: 9\n"),
+            None
+        );
+        // A version belonging to another block is not the skill's version
+        let other =
+            "---\nname: x\ntools:\n  - name: t\n    version: 7.7.7\nmetadata:\n  author: a\n---\n";
+        assert_eq!(extract_frontmatter_version(other), None);
+        // Deeper than metadata's own keys does not count either
+        let deep = "---\nmetadata:\n  build:\n    version: 3.3.3\n---\n";
+        assert_eq!(extract_frontmatter_version(deep), None);
+        assert_eq!(extract_frontmatter_version("---\nversion:\n---\n"), None);
+    }
+
+    #[test]
+    fn md_skill_without_a_declared_version_reports_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        fs::create_dir_all(skills_dir.join("plain")).unwrap();
+        fs::create_dir_all(skills_dir.join("versioned")).unwrap();
+        fs::write(
+            skills_dir.join("plain").join("SKILL.md"),
+            "# Plain\nNo front matter here.\n",
+        )
+        .unwrap();
+        fs::write(
+            skills_dir.join("versioned").join("SKILL.md"),
+            "---\nname: versioned\ndescription: d\nmetadata:\n  version: 1.1.0\n---\n# body\n",
+        )
+        .unwrap();
+
+        let skills = load_skills(dir.path());
+        let get = |n: &str| {
+            skills
+                .iter()
+                .find(|s| s.name == n)
+                .and_then(|s| s.version.clone())
+        };
+        assert_eq!(get("plain"), None, "读不到版本就是未知，不编一个 0.1.0");
+        assert_eq!(get("versioned").as_deref(), Some("1.1.0"));
+    }
+
+    #[test]
     fn skills_to_prompt_empty() {
         let prompt = skills_to_prompt(&[], Path::new("/tmp"));
         assert!(prompt.is_empty());
@@ -1093,7 +1213,7 @@ command = "echo hello"
         let skills = vec![Skill {
             name: "test".to_string(),
             description: "A test".to_string(),
-            version: "1.0.0".to_string(),
+            version: Some("1.0.0".to_string()),
             author: None,
             tags: vec![],
             tools: vec![],
@@ -1111,7 +1231,7 @@ command = "echo hello"
         let skills = vec![Skill {
             name: "test".to_string(),
             description: "A test".to_string(),
-            version: "1.0.0".to_string(),
+            version: Some("1.0.0".to_string()),
             author: None,
             tags: vec![],
             tools: vec![SkillTool {
@@ -1245,7 +1365,7 @@ command = "https://api.example.com/deploy"
         assert_eq!(skills.len(), 1);
         let s = &skills[0];
         assert_eq!(s.name, "multi-tool");
-        assert_eq!(s.version, "2.0.0");
+        assert_eq!(s.version.as_deref(), Some("2.0.0"));
         assert_eq!(s.author.as_deref(), Some("tester"));
         assert_eq!(s.tags, vec!["automation", "devops"]);
         assert_eq!(s.tools.len(), 3);
@@ -1273,7 +1393,7 @@ description = "Bare minimum"
 
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].version, "0.1.0"); // default version
+        assert_eq!(skills[0].version.as_deref(), Some("0.1.0")); // manifest default
         assert!(skills[0].author.is_none());
         assert!(skills[0].tags.is_empty());
         assert!(skills[0].tools.is_empty());
@@ -1311,7 +1431,7 @@ description = "Bare minimum"
         let skills = vec![Skill {
             name: "weather".to_string(),
             description: "Get weather".to_string(),
-            version: "1.0.0".to_string(),
+            version: Some("1.0.0".to_string()),
             author: None,
             tags: vec![],
             tools: vec![SkillTool {
@@ -1336,7 +1456,7 @@ description = "Bare minimum"
         let skills = vec![Skill {
             name: "xml<skill>".to_string(),
             description: "A & B".to_string(),
-            version: "1.0.0".to_string(),
+            version: Some("1.0.0".to_string()),
             author: None,
             tags: vec![],
             tools: vec![],

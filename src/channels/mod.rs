@@ -6499,7 +6499,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
-            version: "1.0.0".into(),
+            version: Some("1.0.0".into()),
             author: None,
             tags: vec![],
             tools: vec![crate::skills::SkillTool {
@@ -6534,7 +6534,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
-            version: "1.0.0".into(),
+            version: Some("1.0.0".into()),
             author: None,
             tags: vec![],
             tools: vec![crate::skills::SkillTool {
@@ -6575,7 +6575,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![crate::skills::Skill {
             name: "code<review>&".into(),
             description: "Review \"unsafe\" and 'risky' bits".into(),
-            version: "1.0.0".into(),
+            version: Some("1.0.0".into()),
             author: None,
             tags: vec![],
             tools: vec![crate::skills::SkillTool {

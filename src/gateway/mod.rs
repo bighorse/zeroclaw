@@ -1805,11 +1805,145 @@ pub(crate) fn final_reply(merged: &str, history: &[ChatMessage]) -> String {
         .unwrap_or_else(|| merged.to_string())
 }
 
+/// 问答窗口的最终答复：在 [`final_reply`] 之上多一道防回退。
+///
+/// 问答这一轮里，模型常先把答案写完、再调一个收尾工具（存记忆之类），历史里最后一条
+/// 就只剩「已保存」这种回执；直接用它当答复等于把答案丢了——当初拼接整轮文本就是为了这个。
+/// 所以：最后一条明显短、而整轮拼接文本明显更长时，退回拼接文本，宁可带上一点过程独白，
+/// 也不把实质内容吞掉。
+pub(crate) fn chat_reply(merged: &str, history: &[ChatMessage]) -> String {
+    let last = final_reply(merged, history);
+    let (last_len, merged_len) = (last.chars().count(), merged.trim().chars().count());
+    // 最后一条短得像收尾工具的回执（「已保存」），而整轮明显写过更多东西：这时退回拼接文本，
+    // 否则真正的答案会被一句回执顶掉。退回时仍然去掉开头的过程独白——那正是要甩掉的部分。
+    if last_len < CHAT_REPLY_SHORT_CHARS && merged_len >= last_len + CHAT_REPLY_MARGIN_CHARS {
+        return strip_leading_narration(merged);
+    }
+    last
+}
+
+/// 去掉开头那几段「工具过程独白」：模型在调工具那一步写的话几乎全是英文
+/// （中文规则压不住它，实测如此），正文一旦开始就是中文。按段落判，只从开头连着去。
+fn strip_leading_narration(text: &str) -> String {
+    let blocks: Vec<&str> = text.split("\n\n").collect();
+    let mut start = 0usize;
+    while start + 1 < blocks.len() {
+        let b = blocks[start].trim();
+        let latin = b.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        let cjk = b
+            .chars()
+            .filter(|c| ('\u{4e00}'..='\u{9fa5}').contains(c))
+            .count();
+        if b.is_empty() || (latin >= 20 && cjk * 20 <= latin) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    blocks[start..].join("\n\n").trim().to_string()
+}
+
+/// 短于这个字数的最后一条，才可能是收尾工具的回执（「已保存」「完成」都在这个量级）
+const CHAT_REPLY_SHORT_CHARS: usize = 40;
+/// 拼接文本要比最后一条多出这么多字，才说明实质内容写在收尾工具之前。
+/// 取值小是有意的：退回拼接文本时会先去掉开头的过程独白，所以「误退回」的代价很小，
+/// 而阈值定高的代价是把一段真答案整条丢掉（120 字时 125 字以内的答案都会被回执顶掉）。
+const CHAT_REPLY_MARGIN_CHARS: usize = 24;
+
+/// 问答窗口的呈现规则（经 system prompt 注入，不拼进用户消息：用户消息会被当作记忆检索词，
+/// 而且逐轮留在历史里累积）。只写成抽象规定，不举反例原文——举了模型会照着学。
+const CHAT_PRESENTATION_RULE: &str = "以下是这个问答窗口的回答规则：\
+     全部用中文书写；\
+     不叙述你调用了哪些工具、经过了哪些步骤，直接给结论和依据；\
+     本轮检索得来的结论，在相应位置标出出处编号——文献标 PMID，没有 PMID 的标 DOI，临床试验标登记号；\
+     凭你已有的知识回答、本轮没有检索核实的内容，必须注明未经检索核实；\
+     用户要办的事需要按规程走时，说明这件事要走规程，请他到前台按规程派活，不要在问答里代办。";
+
+/// 本轮问答回复里引用的文献 / 试验，核验口径与任务档案完全一致
+/// （[`casebook::verify_refs`]：只认本轮运行时亲自执行、且真取到记录的外部调用）。
+///
+/// 靠 `turn_link` 事件把网关这一轮与 agent 循环的轮次对上。台账没开、这一轮没能对上、
+/// 或者回复里本来就没有引用，一律返回 `None`——前台据此不显示核验状态，
+/// 而不是显示一个没核过的「已核」。
+async fn chat_citations(
+    state: &AppState,
+    chat_turn_id: &str,
+    response: &str,
+) -> Option<Vec<casebook::Citation>> {
+    let refs = casebook::extract_refs(response);
+    if refs.is_empty() {
+        return None;
+    }
+    let (trace_path, full) = {
+        let cfg = state.config.lock();
+        let mode =
+            crate::observability::runtime_trace::storage_mode_from_config(&cfg.observability);
+        let path = crate::observability::runtime_trace::resolve_trace_path(
+            &cfg.observability,
+            &cfg.workspace_dir,
+        );
+        (
+            path,
+            mode == crate::observability::runtime_trace::RuntimeTraceStorageMode::Full,
+        )
+    };
+    if !crate::ledger::availability(&trace_path, full).available {
+        return None;
+    }
+    let tag = chat_turn_id.to_string();
+    // 读台账要整文件扫描（工具返回原文都在里面），不能占着异步 worker
+    tokio::task::spawn_blocking(move || {
+        let links = crate::observability::runtime_trace::load_events(
+            &trace_path,
+            CHAT_TRACE_SCAN_LIMIT,
+            Some("turn_link"),
+            Some(&tag),
+        )
+        .ok()?;
+        let mut turns: Vec<String> = Vec::new();
+        for e in links.iter().rev() {
+            let same = e
+                .payload
+                .get("chat_turn_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == tag);
+            if let (true, Some(t)) = (same, e.turn_id.clone()) {
+                if !turns.contains(&t) {
+                    turns.push(t);
+                }
+            }
+        }
+        if turns.is_empty() {
+            return None;
+        }
+        let mut evidence: Vec<(crate::ledger::Evidence, String)> = Vec::new();
+        for t in turns {
+            for (mut e, out) in crate::ledger::evidence_with_output_for_turn(&trace_path, &t) {
+                // 跨轮重新编号，否则两轮的 E1 会撞在一起
+                let n = u32::try_from(evidence.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1);
+                e.eid = format!("E{n}-{}", &e.sha256[..6]);
+                e.n = n;
+                evidence.push((e, out));
+            }
+        }
+        Some(casebook::verify_refs(&refs, &evidence))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 为一轮问答扫台账时最多看多少条事件（与 ledger 内部的上限同量级）
+const CHAT_TRACE_SCAN_LIMIT: usize = 5000;
+
 /// 前台的呈现约定。助手按规程里为飞书写的模板汇报（表情符号、列出「回复某某选项」的操作指引、
 /// 夹着工具过程的独白），放进报纸式的任务档案里既违和，又和前台自己的确认按钮打架。
 /// 写法按抽象规则描述，不举反例原文——举了模型会照着学。
 const PRESENTATION_RULE: &str = "你最后一条回复会原样显示在前台任务档案的「结论」一节——那是一份书面档案，不是聊天窗口。\
-     全部用中文书写。请这样写：先用一两句话给出结论；再分条写建议，每条末尾用（PMID: 编号）标出出处；\
+     全部用中文书写。请这样写：先用一两句话给出结论；再分条写建议，每条末尾用括号标出出处——\
+     文献写（PMID: 编号），没有 PMID 的写（DOI: 编号），临床试验写登记号（NCT 后接 8 位数字）；\
      证据不足或需要特别提醒的，单独成段，以「注意：」开头。\
      不用表情符号，不写寒暄，不叙述你用了哪些工具、做了哪些步骤。\
      需要用户确认时，只写清需要他确认的内容；确认、修改、驳回的操作由前台界面提供，回复里不给操作选项或回复指令。";
@@ -1954,6 +2088,8 @@ async fn handle_api_task_create(
                         None,
                         Some(engine),
                         Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
+                        None,
+                        None,
                     )
                     .await
                     {
@@ -2176,9 +2312,18 @@ async fn handle_sop_approve(
                 let recent = Arc::clone(&state.recent_sop_results);
                 let rid = run_id.clone();
                 let rule = approver_rule(approver.as_deref());
+                // 审核人在前台改过的句子：批准时一并交代，终稿必须逐字采用。
+                // 只读留存的逐条记录（服务端算出的生效修改），不经前台转述
+                let edits_note = {
+                    let workspace = state.config.lock().workspace_dir.clone();
+                    let verdicts =
+                        casebook::read_jsonl_for_run(&casebook::verdicts_path(&workspace), &run_id);
+                    casebook::edits_wake_paragraph(&casebook::effective_edits(&verdicts))
+                        .unwrap_or_default()
+                };
                 tokio::spawn(async move {
                     let wake = format!(
-                        "[系统] SOP run {rid} 的等待审批步骤【已经获得用户批准，审批已完成，不要再向用户请求任何批准或确认】。{rule}{SCOPE_RULE}请立即用 sop_advance 推进并执行该流程的后续步骤，直到全部完成或到达下一个真正需要审批的新步骤。不要提系统消息或内部指令。{PRESENTATION_RULE}"
+                        "[系统] SOP run {rid} 的等待审批步骤【已经获得用户批准，审批已完成，不要再向用户请求任何批准或确认】。{rule}{SCOPE_RULE}请立即用 sop_advance 推进并执行该流程的后续步骤，直到全部完成或到达下一个真正需要审批的新步骤。不要提系统消息或内部指令。{PRESENTATION_RULE}{edits_note}"
                     );
                     // 前台派活建的单接着它自己的历史；对话或通道起的 run 没有单独历史，沿用共享的
                     let own = run_histories().lock().get(&rid).cloned();
@@ -2191,6 +2336,8 @@ async fn handle_sop_approve(
                         None,
                         Some(engine),
                         Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
+                        None,
+                        None,
                     )
                     .await
                     {
@@ -2929,6 +3076,13 @@ async fn handle_api_chat(
     // 共享 daemon SopEngine：/api/chat 里启动的 SOP run 才能被 /sop/approve 批到
     let sop_engine_shared = state.sop_engine.clone();
 
+    // 本轮 id：客户端据此把「我刚发的这一轮」与随后出现的 run / 汇报对上。
+    // /api/chat 此前不返回任何可关联的标识，客户端只能靠轮询做集合差，很脆。
+    // 这个 id 同时交给 agent 循环，让它在证据台账里记一条 turn_link，
+    // 本轮回复里的引用才能按台账核验（见 chat_citations）。
+    let turn_id = format!("turn-{}", chrono::Utc::now().timestamp_millis());
+    let trace_tag = turn_id.clone();
+
     // Spawn the agent loop as a separate tokio task. process_message_with_history
     // internally uses block_in_place + an isolated single-thread runtime, which
     // is compatible with tokio::spawn on a multi-thread runtime — block_in_place
@@ -2941,6 +3095,8 @@ async fn handle_api_chat(
             Some(signal_obs_bg.clone() as Arc<dyn crate::observability::Observer>),
             Some(sop_engine_shared.clone()),
             Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
+            Some(CHAT_PRESENTATION_RULE),
+            Some(&trace_tag),
         )
         .await;
 
@@ -2971,6 +3127,8 @@ async fn handle_api_chat(
                             Some(signal_obs_bg.clone() as Arc<dyn crate::observability::Observer>),
                             Some(sop_engine_shared.clone()),
                             Some(crate::memory::GATEWAY_API_CHAT_SESSION_ID),
+                            Some(CHAT_PRESENTATION_RULE),
+                            Some(&trace_tag),
                         )
                         .await;
                     }
@@ -2987,8 +3145,13 @@ async fn handle_api_chat(
 
         // Update conversation history and fire ChatTurnCompleted regardless of
         // whether the gateway already returned early (SOP case) or is still waiting.
-        match &result {
+        //
+        // 整轮的「交错显示」文本里夹着中间轮的过程独白（英文开场白、「域名不在白名单…先用
+        // shell 试试」这类内部说明）。这里统一收敛成 chat_reply 的结果，返回给调用方的、
+        // ChatTurnCompleted 事件里的、以及由它驱动的 done webhook 与 SSE 汇报，是同一份文本。
+        let result = match result {
             Ok((response_text, new_history)) => {
+                let reply = chat_reply(&response_text, &new_history);
                 {
                     let mut stored = new_history.clone();
                     trim_api_chat_history(&mut stored);
@@ -2997,12 +3160,13 @@ async fn handle_api_chat(
                 crate::observability::Observer::record_event(
                     signal_obs_bg.as_ref(),
                     &crate::observability::ObserverEvent::ChatTurnCompleted {
-                        response_text: response_text.clone(),
+                        response_text: reply.clone(),
                     },
                 );
                 global_obs.record_metric(&crate::observability::ObserverMetric::RequestLatency(
                     started_at.elapsed(),
                 ));
+                Ok((reply, new_history))
             }
             Err(e) => {
                 let sanitized = providers::sanitize_api_error(&e.to_string());
@@ -3010,16 +3174,13 @@ async fn handle_api_chat(
                     component: "gateway".to_string(),
                     message: sanitized,
                 });
+                Err(e)
             }
-        }
+        };
         let _ = result_tx.send(result);
     });
 
     let _ = (provider_label, model_label);
-
-    // 本轮 id：客户端据此把「我刚发的这一轮」与随后出现的 run / 汇报对上。
-    // /api/chat 此前不返回任何可关联的标识，客户端只能靠轮询做集合差，很脆。
-    let turn_id = format!("turn-{}", chrono::Utc::now().timestamp_millis());
 
     // Select: return as soon as the agent finishes (quick non-SOP path) OR as
     // soon as a SOP is detected (early-return path — agent keeps running in bg).
@@ -3028,11 +3189,15 @@ async fn handle_api_chat(
             // Agent completed before (or without) triggering a SOP.
             match res {
                 Ok(Ok((response, _))) => {
-                    let body = serde_json::json!({
+                    let mut body = serde_json::json!({
                         "response": response,
                         "model": model_label_clone,
                         "turn_id": turn_id,
                     });
+                    if let Some(c) = chat_citations(&state, &turn_id, &response).await {
+                        body["citation_summary"] = casebook::citation_summary(&c);
+                        body["citations"] = serde_json::to_value(&c).unwrap_or_default();
+                    }
                     (StatusCode::OK, Json(body))
                 }
                 Ok(Err(e)) => {
@@ -5642,7 +5807,7 @@ mod run_history_tests {
 
 #[cfg(test)]
 mod final_reply_tests {
-    use super::final_reply;
+    use super::{chat_reply, final_reply, CHAT_PRESENTATION_RULE};
     use crate::providers::ChatMessage;
 
     #[test]
@@ -5661,6 +5826,63 @@ mod final_reply_tests {
         assert_eq!(final_reply("原文", &[]), "原文");
         let hist = vec![ChatMessage::assistant(r#"{"tool_calls":[]}"#)];
         assert_eq!(final_reply("原文", &hist), "原文");
+    }
+
+    #[test]
+    fn chat_reply_drops_mid_turn_narration() {
+        let answer = "KRAS G12C 抑制剂已在非小细胞肺癌获批（PMID: 34161704）；                      其余靶点仍在临床试验阶段（NCT04613596）。以上结论来自本轮检索。";
+        let hist = vec![
+            ChatMessage::user("KRAS 在肺癌治疗上的新进展"),
+            ChatMessage::assistant("I'll start by searching PubMed."),
+            ChatMessage::assistant(answer),
+        ];
+        let merged = format!("I'll start by searching PubMed.\n\n{answer}");
+        assert_eq!(chat_reply(&merged, &hist), answer);
+    }
+
+    #[test]
+    fn chat_reply_keeps_the_answer_when_the_turn_ends_on_a_tool_receipt() {
+        let answer = "二甲双胍的常见不良反应包括胃肠道不适与维生素 B12 吸收减少；                      这一条凭已有知识回答，未经检索核实。需要文献的话我再检索一次。                      另外，剂量调整请按主诊医师意见执行，本窗口不代为决定。";
+        let hist = vec![
+            ChatMessage::user("二甲双胍有什么副作用"),
+            ChatMessage::assistant(answer),
+            ChatMessage::assistant("已保存。"),
+        ];
+        let merged = format!("{answer}\n\n已保存。");
+        assert_eq!(
+            chat_reply(&merged, &hist),
+            merged,
+            "最后一条只是收尾工具的回执，不能把答案吞掉"
+        );
+    }
+
+    #[test]
+    fn a_short_answer_before_a_tool_receipt_survives_and_loses_the_narration() {
+        // 实测过的形状：开头英文过程独白 → 正文（这里很短）→ 收尾工具回执。
+        // 原来的判据要求拼接文本至少是最后一条的三倍再加 120 字，125 字的答案会被
+        // 「已保存。」整条顶掉——答案没了，只剩回执。
+        let answer = "主要终点是无进展生存期：5.6 个月对 4.5 个月，HR 0.66（PMID: 36764316）。";
+        let hist = vec![
+            ChatMessage::user("CodeBreaK 200 的主要终点结果"),
+            ChatMessage::assistant("I'll look up that trial on PubMed before answering."),
+            ChatMessage::assistant(answer),
+            ChatMessage::assistant("已保存。"),
+        ];
+        let merged =
+            format!("I'll look up that trial on PubMed before answering.\n\n{answer}\n\n已保存。");
+        let got = chat_reply(&merged, &hist);
+        assert!(got.contains("5.6 个月"), "答案不能被回执顶掉：{got}");
+        assert!(
+            !got.contains("I'll look up"),
+            "退回拼接文本时仍要去掉过程独白：{got}"
+        );
+    }
+
+    #[test]
+    fn chat_rule_is_abstract_and_states_what_must_be_disclosed() {
+        for must in ["全部用中文", "未经检索核实", "出处编号", "规程"] {
+            assert!(CHAT_PRESENTATION_RULE.contains(must), "{must}");
+        }
     }
 }
 

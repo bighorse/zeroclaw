@@ -341,7 +341,7 @@ mod tests {
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
-            version: "1.0.0".into(),
+            version: Some("1.0.0".into()),
             author: None,
             tags: vec![],
             tools: vec![crate::skills::SkillTool {
@@ -379,7 +379,7 @@ mod tests {
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
-            version: "1.0.0".into(),
+            version: Some("1.0.0".into()),
             author: None,
             tags: vec![],
             tools: vec![crate::skills::SkillTool {
@@ -439,7 +439,7 @@ mod tests {
         let skills = vec![crate::skills::Skill {
             name: "code<review>&".into(),
             description: "Review \"unsafe\" and 'risky' bits".into(),
-            version: "1.0.0".into(),
+            version: Some("1.0.0".into()),
             author: None,
             tags: vec![],
             tools: vec![crate::skills::SkillTool {

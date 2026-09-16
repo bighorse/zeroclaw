@@ -1395,6 +1395,20 @@ impl LarkChannel {
                     let reply = format!(
                         "✅ 已批准 `{run_id}`,SOP 推进。下一动作:`{next}`\n\n正在自动唤醒 LLM 推进剩余步骤..."
                     );
+                    // 审核人在前台改过的句子，批准时一并交给助手——与网关 /sop/approve
+                    // 读的是同一份逐条记录(state 下的 verdicts.jsonl)。不带上它的话,
+                    // 「先在前台改、再在飞书批准」这条路径上,修改不会进终稿,前台随后
+                    // 只会显示「终稿里找不到这句」,看不出原因是走了飞书批准。
+                    // 没配 workspace_dir 时读不到记录,这里如实不加,不假装带上了修改。
+                    let edits_note = self
+                        .workspace_dir
+                        .as_ref()
+                        .and_then(|ws| {
+                            use crate::gateway::casebook as cb;
+                            let verdicts = cb::read_jsonl_for_run(&cb::verdicts_path(ws), &run_id);
+                            cb::edits_wake_paragraph(&cb::effective_edits(&verdicts))
+                        })
+                        .unwrap_or_default();
                     // Synthesize a wake message that the LLM agent loop
                     // will treat as inbound chat. The message is phrased
                     // as a system instruction so the LLM picks the
@@ -1402,7 +1416,7 @@ impl LarkChannel {
                     // short — IDENTITY.md already teaches the LLM what
                     // `sop_advance` does.
                     let wake = format!(
-                        "[SYSTEM] PM 已批准 SOP run `{run_id}` 的当前 WaitApproval 检查点。请立即调用 `sop_advance` 工具(参数 `run_id={run_id}`)推进 SOP 到下一步,然后按 SOP.md 继续执行剩余步骤,直到下一个 `requires_confirmation:true` 检查点或运行完成。"
+                        "[SYSTEM] PM 已批准 SOP run `{run_id}` 的当前 WaitApproval 检查点。请立即调用 `sop_advance` 工具(参数 `run_id={run_id}`)推进 SOP 到下一步,然后按 SOP.md 继续执行剩余步骤,直到下一个 `requires_confirmation:true` 检查点或运行完成。{edits_note}"
                     );
                     SopCommandOutcome::Approved { reply, wake }
                 }

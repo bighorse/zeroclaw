@@ -1347,7 +1347,8 @@ pub async fn handle_api_task_detail(
     .into_response()
 }
 
-/// 一单的可核对信息：引用核验、结构化结论（逐条核验）、人工决定记录、逐条认可 / 不认同。
+/// 一单的可核对信息：引用核验、结构化结论（逐条核验，初稿 / 终稿）、人工决定记录、逐条认可 / 不认同、
+/// 人工修改及终稿是否照改、规程声明的栏目名。
 /// 全部由运行时从留存记录算出；模型写的任何「已核」字样都不参与。
 pub(crate) fn task_casebook(
     state: &AppState,
@@ -1381,37 +1382,160 @@ pub(crate) fn task_casebook(
                 .unwrap_or_default(),
         ),
     };
-    let citations = cb::verify_citations(&cb::extract_pmids(&report_text), evidence);
-    let verified = citations.iter().filter(|c| c.verified).count();
+    let citations = cb::verify_refs(&cb::extract_refs(&report_text), evidence);
 
-    // 结构化结论：规程产出的 conclusion.json（同一单写的，且在工作区里）
-    let conclusion = paths
-        .iter()
-        .rev()
-        .find(|(rel, _)| rel.ends_with("conclusion.json"))
-        .map(|(rel, abs)| {
-            match std::fs::read_to_string(abs)
-                .map_err(|e| e.to_string())
-                .and_then(|raw| {
-                    serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string())
-                }) {
-                Ok(v) => {
-                    serde_json::json!({"path": rel, "data": cb::annotate_conclusion(v, evidence)})
-                }
-                Err(e) => {
-                    serde_json::json!({"path": rel, "error": format!("结构化结论读不出来：{e}")})
-                }
+    // 结构化结论：规程产出的 conclusion.json（同一单写的，且在工作区里）；
+    // 交付时另写的 conclusion_final.json 才是现在的结论，初稿附在旁边供对照
+    let read_json = |abs: &std::path::Path| {
+        std::fs::read_to_string(abs)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string())
+            })
+    };
+    let (draft_file, final_file) = cb::pick_conclusions(&paths);
+    let draft_raw = draft_file.map(|f| (f, read_json(&f.1)));
+    let final_raw = final_file.map(|f| (f, read_json(&f.1)));
+    let shaped = |(file, raw): &LoadedConclusion| match raw {
+        Ok(v) => {
+            serde_json::json!({"path": file.0, "data": cb::annotate_conclusion(v.clone(), evidence)})
+        }
+        Err(e) => {
+            serde_json::json!({"path": file.0, "error": format!("结构化结论读不出来：{e}")})
+        }
+    };
+    let conclusion = match (&final_raw, &draft_raw) {
+        (Some(fin), draft) => {
+            let mut c = shaped(fin);
+            c["final"] = true.into();
+            if let Some(d @ (file, Ok(_))) = draft {
+                c["draft"] = shaped(d)["data"].take();
+                c["draft_path"] = serde_json::json!(file.0);
             }
-        });
+            c
+        }
+        (None, Some(draft)) => {
+            let mut c = shaped(draft);
+            c["final"] = false.into();
+            c
+        }
+        (None, None) => serde_json::Value::Null,
+    };
+
+    let verdicts = cb::read_jsonl_for_run(&cb::verdicts_path(&workspace), run_id);
+    let edits = edits_against_final(&paths, final_raw.as_ref(), &verdicts);
 
     serde_json::json!({
         "report": report_rel,
         "citations": citations,
-        "citation_summary": {"total": citations.len(), "verified": verified},
+        "citation_summary": cb::citation_summary(&citations),
         "conclusion": conclusion,
         "decisions": cb::read_jsonl_for_run(&cb::decisions_path(&workspace), run_id),
-        "verdicts": cb::read_jsonl_for_run(&cb::verdicts_path(&workspace), run_id),
+        "verdicts": verdicts,
+        "edits": edits,
+        "vocabulary": frontdesk_vocabulary(state, run_id, evidence),
     })
+}
+
+/// 读过的一份结构化结论文件：(产物路径, 解析结果或读不出来的原因)
+type LoadedConclusion<'a> = (
+    &'a super::casebook::ArtifactPath,
+    Result<serde_json::Value, String>,
+);
+
+/// 生效的人工修改，逐条比对终稿有没有照改。
+/// 终稿 = 路径含 final 的报告 .md 与 conclusion_final.json；都没有就是还没交付，比对结论一律 null。
+/// 终稿文件在却读不出来，同样不下结论——拿半份终稿比对，会把照改了的说成「找不到」。
+fn edits_against_final(
+    paths: &[super::casebook::ArtifactPath],
+    final_conclusion: Option<&LoadedConclusion>,
+    verdicts: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    use super::casebook as cb;
+    let final_report = cb::pick_final_report(paths);
+    let mut pieces: Vec<String> = Vec::new();
+    let mut readable = final_report.is_some() || final_conclusion.is_some();
+    if let Some((_, abs)) = final_report {
+        match std::fs::read_to_string(abs) {
+            Ok(t) => pieces.push(t),
+            Err(_) => readable = false,
+        }
+    }
+    match final_conclusion {
+        Some((_, Ok(v))) => cb::json_strings(v, &mut pieces),
+        Some((_, Err(_))) => readable = false,
+        None => {}
+    }
+    let final_text = readable.then(|| cb::normalized_final_text(&pieces));
+    // 终稿最后一次写盘的时间：比它晚的修改不可能写进终稿
+    let final_modified = final_report
+        .into_iter()
+        .chain(final_conclusion.map(|(file, _)| *file))
+        .filter_map(|(_, abs)| std::fs::metadata(abs).and_then(|m| m.modified()).ok())
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .max();
+    cb::effective_edits(verdicts)
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "rec_id": e.rec_id,
+                "before": e.before,
+                "after": e.after,
+                "at": e.at,
+                "who": e.who,
+                "applied": cb::edit_applied(e.before.as_deref(), &e.after, final_text.as_deref()),
+                "after_final": cb::edited_after_final(e.at.as_deref(), final_modified),
+            })
+        })
+        .collect()
+}
+
+/// 规程在 SOP.toml `[frontdesk]` 里声明的栏目名。
+/// 规程名先问引擎；服务端重启后 run 已不在内存，再从本单 SOP 工具的返回里认。
+/// 认不出、规程已不在、没声明，都返回 None——前台用默认措辞，不猜。
+fn frontdesk_vocabulary(
+    state: &AppState,
+    run_id: &str,
+    evidence: &[(crate::ledger::Evidence, String)],
+) -> Option<serde_json::Value> {
+    let from_engine = {
+        let engine = state.sop_engine.lock().ok()?;
+        engine.get_run(run_id).map(|r| r.sop_name.clone())
+    };
+    let name = from_engine.or_else(|| super::casebook::sop_name_in_evidence(run_id, evidence))?;
+    let location = {
+        let engine = state.sop_engine.lock().ok()?;
+        engine.get_sop(&name)?.location.clone()?
+    };
+    let raw = std::fs::read_to_string(location.join("SOP.toml")).ok()?;
+    super::casebook::parse_frontdesk_vocabulary(&raw)
+}
+
+/// 这一单当前结构化结论（有终稿读终稿，读不出来再读初稿）里某一句的原文，供改写记录的 before。
+fn current_sentence(state: &AppState, run_id: &str, rec_id: &str) -> Option<String> {
+    use super::casebook as cb;
+    let (trace_path, full) = trace_setup(state);
+    if !crate::ledger::availability(&trace_path, full).available {
+        return None;
+    }
+    let evidence = crate::ledger::evidence_for_run(&trace_path, run_id);
+    let workspace = state.config.lock().workspace_dir.clone();
+    let paths: Vec<(String, std::path::PathBuf)> = task_artifacts(&evidence, &workspace)
+        .into_iter()
+        .map(|a| (a.rel, a.abs))
+        .collect();
+    let (draft, fin) = cb::pick_conclusions(&paths);
+    // 读得出来的第一份说了算：终稿里没有这一句就是 null，不退回初稿去找
+    for (_, abs) in fin.into_iter().chain(draft) {
+        let Some(v) = std::fs::read_to_string(abs)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        else {
+            continue;
+        };
+        return cb::conclusion_sentence(&v, rec_id);
+    }
+    None
 }
 
 /// 人工决定（批准 / 驳回 / 停止）留痕：谁、何时、哪一步，以及**做决定时**可核对的状况。
@@ -1461,6 +1585,8 @@ pub(crate) fn record_decision(
             "report": book.get("report"),
             "report_sha256": report_sha,
             "binding_violations": book.pointer("/conclusion/data/checks/binding_violations"),
+            // 批准时带着几处人工修改：这些句子是审核人的写法，不是助手的
+            "edits": book["edits"].as_array().map_or(0, Vec::len),
         },
     });
     if let Err(e) = cb::append_jsonl(&cb::decisions_path(&workspace), &entry) {
@@ -1468,11 +1594,12 @@ pub(crate) fn record_decision(
     }
 }
 
+/// 请求体里没有 `before`：被改那句的原文由服务端从结论里取，前台传了也不认（未知字段直接忽略）。
 #[derive(Debug, serde::Deserialize)]
 pub struct VerdictBody {
-    /// agree | disagree | answer
+    /// agree | disagree | retract | edit | unedit | answer
     pub kind: String,
-    /// 针对哪一条建议（agree / disagree）
+    /// 针对哪一条建议（agree / disagree / retract / edit / unedit；edit 还可以是 summary / verdict）
     #[serde(default)]
     pub rec_id: Option<String>,
     /// 针对哪一个问题（answer）
@@ -1484,8 +1611,8 @@ pub struct VerdictBody {
     pub who: Option<String>,
 }
 
-/// POST /api/tasks/{run_id}/verdicts —— 快环：逐条认可 / 不认同，或回答「助手不确定的」问题。
-/// 只记录，不改结论、不改规程——它是评测样本与修订建议的原料。
+/// POST /api/tasks/{run_id}/verdicts —— 快环：逐条认可 / 不认同、改写某句 / 撤销改写，或回答「助手不确定的」问题。
+/// 只记录，不改结论文件、不改规程——改写在批准时交给助手写进终稿，照没照改由 casebook 比对终稿得出。
 pub async fn handle_api_task_verdict(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -1508,43 +1635,100 @@ pub async fn handle_api_task_verdict(
         .as_deref()
         .map(|t| redact_feedback(t.trim()))
         .filter(|t| !t.is_empty());
+    // 撤销改写不带文字：带了也不记，否则同样的撤销因文字不同而重复入账
+    let text = if kind == "unedit" { None } else { text };
+    let rec_id: Option<String> = b
+        .rec_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string);
     let valid = match kind {
-        "agree" | "retract" => b.rec_id.is_some(),
-        "disagree" => b.rec_id.is_some() && text.is_some(),
+        "agree" | "retract" | "unedit" => rec_id.is_some(),
+        "disagree" | "edit" => rec_id.is_some() && text.is_some(),
         "answer" => b.qid.is_some() && text.is_some(),
         _ => false,
     };
     if !valid {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"api":"frontdesk","error":"需要 kind=agree 带 rec_id；disagree 带 rec_id 和一句理由；answer 带 qid 和回答"})),
+            Json(serde_json::json!({"api":"frontdesk","error":"需要 kind=agree / retract 带 rec_id；disagree 带 rec_id 和一句理由；edit 带 rec_id 和改后的写法；unedit 带 rec_id；answer 带 qid 和回答"})),
+        )
+            .into_response();
+    }
+    // 条目编号原样进唤醒消息，格式不对就不收：带换行和伪造「[系统]」行的编号能在消息里另起一段
+    if let Some(rec) = rec_id.as_deref() {
+        if !super::casebook::valid_rec_id(rec) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"api":"frontdesk","error":"rec_id 只能是 summary、verdict，或 32 字以内的字母数字加 - _"})),
+            )
+                .into_response();
+        }
+    }
+    if kind == "edit"
+        && text
+            .as_deref()
+            .is_some_and(|t| t.chars().count() > super::casebook::EDIT_MAX_CHARS)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"api":"frontdesk","error":format!("改后的写法超过 {} 字，请分句修改", super::casebook::EDIT_MAX_CHARS)})),
         )
             .into_response();
     }
     let workspace = state.config.lock().workspace_dir.clone();
     let path = super::casebook::verdicts_path(&workspace);
-    let text: Option<String> = text.map(|t| t.chars().take(1000).collect());
+    let text: Option<String> =
+        text.map(|t| t.chars().take(super::casebook::EDIT_MAX_CHARS).collect());
     // 幂等：同一条（同一建议 / 同一问题）的最新记录与这次完全一样，就不再追加——
     // 实测按钮多点几下，记录里就出现三条「认可 R1」、六条同样的回答。改了主意（换答案、认可改不认同）照常记。
     let existing = super::casebook::read_jsonl_for_run(&path, &run_id);
+    // 生效的修改条数有上限：每个编号占一个槽位，唤醒消息要把它们逐条交代给助手。
+    // 已经改过的那一条照常可以再改，只挡新开槽位。
+    if kind == "edit" {
+        let effective = super::casebook::effective_edits(&existing);
+        if effective.len() >= super::casebook::MAX_WAKE_EDITS
+            && !effective
+                .iter()
+                .any(|e| Some(e.rec_id.as_str()) == rec_id.as_deref())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"api":"frontdesk","error":format!("本单生效的修改已有 {} 处，到上限了；请先撤销一些修改，或批准后在终稿上继续", effective.len())})),
+            )
+                .into_response();
+        }
+    }
     if let Some(same) = super::casebook::latest_verdict_if_same(
         &existing,
         kind,
-        b.rec_id.as_deref(),
+        rec_id.as_deref(),
         b.qid.as_deref(),
         text.as_deref(),
     ) {
         return Json(serde_json::json!({"api":"frontdesk","api_version":1,"recorded":false,"duplicate":true,"entry":same})).into_response();
     }
-    let entry = serde_json::json!({
+    // 「改之前」只取结论里真有的那句；取不到如实记 null
+    let before = (kind == "edit")
+        .then(|| {
+            rec_id
+                .as_deref()
+                .and_then(|rec| current_sentence(&state, &run_id, rec))
+        })
+        .flatten();
+    let mut entry = serde_json::json!({
         "run_id": run_id,
         "at": chrono::Utc::now().to_rfc3339(),
         "kind": kind,
-        "rec_id": b.rec_id,
+        "rec_id": rec_id,
         "qid": b.qid,
         "text": text,
         "who": b.who.as_deref().map(str::trim).filter(|w| !w.is_empty()),
     });
+    if kind == "edit" {
+        entry["before"] = before.into();
+    }
     if let Err(e) = super::casebook::append_jsonl(&path, &entry) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2480,6 +2664,8 @@ mod sop_title_tests {
 mod frontdesk_v6_tests {
     //! 龙虾前台 v6（PR-A）新增能力的回归测试。
     //! 关心的不是「返回 200」，而是**客户端能否确定性地判断服务端支持什么、以及状态是否已变**。
+    use super::super::casebook;
+    use super::edits_against_final;
     use crate::config::SopConfig;
     use crate::sop::engine::SopEngine;
     use crate::sop::types::{
@@ -2562,6 +2748,67 @@ mod frontdesk_v6_tests {
         assert!(e.get_run(&run_id).is_some());
         e.cancel_run(&run_id).expect("cancel");
         assert!(e.get_run(&run_id).is_some(), "结束后仍应可查");
+    }
+
+    /// 人工改结果的比对口径：拿终稿真文本比，比不出来就不下结论。
+    /// 这一段最容易出错的地方是「找得到改后的写法」就判照改——删减型修改里那等于不比。
+    #[test]
+    fn edits_are_compared_against_the_delivered_final_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let edit = |before: &str, after: &str| {
+            vec![serde_json::json!({
+                "run_id": "r1",
+                "kind": "edit",
+                "rec_id": "R1",
+                "before": before,
+                "text": after,
+                "at": "2026-09-15T01:00:00Z",
+            })]
+        };
+
+        // 还没交付：没有终稿就不下结论
+        let no_final: Vec<casebook::ArtifactPath> = vec![(
+            "case/report_draft.md".to_string(),
+            dir.path().join("report_draft.md"),
+        )];
+        std::fs::write(dir.path().join("report_draft.md"), "建议每 3 个月复查。").unwrap();
+        let got = edits_against_final(
+            &no_final,
+            None,
+            &edit("建议每 3 个月复查", "建议每 6 个月复查一次颈部超声"),
+        );
+        assert!(got[0]["applied"].is_null(), "没有终稿时不下结论");
+        assert_eq!(got[0]["after_final"], false);
+
+        // 已交付，但终稿里还是原句：没照改
+        let final_path = dir.path().join("report_final.md");
+        std::fs::write(&final_path, "# 终稿\n\n建议每 3 个月复查一次颈部超声。\n").unwrap();
+        let delivered: Vec<casebook::ArtifactPath> =
+            vec![("case/report_final.md".to_string(), final_path)];
+        let got = edits_against_final(
+            &delivered,
+            None,
+            &edit(
+                "建议每 3 个月复查一次颈部超声",
+                "建议每 6 个月复查一次颈部超声",
+            ),
+        );
+        assert_eq!(got[0]["applied"], false, "原句原封不动留在终稿里");
+
+        // 终稿文件在、却读不出来：同样不下结论，不拿半份终稿比
+        let broken: Vec<casebook::ArtifactPath> = vec![(
+            "case/report_final.md".to_string(),
+            dir.path().join("不存在_final.md"),
+        )];
+        let got = edits_against_final(
+            &broken,
+            None,
+            &edit(
+                "建议每 3 个月复查一次颈部超声",
+                "建议每 6 个月复查一次颈部超声",
+            ),
+        );
+        assert!(got[0]["applied"].is_null(), "终稿读不出来时不下结论");
     }
 
     #[test]
