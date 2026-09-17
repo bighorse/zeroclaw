@@ -153,19 +153,40 @@ pub fn evidence_with_output_for_turn(trace_path: &Path, turn_id: &str) -> Vec<(E
         .collect();
     chron.reverse();
 
-    // tool_call_start 提供参数，tool_call_result 提供输出；按 (iteration, tool) 配对
-    let mut args_by_key: std::collections::HashMap<String, String> =
+    // tool_call_start 提供参数，tool_call_result 提供输出。
+    //
+    // 同一轮里模型会并行发出几次同名调用（比如一次写 plan.md、一次写 plan.sidecar.json），
+    // 所以不能按 (iteration, tool) 建一张表——后一次的参数会盖掉前一次，前一个文件就从
+    // 「产物」里消失了（驻京办月度生成实测：10 份企业方案一份都没登记上）。
+    //
+    // 运行时的写法保证可以按先后配对：
+    // - 真正执行的调用：先逐个写 start，全部执行完再按同样顺序写 result；
+    // - 被钩子取消、被拒绝、判为重复而没执行的调用：不写 start，参数直接带在 result 里。
+    // 所以同一 (iteration, tool) 下，不带参数的 result 依次对应 start 队列。
+    // 条数对不上（比如扫描窗口正好截在这一轮中间）就整组不配：宁可不给参数，也不张冠李戴。
+    let key_of = |e: &RuntimeTraceEvent| {
+        format!(
+            "{}:{}",
+            payload_str(e, "iteration").unwrap_or_default(),
+            payload_str(e, "tool").unwrap_or_default()
+        )
+    };
+    let mut starts: std::collections::HashMap<String, std::collections::VecDeque<Option<String>>> =
         std::collections::HashMap::new();
-    // 完整参数（不截断），只用来抽取文件路径
+    let mut executed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for e in &chron {
-        if e.event_type == "tool_call_start" {
-            let tool = payload_str(e, "tool").unwrap_or_default();
-            let iter = payload_str(e, "iteration").unwrap_or_default();
-            if let Some(a) = payload_str(e, "arguments") {
-                args_by_key.insert(format!("{iter}:{tool}"), a);
+        match e.event_type.as_str() {
+            "tool_call_start" => starts
+                .entry(key_of(e))
+                .or_default()
+                .push_back(payload_str(e, "arguments")),
+            "tool_call_result" if payload_str(e, "arguments").is_none() => {
+                *executed.entry(key_of(e)).or_default() += 1;
             }
+            _ => {}
         }
     }
+    starts.retain(|k, q| executed.get(k) == Some(&q.len()));
 
     let mut out = Vec::new();
     let mut n = 0u32;
@@ -178,15 +199,21 @@ pub fn evidence_with_output_for_turn(trace_path: &Path, turn_id: &str) -> Vec<(E
         let output = payload_str(e, "output").unwrap_or_default();
         n += 1;
         let sha = sha256_hex(&output);
-        let full_args = args_by_key.get(&format!("{iter}:{tool}"));
+        let full_args = match payload_str(e, "arguments") {
+            Some(own) => Some(own),
+            None => starts
+                .get_mut(&format!("{iter}:{tool}"))
+                .and_then(|q| q.pop_front())
+                .flatten(),
+        };
         let ev = Evidence {
             eid: format!("E{n}-{}", &sha[..6]),
             n,
             at: e.timestamp.clone(),
             source_class: SourceClass::of_tool(&tool),
-            path: full_args.and_then(|a| path_arg(a)),
-            url: full_args.and_then(|a| url_arg(a)),
-            args_excerpt: full_args.map(|a| excerpt(a, 200)),
+            path: full_args.as_deref().and_then(path_arg),
+            url: full_args.as_deref().and_then(url_arg),
+            args_excerpt: full_args.as_deref().map(|a| excerpt(a, 200)),
             output_excerpt: excerpt(&output, EXCERPT),
             output_bytes: output.len(),
             sha256: sha,
@@ -384,6 +411,111 @@ mod tests {
         assert_eq!(path_arg(r#"{"file_path":"x.md"}"#).as_deref(), Some("x.md"));
         assert_eq!(path_arg(r#"{"command":"ls"}"#), None);
         assert_eq!(path_arg("not json"), None);
+    }
+
+    fn trace_file(events: &[(&str, serde_json::Value, Option<bool>)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let lines: Vec<String> = events
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, payload, success))| {
+                serde_json::to_string(&RuntimeTraceEvent {
+                    id: format!("ev-{i}"),
+                    // 同一时刻：顺序只能靠落盘先后，和并行调用的真实情况一致
+                    timestamp: "2026-09-17T11:34:58Z".into(),
+                    event_type: (*kind).into(),
+                    channel: None,
+                    provider: None,
+                    model: None,
+                    turn_id: Some("t1".into()),
+                    success: *success,
+                    message: None,
+                    payload: payload.clone(),
+                })
+                .unwrap()
+            })
+            .collect();
+        std::fs::write(dir.path().join("trace.jsonl"), lines.join("\n")).unwrap();
+        dir
+    }
+
+    fn start(iter: u32, tool: &str, path: &str) -> (&'static str, serde_json::Value, Option<bool>) {
+        let args = serde_json::json!({ "path": path, "content": "x" }).to_string();
+        (
+            "tool_call_start",
+            serde_json::json!({ "iteration": iter, "tool": tool, "arguments": args }),
+            None,
+        )
+    }
+
+    fn result(
+        iter: u32,
+        tool: &str,
+        output: &str,
+    ) -> (&'static str, serde_json::Value, Option<bool>) {
+        (
+            "tool_call_result",
+            serde_json::json!({ "iteration": iter, "tool": tool, "duration_ms": 0, "output": output }),
+            Some(true),
+        )
+    }
+
+    fn paths(dir: &tempfile::TempDir) -> Vec<Option<String>> {
+        evidence_for_turn(&dir.path().join("trace.jsonl"), "t1")
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
+    }
+
+    #[test]
+    fn parallel_calls_of_the_same_tool_keep_their_own_paths() {
+        // 同一轮并行写两个文件：以前后一次的参数会盖掉前一次，plan.md 从产物里消失
+        let dir = trace_file(&[
+            start(27, "file_write", "plans/a/plan.md"),
+            start(27, "file_write", "plans/a/plan.sidecar.json"),
+            result(27, "file_write", "wrote plan.md"),
+            result(27, "file_write", "wrote plan.sidecar.json"),
+            start(28, "file_write", "navigation.md"),
+            result(28, "file_write", "wrote navigation.md"),
+        ]);
+        assert_eq!(
+            paths(&dir),
+            vec![
+                Some("plans/a/plan.md".to_string()),
+                Some("plans/a/plan.sidecar.json".to_string()),
+                Some("navigation.md".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn skipped_calls_use_their_own_arguments_and_do_not_shift_the_queue() {
+        // 判为重复的调用没有 start，参数带在 result 里；它不能占掉后面真执行那次的参数
+        let skipped_args = serde_json::json!({ "path": "dup.md" }).to_string();
+        let dir = trace_file(&[
+            (
+                "tool_call_result",
+                serde_json::json!({ "iteration": 3, "tool": "file_write", "arguments": skipped_args, "deduplicated": true }),
+                Some(false),
+            ),
+            start(3, "file_write", "real.md"),
+            result(3, "file_write", "wrote real.md"),
+        ]);
+        assert_eq!(
+            paths(&dir),
+            vec![Some("dup.md".to_string()), Some("real.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn mismatched_counts_leave_paths_empty_instead_of_guessing() {
+        // 一轮里 start 少了一条（比如被扫描窗口截掉）：宁可不给路径，也不把别人的路径安上去
+        let dir = trace_file(&[
+            start(5, "file_write", "second.md"),
+            result(5, "file_write", "wrote first.md"),
+            result(5, "file_write", "wrote second.md"),
+        ]);
+        assert_eq!(paths(&dir), vec![None, None]);
     }
 
     #[test]
