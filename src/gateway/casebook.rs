@@ -830,10 +830,13 @@ pub const EDIT_MAX_CHARS: usize = 1000;
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum EditKind {
-    /// 改后的写法，终稿要逐字采用
-    Edit { after: String },
-    /// 终稿里删掉这一条；理由要写进终稿的审核记录
-    Drop { reason: String },
+    /// 改后的写法，终稿要逐字采用。
+    /// `safety_note`：原句是规程要求的通用安全提醒、改后的写法不再含标志句——等于拿掉了这条提醒
+    /// （记录时服务端判出，见 [`takes_away_safety_note`]）
+    Edit { after: String, safety_note: bool },
+    /// 终稿里删掉这一条；理由要写进终稿的审核记录。
+    /// `safety_note`：删的是规程要求的通用安全提醒（记录时服务端按原句判出，见 [`takes_away_safety_note`]）
+    Drop { reason: String, safety_note: bool },
 }
 
 impl EditKind {
@@ -842,6 +845,13 @@ impl EditKind {
         match self {
             Self::Edit { .. } => "edit",
             Self::Drop { .. } => "drop",
+        }
+    }
+
+    /// 这条要求是不是拿掉了通用安全提醒（删掉它，或改写得不再含标志句）
+    pub fn safety_note(&self) -> bool {
+        match self {
+            Self::Edit { safety_note, .. } | Self::Drop { safety_note, .. } => *safety_note,
         }
     }
 }
@@ -880,12 +890,17 @@ pub fn effective_edits(verdicts: &[serde_json::Value]) -> Vec<EffectiveEdit> {
         .into_iter()
         .filter_map(|(rec_id, v)| {
             // 这一句最新的记录是 unedit（撤销改写 / 撤销删除），就等于没有要求
+            // 安全提醒标记只认记录里服务端写下的（记录这条要求时按结论原句判出）：
+            // verdicts.jsonl 里那条记录、casebook.edits、批准唤醒段落用的是同一个判断，这里不另判一次
+            let safety_note = v.get("safety_note").and_then(|s| s.as_bool()) == Some(true);
             let kind = match v.get("kind").and_then(|k| k.as_str())? {
                 "edit" => EditKind::Edit {
                     after: str_of(v, "text")?,
+                    safety_note,
                 },
                 "drop" => EditKind::Drop {
                     reason: str_of(v, "text")?,
+                    safety_note,
                 },
                 _ => return None,
             };
@@ -1104,6 +1119,59 @@ pub fn edited_after_final(
     chrono::DateTime::parse_from_rfc3339(at).is_ok_and(|t| t.with_timezone(&chrono::Utc) > fin)
 }
 
+// ── 通用安全提醒 ────────────────────────────────────────────────
+
+/// 通用安全提醒的标志句。出处：claim-check 规程 P0-6——说法涉及停药、减药、停止或推迟正规治疗、
+/// 偏方替代、吃喝非食用物质时，要点里必须有一条正文含这句话的提醒。
+/// 别的规程有自己的标志句时再扩成列表。
+pub const SAFETY_NOTE_MARKER: &str = "用药和治疗请听医生的";
+
+/// 审核人拿掉通用安全提醒之后（删掉它，或改写得不再含标志句），终稿正文里「核查结论」那段话之后
+/// 另起一行必须原样写出的一句。不说「一条」「删除」：拿掉两条、改写拿掉的情况都要说得准。
+/// 与 claim-check 规程脚本的 `SAFETY_DROP_NOTICE`、前台确认框引用的那句逐字一致，改措辞要三处一起改。
+pub const SAFETY_NOTE_DROPPED_NOTICE: &str = "注意：本核查卡原有的通用安全提醒已被审核人拿掉。";
+
+/// 判标志句专用的规范化：去掉空白、标点、符号、控制与格式字符（Unicode 类别 P / S / C），
+/// 与前台 `looksLikeSafetyNote`（`[\s\p{P}\p{S}\p{C}]`）同一口径——标志句中间夹了 `～ - / ~` 仍算。
+/// 刻意不复用 [`normalize_for_match`]：那边比对终稿时要保留 `- / ~ <` 这类改变意思的符号
+/// （「4-6」与「46」不能判成一样），这里只问「有没有这句话」，符号不影响。
+fn normalize_for_marker(s: &str) -> String {
+    static NOISE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    regex_once(&NOISE, r"[\s\p{P}\p{S}\p{C}]+")
+        .replace_all(s, "")
+        .into_owned()
+}
+
+/// 这句原文是不是通用安全提醒：按 `normalize_for_marker` 规范化后含标志句（空白、标点、符号不影响）。
+/// 只拿服务端从结论里取到的原句判——前台传来的同名字段一律不认。
+pub fn is_safety_note(sentence: &str) -> bool {
+    normalize_for_marker(sentence).contains(&normalize_for_marker(SAFETY_NOTE_MARKER))
+}
+
+/// 这条人工要求是不是拿掉了通用安全提醒，记录时由服务端判：
+/// - `drop`：服务端从结论里取到的原句是安全提醒；
+/// - `edit`：改的是一条要点（不是一句话结论 / 判定——通用安全提醒按规程是一条要点），
+///   原句是安全提醒，而改后的写法不再含标志句。
+///
+/// 取不到原句就判不了，一律 false（如实不记）。`after` 是要落盘的那份改后写法。
+pub fn takes_away_safety_note(
+    kind: &str,
+    rec_id: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> bool {
+    let was_safety = before.is_some_and(is_safety_note);
+    match kind {
+        "drop" => was_safety,
+        "edit" => {
+            was_safety
+                && rec_id.is_some_and(|r| !matches!(r, "summary" | "verdict"))
+                && !after.is_some_and(is_safety_note)
+        }
+        _ => false,
+    }
+}
+
 /// 条目编号的合法写法：保留字，或短的 ASCII 标识（结论里的建议 id 是 R1、R2 这种）。
 /// 编号会原样拼进发给助手的「[系统]」唤醒消息，所以进库之前就要卡住：
 /// 带换行和伪造系统行的编号能在唤醒消息里另起一段，冒充系统指令。
@@ -1165,14 +1233,14 @@ pub fn edits_wake_paragraph(edits: &[EffectiveEdit]) -> Option<String> {
                 .as_deref()
                 .map(|b| quotable(b, WAKE_BEFORE_MAX_CHARS));
             match &e.kind {
-                EditKind::Edit { after } => {
+                EditKind::Edit { after, .. } => {
                     let after = quotable(after, EDIT_MAX_CHARS);
                     match before {
                         Some(b) => format!("{n}）{what}：原句「{b}」改为「{after}」"),
                         None => format!("{n}）{what}：改为「{after}」"),
                     }
                 }
-                EditKind::Drop { reason } => {
+                EditKind::Drop { reason, .. } => {
                     let why = quotable(reason, EDIT_MAX_CHARS);
                     match before {
                         Some(b) => format!("{n}）删掉{what}：原句「{b}」。审核人理由：「{why}」"),
@@ -1212,7 +1280,32 @@ pub fn edits_wake_paragraph(edits: &[EffectiveEdit]) -> Option<String> {
     } else {
         ""
     };
-    Some(format!("{head}{}{tail}{drop_rule}。", items.join("；")))
+    // 拿掉了通用安全提醒（删掉，或改写得不再含标志句）：终稿正文里要原样写明，读者才看得出这张卡少了它。
+    // 按全部生效条目算，不只看上面列出的前 MAX_WAKE_EDITS 条——这一条不能因为排在后面就漏交代。
+    // 位置的说法与 claim-check 规程一致（「核查结论」那段话之后），免得助手把那段话拆开插进去
+    let safety_items: Vec<String> = edits
+        .iter()
+        .filter(|e| e.kind.safety_note())
+        .map(|e| {
+            let how = match e.kind {
+                EditKind::Drop { .. } => "审核人要求删掉",
+                EditKind::Edit { .. } => "审核人改写后不再含这句提醒",
+            };
+            format!("建议 {}（{how}）", quotable(&e.rec_id, 32))
+        })
+        .collect();
+    let safety_rule = if safety_items.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "。其中{}原本是规程要求的通用安全提醒：终稿正文里「核查结论」那段话之后，必须另起一行原样写明「{SAFETY_NOTE_DROPPED_NOTICE}」，不要插进那段话中间；这句逐字照抄，不论拿掉几条都只写这一行，不要复述被拿掉的原句；审核记录照常写，同样不复述原句",
+            safety_items.join("、")
+        )
+    };
+    Some(format!(
+        "{head}{}{tail}{drop_rule}{safety_rule}。",
+        items.join("；")
+    ))
 }
 
 // ── 规程声明的栏目名 ────────────────────────────────────────────
@@ -1789,7 +1882,8 @@ mod tests {
         assert_eq!(
             got[1].kind,
             EditKind::Edit {
-                after: "第二版".into()
+                after: "第二版".into(),
+                safety_note: false,
             }
         );
         assert_eq!(got[1].before.as_deref(), Some("原文"));
@@ -1814,7 +1908,8 @@ mod tests {
         assert_eq!(
             got[0].kind,
             EditKind::Drop {
-                reason: "这条没有出处".into()
+                reason: "这条没有出处".into(),
+                safety_note: false,
             }
         );
         assert_eq!(got[0].before.as_deref(), Some("必要时可考虑预防性手术"));
@@ -1828,7 +1923,8 @@ mod tests {
         assert_eq!(
             effective_edits(&log)[0].kind,
             EditKind::Edit {
-                after: "必要时可与外科讨论".into()
+                after: "必要时可与外科讨论".into(),
+                safety_note: false,
             }
         );
         // unedit 同时用于撤销改写与撤销删除
@@ -1946,6 +2042,7 @@ mod tests {
             rec_id: rec.into(),
             kind: EditKind::Edit {
                 after: after.into(),
+                safety_note: false,
             },
             before: before.map(str::to_string),
             at: None,
@@ -1970,7 +2067,10 @@ mod tests {
     fn wake_paragraph_spells_out_each_drop() {
         let drop = |rec: &str, before: Option<&str>, why: &str| EffectiveEdit {
             rec_id: rec.into(),
-            kind: EditKind::Drop { reason: why.into() },
+            kind: EditKind::Drop {
+                reason: why.into(),
+                safety_note: false,
+            },
             before: before.map(str::to_string),
             at: None,
             who: None,
@@ -1979,6 +2079,7 @@ mod tests {
             rec_id: rec.into(),
             kind: EditKind::Edit {
                 after: after.into(),
+                safety_note: false,
             },
             before: Some(before.to_string()),
             at: None,
@@ -2003,6 +2104,252 @@ mod tests {
             "结论里取不到原句时不编一句出来"
         );
         assert!(mixed.contains("不要重新编号其余条目"));
+        assert!(
+            !mixed.contains("通用安全提醒"),
+            "删的不是安全提醒，不加那条要求"
+        );
+    }
+
+    #[test]
+    fn safety_note_is_judged_from_the_sentence_itself() {
+        assert!(is_safety_note(
+            "目前没有研究支持这样做；用药和治疗请听医生的。"
+        ));
+        assert!(
+            is_safety_note("用药和治疗，请听医生的！"),
+            "标点、空白不同不影响"
+        );
+        assert!(!is_safety_note("每 6 个月复查一次颈部超声。"));
+        assert!(!is_safety_note("用药请听医生的"), "只含一半标志句不算");
+    }
+
+    /// 标志句中间夹了符号，与前台（`[\s\p{P}\p{S}\p{C}]`）、规程脚本同样判「是」；
+    /// 但比对终稿用的 normalize_for_match 口径不动——那边的 `- / ~` 仍要保留。
+    #[test]
+    fn safety_marker_judgement_ignores_symbols_but_matching_keeps_them() {
+        for s in [
+            "用药和治疗～请听医生的。",
+            "用药和治疗~请听医生的",
+            "用药和治疗-请听医生的",
+            "用药和治疗/请听医生的",
+            "用药和治疗 — 请听医生的",
+            "用药和\u{200B}治疗请听医生的",
+            "**用药和治疗**请听医生的",
+        ] {
+            assert!(is_safety_note(s), "{s}");
+        }
+        assert!(!is_safety_note("用药和治疗请听"), "缺字仍不算");
+        assert!(!is_safety_note("用药和治疗请问医生的"), "换字仍不算");
+        // 终稿比对的规范化保留这些符号：「4-6」与「46」、「1/2」与「12」不能判成一样
+        assert_ne!(normalize_for_match("4-6"), normalize_for_match("46"));
+        assert_ne!(normalize_for_match("1/2"), normalize_for_match("12"));
+        assert_ne!(
+            normalize_for_match("用药和治疗-请听医生的"),
+            normalize_for_match("用药和治疗请听医生的")
+        );
+    }
+
+    #[test]
+    fn taking_away_a_safety_note_covers_drop_and_rewrite() {
+        let safety = Some("目前没有研究支持这样做；用药和治疗请听医生的。");
+        let other = Some("没查到研究，不等于这句话是真的。");
+        // 删掉：只看原句
+        assert!(takes_away_safety_note(
+            "drop",
+            Some("R1"),
+            safety,
+            Some("放在这里不合适")
+        ));
+        assert!(!takes_away_safety_note(
+            "drop",
+            Some("R2"),
+            other,
+            Some("跑题")
+        ));
+        assert!(
+            !takes_away_safety_note("drop", Some("R1"), None, Some("跑题")),
+            "取不到原句判不了"
+        );
+        // 改写：原句是安全提醒、改后不再含标志句 → 等于拿掉
+        assert!(takes_away_safety_note(
+            "edit",
+            Some("R1"),
+            safety,
+            Some("目前没有研究支持这样做。")
+        ));
+        assert!(
+            !takes_away_safety_note(
+                "edit",
+                Some("R1"),
+                safety,
+                Some("目前没有研究支持；用药和治疗，请听医生的！")
+            ),
+            "改后仍含标志句（标点不同）不算拿掉"
+        );
+        assert!(
+            !takes_away_safety_note(
+                "edit",
+                Some("R1"),
+                safety,
+                Some("没有研究支持；用药和治疗～请听医生的")
+            ),
+            "改后标志句中间夹了符号，仍算留着"
+        );
+        assert!(
+            !takes_away_safety_note("edit", Some("R2"), other, Some("改了一句")),
+            "原句本来就不是"
+        );
+        assert!(
+            !takes_away_safety_note("edit", Some("R1"), None, Some("改了一句")),
+            "取不到原句判不了"
+        );
+        assert!(
+            !takes_away_safety_note("edit", Some("summary"), safety, Some("没有研究支持停药。")),
+            "一句话结论 / 判定不是那条要点"
+        );
+        assert!(!takes_away_safety_note(
+            "edit",
+            Some("verdict"),
+            safety,
+            Some("证据不足")
+        ));
+        for kind in ["agree", "disagree", "unedit", "answer"] {
+            assert!(
+                !takes_away_safety_note(kind, Some("R1"), safety, None),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_edits_carry_the_recorded_safety_note() {
+        let before = "目前没有研究支持这样做；用药和治疗请听医生的。";
+        let log = vec![
+            serde_json::json!({"kind": "drop", "rec_id": "R1", "text": "放在这里不合适", "before": before, "safety_note": true}),
+            serde_json::json!({"kind": "drop", "rec_id": "R2", "text": "跑题", "before": "没查到研究，不等于这句话是真的。"}),
+            // 标记只认布尔 true
+            serde_json::json!({"kind": "drop", "rec_id": "R3", "text": "跑题", "before": "别的", "safety_note": "true"}),
+            serde_json::json!({"kind": "edit", "rec_id": "R4", "text": "目前没有研究支持这样做。", "before": before, "safety_note": true}),
+            // 记录里没写标记就是 false：这里不按原句另判一次
+            serde_json::json!({"kind": "edit", "rec_id": "R5", "text": "目前没有研究支持这样做。", "before": before}),
+        ];
+        let got = effective_edits(&log);
+        let safety: Vec<(&str, bool)> = got
+            .iter()
+            .map(|e| (e.kind.name(), e.kind.safety_note()))
+            .collect();
+        assert_eq!(
+            safety,
+            vec![
+                ("drop", true),
+                ("drop", false),
+                ("drop", false),
+                ("edit", true),
+                ("edit", false)
+            ]
+        );
+    }
+
+    #[test]
+    fn wake_paragraph_requires_the_notice_when_a_safety_note_is_taken_away() {
+        let drop = |rec: &str, before: &str, safety_note: bool| EffectiveEdit {
+            rec_id: rec.into(),
+            kind: EditKind::Drop {
+                reason: "放在这里不合适".into(),
+                safety_note,
+            },
+            before: Some(before.to_string()),
+            at: None,
+            who: None,
+        };
+        let edit = |rec: &str, before: &str, after: &str, safety_note: bool| EffectiveEdit {
+            rec_id: rec.into(),
+            kind: EditKind::Edit {
+                after: after.into(),
+                safety_note,
+            },
+            before: Some(before.to_string()),
+            at: None,
+            who: None,
+        };
+        let p = edits_wake_paragraph(&[
+            drop("R2", "没查到研究，不等于这句话是真的。", false),
+            drop("R1", "目前没有研究支持这样做；用药和治疗请听医生的。", true),
+        ])
+        .unwrap();
+        // 写死原句而不引用常量：措辞一变，这里要跟着 claim-check 规程脚本、前台一起改
+        assert!(
+            p.contains("「注意：本核查卡原有的通用安全提醒已被审核人拿掉。」"),
+            "{p}"
+        );
+        assert_eq!(
+            SAFETY_NOTE_DROPPED_NOTICE,
+            "注意：本核查卡原有的通用安全提醒已被审核人拿掉。"
+        );
+        assert!(
+            p.contains("其中建议 R1（审核人要求删掉）原本是规程要求的通用安全提醒"),
+            "{p}"
+        );
+        assert!(!p.contains("建议 R2（"), "删的不是安全提醒的那条不点名");
+        // 位置的说法与规程一致
+        assert!(
+            p.contains("终稿正文里「核查结论」那段话之后，必须另起一行原样写明"),
+            "{p}"
+        );
+        assert!(!p.contains("判定与一句话结论之后"), "旧的位置说法不再出现");
+        assert!(p.contains("不要插进那段话中间"));
+        assert!(p.contains("不论拿掉几条都只写这一行"));
+        assert!(p.contains("不要复述被拿掉的原句"));
+        assert!(p.contains("2）删掉建议 R1：原句"), "原有的逐条删除写法照旧");
+
+        // 改写拿掉了安全提醒，与删掉同样交代；两种一起出现时逐条说清是哪一种
+        let p = edits_wake_paragraph(&[
+            edit(
+                "R3",
+                "目前没有研究支持这样做；用药和治疗请听医生的。",
+                "目前没有研究支持这样做。",
+                true,
+            ),
+            edit("R4", "每 6 个月复查。", "每 3 个月复查。", false),
+        ])
+        .unwrap();
+        assert!(
+            p.contains("其中建议 R3（审核人改写后不再含这句提醒）原本是规程要求的通用安全提醒"),
+            "{p}"
+        );
+        assert!(p.contains(SAFETY_NOTE_DROPPED_NOTICE));
+        assert!(!p.contains("建议 R4（"));
+        assert!(p.contains("1）建议 R3：原句"), "原有的逐条改写写法照旧");
+        let p = edits_wake_paragraph(&[
+            drop("R1", "用药和治疗请听医生的。", true),
+            edit("R3", "用药和治疗请听医生的。", "请咨询专业人士。", true),
+        ])
+        .unwrap();
+        assert!(
+            p.contains(
+                "其中建议 R1（审核人要求删掉）、建议 R3（审核人改写后不再含这句提醒）原本是"
+            ),
+            "{p}"
+        );
+        assert_eq!(
+            p.matches(SAFETY_NOTE_DROPPED_NOTICE).count(),
+            1,
+            "拿掉几条都只交代一次"
+        );
+        // 没拿掉安全提醒的改写不加这条要求
+        let p = edits_wake_paragraph(&[edit("R4", "每 6 个月复查。", "每 3 个月复查。", false)])
+            .unwrap();
+        assert!(!p.contains("通用安全提醒"), "{p}");
+
+        // 排在逐条列出的上限之外，这条要求也不能漏
+        let mut many: Vec<EffectiveEdit> = (0..MAX_WAKE_EDITS)
+            .map(|i| drop(&format!("X{i}"), "跑题的一条", false))
+            .collect();
+        many.push(edit("R9", "用药和治疗请听医生的。", "请遵医嘱。", true));
+        let p = edits_wake_paragraph(&many).unwrap();
+        assert!(p.contains("另有 1 条要求没有在这里列出"));
+        assert!(p.contains("其中建议 R9（审核人改写后不再含这句提醒）"));
+        assert!(p.contains(SAFETY_NOTE_DROPPED_NOTICE));
     }
 
     #[test]
@@ -2409,6 +2756,7 @@ redo = ""
             rec_id: rec.into(),
             kind: EditKind::Edit {
                 after: after.into(),
+                safety_note: false,
             },
             before: before.map(str::to_string),
             at: None,

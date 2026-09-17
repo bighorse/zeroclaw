@@ -1489,18 +1489,18 @@ fn edits_against_final(
         .map(|e| {
             // 改写看「终稿里有没有改后的写法」，删除反过来看「原句是不是真的没了」
             let (after, reason, applied) = match &e.kind {
-                cb::EditKind::Edit { after } => (
+                cb::EditKind::Edit { after, .. } => (
                     Some(after.clone()),
                     None,
                     cb::edit_applied(e.before.as_deref(), after, final_text.as_deref()),
                 ),
-                cb::EditKind::Drop { reason } => (
+                cb::EditKind::Drop { reason, .. } => (
                     None,
                     Some(reason.clone()),
                     cb::drop_applied(e.before.as_deref(), final_text_no_audit.as_deref()),
                 ),
             };
-            serde_json::json!({
+            let mut item = serde_json::json!({
                 "rec_id": e.rec_id,
                 "kind": e.kind.name(),
                 "before": e.before,
@@ -1510,9 +1510,46 @@ fn edits_against_final(
                 "who": e.who,
                 "applied": applied,
                 "after_final": cb::edited_after_final(e.at.as_deref(), final_modified),
-            })
+            });
+            // 拿掉了通用安全提醒（删掉，或改写得不再含标志句）才带这个字段，
+            // 与 verdicts.jsonl 里那条记录的写法一致：前台据此标出来
+            if e.kind.safety_note() {
+                item["safety_note"] = true.into();
+            }
+            item
         })
         .collect()
+}
+
+/// 批准时带着的人工改动条数。
+#[derive(Debug, Default, PartialEq)]
+struct EditCounts {
+    /// 改写 + 删除合计
+    edits: usize,
+    /// 其中要求删掉的
+    drops: usize,
+    /// 删掉的里头是通用安全提醒的
+    safety_drops: usize,
+    /// 改写得不再含通用安全提醒的
+    safety_edits: usize,
+}
+
+/// `edits` 是 [`edits_against_final`] 的结果，不是数组就都算 0。
+fn edit_counts(edits: &serde_json::Value) -> EditCounts {
+    let Some(all) = edits.as_array() else {
+        return EditCounts::default();
+    };
+    let count = |kind: &str, safety: bool| {
+        all.iter()
+            .filter(|e| e["kind"] == kind && (!safety || e["safety_note"] == true))
+            .count()
+    };
+    EditCounts {
+        edits: all.len(),
+        drops: count("drop", false),
+        safety_drops: count("drop", true),
+        safety_edits: count("edit", true),
+    }
 }
 
 /// 规程在 SOP.toml `[frontdesk]` 里声明的栏目名。
@@ -1538,6 +1575,22 @@ fn frontdesk_vocabulary(
 
 /// 这一单当前结构化结论（有终稿读终稿，读不出来再读初稿）里某一句的原文，供改写记录的 before。
 fn current_sentence(state: &AppState, run_id: &str, rec_id: &str) -> Option<String> {
+    conclusion_sentence_in(state, run_id, rec_id, false)
+}
+
+/// 初稿里这一句的原文。判「是不是拿掉了通用安全提醒」只认初稿：
+/// 终稿写出后再改同一条，`current_sentence` 取到的已是改写后的终稿写法（不含标志句），
+/// 拿它判会把「交付的终稿里确实没有这句提醒」漏标（独立验证实测过这条路径）。
+fn draft_sentence(state: &AppState, run_id: &str, rec_id: &str) -> Option<String> {
+    conclusion_sentence_in(state, run_id, rec_id, true)
+}
+
+fn conclusion_sentence_in(
+    state: &AppState,
+    run_id: &str,
+    rec_id: &str,
+    draft_only: bool,
+) -> Option<String> {
     use super::casebook as cb;
     let (trace_path, full) = trace_setup(state);
     if !crate::ledger::availability(&trace_path, full).available {
@@ -1550,6 +1603,7 @@ fn current_sentence(state: &AppState, run_id: &str, rec_id: &str) -> Option<Stri
         .map(|a| (a.rel, a.abs))
         .collect();
     let (draft, fin) = cb::pick_conclusions(&paths);
+    let fin = if draft_only { None } else { fin };
     // 读得出来的第一份说了算：终稿里没有这一句就是 null，不退回初稿去找
     for (_, abs) in fin.into_iter().chain(draft) {
         let Some(v) = std::fs::read_to_string(abs)
@@ -1595,6 +1649,7 @@ pub(crate) fn record_decision(
         .and_then(|v| v.to_str().ok())
         .and_then(|a| a.strip_prefix("Bearer "))
         .and_then(cb::device_fingerprint);
+    let counts = edit_counts(&book["edits"]);
     let entry = serde_json::json!({
         "run_id": run_id,
         "at": chrono::Utc::now().to_rfc3339(),
@@ -1611,9 +1666,13 @@ pub(crate) fn record_decision(
             "report_sha256": report_sha,
             "binding_violations": book.pointer("/conclusion/data/checks/binding_violations"),
             // 批准时带着几处人工改动（改写 + 删除合计）：这些句子按审核人说的算，不是助手自己定的
-            "edits": book["edits"].as_array().map_or(0, Vec::len),
+            "edits": counts.edits,
             // 其中要求终稿删掉的条数，单独记一笔：删掉一条与改写一句不是一回事
-            "drops": book["edits"].as_array().map_or(0, |a| a.iter().filter(|e| e["kind"] == "drop").count()),
+            "drops": counts.drops,
+            // 拿掉了几条规程要求的通用安全提醒（删掉的 / 改写得不再含标志句的分开记）：
+            // 批准的人是带着这个状况批的，要能查到
+            "safety_drops": counts.safety_drops,
+            "safety_edits": counts.safety_edits,
         },
     });
     if let Err(e) = cb::append_jsonl(&cb::decisions_path(&workspace), &entry) {
@@ -1637,6 +1696,40 @@ pub struct VerdictBody {
     pub text: Option<String>,
     #[serde(default)]
     pub who: Option<String>,
+}
+
+/// 一条审核记录落盘的内容。请求体里只取上面认的字段；`before`（结论里的原句）与 `safety_note`
+/// 由服务端定——`VerdictBody` 没有这两个字段，前台带了同名字段，反序列化时就丢掉了。
+fn verdict_entry(
+    run_id: &str,
+    b: &VerdictBody,
+    kind: &str,
+    rec_id: Option<&str>,
+    text: Option<&str>,
+    before: Option<String>,
+    // 判安全提醒用的原句（初稿里的）；取不到退回 before
+    safety_basis: Option<String>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "run_id": run_id,
+        "at": chrono::Utc::now().to_rfc3339(),
+        "kind": kind,
+        "rec_id": rec_id,
+        "qid": b.qid,
+        "text": text,
+        "who": b.who.as_deref().map(str::trim).filter(|w| !w.is_empty()),
+    });
+    if matches!(kind, "edit" | "drop") {
+        // 拿掉了规程要求的通用安全提醒（删掉它，或改写得不再含标志句；按服务端取到的原句与要落盘的
+        // 改后写法判），只在为真时记：批准时要求终稿正文写明，前台与决定台账据此标出。
+        // 取不到原句就判不了，如实不记
+        let basis = safety_basis.as_deref().or(before.as_deref());
+        if super::casebook::takes_away_safety_note(kind, rec_id, basis, text) {
+            entry["safety_note"] = true.into();
+        }
+        entry["before"] = before.into();
+    }
+    entry
 }
 
 /// POST /api/tasks/{run_id}/verdicts —— 快环：逐条认可 / 不认同、改写某句 / 要求终稿删掉某条 /
@@ -1757,18 +1850,22 @@ pub async fn handle_api_task_verdict(
                 .and_then(|rec| current_sentence(&state, &run_id, rec))
         })
         .flatten();
-    let mut entry = serde_json::json!({
-        "run_id": run_id,
-        "at": chrono::Utc::now().to_rfc3339(),
-        "kind": kind,
-        "rec_id": rec_id,
-        "qid": b.qid,
-        "text": text,
-        "who": b.who.as_deref().map(str::trim).filter(|w| !w.is_empty()),
-    });
-    if matches!(kind, "edit" | "drop") {
-        entry["before"] = before.into();
-    }
+    let safety_basis = matches!(kind, "edit" | "drop")
+        .then(|| {
+            rec_id
+                .as_deref()
+                .and_then(|rec| draft_sentence(&state, &run_id, rec))
+        })
+        .flatten();
+    let entry = verdict_entry(
+        &run_id,
+        &b,
+        kind,
+        rec_id.as_deref(),
+        text.as_deref(),
+        before,
+        safety_basis,
+    );
     if let Err(e) = super::casebook::append_jsonl(&path, &entry) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2908,6 +3005,190 @@ mod frontdesk_v6_tests {
             got[0]["applied"], true,
             "正文里已经删掉，审核记录里的复述不算「还在」"
         );
+    }
+
+    #[test]
+    fn a_later_rewrite_of_an_already_removed_reminder_is_still_marked() {
+        // 终稿里这一条已经被上一次改写拿掉了提醒；审核人再改一次，服务端取到的「改之前」
+        // 是终稿的写法（不含标志句）。判安全提醒必须看初稿，否则标签就在这一刻消失了。
+        use super::{verdict_entry, VerdictBody};
+        let b: VerdictBody = serde_json::from_value(
+            serde_json::json!({"kind": "edit", "rec_id": "R4", "text": "x"}),
+        )
+        .unwrap();
+        let draft = "目前没有研究支持这样做；用药和治疗请听医生的。";
+        let in_final = "目前没有研究支持这样做。";
+        let e = verdict_entry(
+            "r1",
+            &b,
+            "edit",
+            Some("R4"),
+            Some("目前没有研究支持这样做，请慎重。"),
+            Some(in_final.to_string()),
+            Some(draft.to_string()),
+        );
+        assert_eq!(
+            e["safety_note"], true,
+            "按初稿判：交付的终稿里确实没有这句提醒"
+        );
+        assert_eq!(e["before"], in_final, "记录里的原句仍是改之前的那句");
+
+        let restored = verdict_entry(
+            "r1",
+            &b,
+            "edit",
+            Some("R4"),
+            Some("目前没有研究支持这样做；用药和治疗请听医生的。"),
+            Some(in_final.to_string()),
+            Some(draft.to_string()),
+        );
+        assert!(
+            restored.get("safety_note").is_none(),
+            "改回含标志句的写法就不算拿掉"
+        );
+    }
+
+    /// 删掉 / 改写的是不是拿掉了通用安全提醒，只由服务端按它从结论里取到的原句（与要落盘的改后写法）判；
+    /// 请求体里的同名字段不认。
+    #[test]
+    fn a_taken_away_safety_note_is_marked_by_the_server_alone() {
+        use super::{verdict_entry, VerdictBody};
+        let safety = "目前没有研究支持这样做；用药和治疗请听医生的。";
+        let other = "没查到研究，不等于这句话是真的，只是眼下没有依据。";
+        // 与 axum 的 Json 提取器同一套反序列化：未知字段直接丢掉，不报错
+        let body = |kind: &str, forged: serde_json::Value| -> VerdictBody {
+            let mut v = serde_json::json!({"kind": kind, "rec_id": "R1", "text": "放在这里不合适"});
+            for (k, x) in forged.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            serde_json::from_value(v).expect("请求体带多余字段也能解析")
+        };
+        let entry = |b: &VerdictBody, rec: &str, text: &str, before: Option<&str>| {
+            verdict_entry(
+                "r1",
+                b,
+                b.kind.as_str(),
+                Some(rec),
+                Some(text),
+                before.map(str::to_string),
+                None,
+            )
+        };
+        let drop = body("drop", serde_json::json!({}));
+
+        let e = entry(&drop, "R1", "放在这里不合适", Some(safety));
+        assert_eq!(e["safety_note"], true, "原句含标志句");
+        assert_eq!(e["before"], safety);
+
+        let e = entry(&drop, "R1", "放在这里不合适", Some(other));
+        assert!(e.get("safety_note").is_none(), "不是安全提醒就不写这个字段");
+
+        let forged = body(
+            "drop",
+            serde_json::json!({"safety_note": true, "before": safety}),
+        );
+        let e = entry(&forged, "R1", "放在这里不合适", Some(other));
+        assert!(e.get("safety_note").is_none(), "前台说是安全提醒不算数");
+        assert_eq!(e["before"], other, "原句也只认服务端取到的");
+
+        let forged = body("drop", serde_json::json!({"safety_note": false}));
+        let e = entry(&forged, "R1", "放在这里不合适", Some(safety));
+        assert_eq!(e["safety_note"], true, "前台说不是也不算数");
+
+        let e = entry(&drop, "R1", "放在这里不合适", None);
+        assert!(e.get("safety_note").is_none(), "取不到原句就判不了");
+
+        // 改写：原句是安全提醒、改后的写法不再含标志句 → 与删掉同样标出
+        let edit = body("edit", serde_json::json!({}));
+        let e = entry(&edit, "R1", "目前没有研究支持这样做。", Some(safety));
+        assert_eq!(e["safety_note"], true, "改写拿掉了标志句");
+        assert_eq!(e["text"], "目前没有研究支持这样做。");
+        assert_eq!(e["before"], safety);
+
+        let e = entry(
+            &edit,
+            "R1",
+            "目前没有研究支持这样做；用药和治疗～请听医生的！",
+            Some(safety),
+        );
+        assert!(
+            e.get("safety_note").is_none(),
+            "改后仍含标志句（夹了符号也算）"
+        );
+
+        let e = entry(&edit, "R1", "改成别的一句。", Some(other));
+        assert!(e.get("safety_note").is_none(), "原句本来就不是安全提醒");
+
+        let e = entry(&edit, "summary", "没有研究支持停药。", Some(safety));
+        assert!(e.get("safety_note").is_none(), "一句话结论不是那条要点");
+
+        let forged = body("edit", serde_json::json!({"safety_note": true}));
+        let e = entry(&forged, "R1", "改成别的一句。", Some(other));
+        assert!(e.get("safety_note").is_none(), "改写时前台说是也不算数");
+
+        let forged = body("edit", serde_json::json!({"safety_note": false}));
+        let e = entry(&forged, "R1", "目前没有研究支持这样做。", Some(safety));
+        assert_eq!(e["safety_note"], true, "改写时前台说不是也不算数");
+
+        let e = entry(&edit, "R1", "目前没有研究支持这样做。", None);
+        assert!(e.get("safety_note").is_none(), "改写取不到原句也判不了");
+
+        let agree = body("agree", serde_json::json!({"safety_note": true}));
+        let e = entry(&agree, "R1", "", Some(safety));
+        assert!(e.get("safety_note").is_none(), "认可不是拿掉");
+    }
+
+    #[test]
+    fn safety_notes_reach_the_casebook_edits_and_the_decision_basis() {
+        use super::{edit_counts, EditCounts};
+        let safety = "目前没有研究支持这样做；用药和治疗请听医生的。";
+        let v = |kind: &str, rec: &str, before: &str, text: &str, flag: bool| {
+            let mut x = serde_json::json!({
+                "run_id": "r1",
+                "kind": kind,
+                "rec_id": rec,
+                "before": before,
+                "text": text,
+                "at": "2026-09-17T01:00:00Z",
+            });
+            if flag {
+                x["safety_note"] = true.into();
+            }
+            x
+        };
+        let verdicts = vec![
+            v("drop", "R1", safety, "放在这里不合适", true),
+            v(
+                "drop",
+                "R2",
+                "没查到研究，不等于这句话是真的。",
+                "跑题",
+                false,
+            ),
+            v("edit", "R3", "每 6 个月复查", "每 3 个月复查", false),
+            v("edit", "R4", safety, "目前没有研究支持这样做。", true),
+        ];
+        let edits = serde_json::Value::Array(edits_against_final(&[], None, &verdicts));
+        assert_eq!(edits[0]["safety_note"], true);
+        assert!(edits[1].get("safety_note").is_none());
+        assert!(edits[2].get("safety_note").is_none());
+        assert_eq!(edits[3]["kind"], "edit");
+        assert_eq!(edits[3]["safety_note"], true, "改写拿掉的同样带出去");
+        assert_eq!(
+            edit_counts(&edits),
+            EditCounts {
+                edits: 4,
+                drops: 2,
+                safety_drops: 1,
+                safety_edits: 1,
+            }
+        );
+        assert_eq!(
+            edit_counts(&serde_json::Value::Array(vec![])),
+            EditCounts::default(),
+            "没有就是 0"
+        );
+        assert_eq!(edit_counts(&serde_json::Value::Null), EditCounts::default());
     }
 
     #[test]
