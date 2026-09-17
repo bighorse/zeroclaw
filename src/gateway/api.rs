@@ -1443,7 +1443,7 @@ type LoadedConclusion<'a> = (
     Result<serde_json::Value, String>,
 );
 
-/// 生效的人工修改，逐条比对终稿有没有照改。
+/// 生效的人工改动（改写与删除），逐条比对终稿有没有照办。
 /// 终稿 = 路径含 final 的报告 .md 与 conclusion_final.json；都没有就是还没交付，比对结论一律 null。
 /// 终稿文件在却读不出来，同样不下结论——拿半份终稿比对，会把照改了的说成「找不到」。
 fn edits_against_final(
@@ -1454,19 +1454,29 @@ fn edits_against_final(
     use super::casebook as cb;
     let final_report = cb::pick_final_report(paths);
     let mut pieces: Vec<String> = Vec::new();
+    // 判「删掉了没有」用的那一份：不含终稿的「审核记录」小节。助手照规程在那里写明删了哪几条，
+    // 若顺手抄上被删的原句，按「原句还在」判就会冤枉它没照做（0917 审查实测）。
+    let mut pieces_without_audit: Vec<String> = Vec::new();
     let mut readable = final_report.is_some() || final_conclusion.is_some();
     if let Some((_, abs)) = final_report {
         match std::fs::read_to_string(abs) {
-            Ok(t) => pieces.push(t),
+            Ok(t) => {
+                pieces_without_audit.push(cb::strip_audit_section(&t).to_string());
+                pieces.push(t);
+            }
             Err(_) => readable = false,
         }
     }
     match final_conclusion {
-        Some((_, Ok(v))) => cb::json_strings(v, &mut pieces),
+        Some((_, Ok(v))) => {
+            cb::json_strings(v, &mut pieces);
+            cb::json_strings(v, &mut pieces_without_audit);
+        }
         Some((_, Err(_))) => readable = false,
         None => {}
     }
     let final_text = readable.then(|| cb::normalized_final_text(&pieces));
+    let final_text_no_audit = readable.then(|| cb::normalized_final_text(&pieces_without_audit));
     // 终稿最后一次写盘的时间：比它晚的修改不可能写进终稿
     let final_modified = final_report
         .into_iter()
@@ -1477,13 +1487,28 @@ fn edits_against_final(
     cb::effective_edits(verdicts)
         .into_iter()
         .map(|e| {
+            // 改写看「终稿里有没有改后的写法」，删除反过来看「原句是不是真的没了」
+            let (after, reason, applied) = match &e.kind {
+                cb::EditKind::Edit { after } => (
+                    Some(after.clone()),
+                    None,
+                    cb::edit_applied(e.before.as_deref(), after, final_text.as_deref()),
+                ),
+                cb::EditKind::Drop { reason } => (
+                    None,
+                    Some(reason.clone()),
+                    cb::drop_applied(e.before.as_deref(), final_text_no_audit.as_deref()),
+                ),
+            };
             serde_json::json!({
                 "rec_id": e.rec_id,
+                "kind": e.kind.name(),
                 "before": e.before,
-                "after": e.after,
+                "after": after,
+                "reason": reason,
                 "at": e.at,
                 "who": e.who,
-                "applied": cb::edit_applied(e.before.as_deref(), &e.after, final_text.as_deref()),
+                "applied": applied,
                 "after_final": cb::edited_after_final(e.at.as_deref(), final_modified),
             })
         })
@@ -1585,8 +1610,10 @@ pub(crate) fn record_decision(
             "report": book.get("report"),
             "report_sha256": report_sha,
             "binding_violations": book.pointer("/conclusion/data/checks/binding_violations"),
-            // 批准时带着几处人工修改：这些句子是审核人的写法，不是助手的
+            // 批准时带着几处人工改动（改写 + 删除合计）：这些句子按审核人说的算，不是助手自己定的
             "edits": book["edits"].as_array().map_or(0, Vec::len),
+            // 其中要求终稿删掉的条数，单独记一笔：删掉一条与改写一句不是一回事
+            "drops": book["edits"].as_array().map_or(0, |a| a.iter().filter(|e| e["kind"] == "drop").count()),
         },
     });
     if let Err(e) = cb::append_jsonl(&cb::decisions_path(&workspace), &entry) {
@@ -1597,9 +1624,10 @@ pub(crate) fn record_decision(
 /// 请求体里没有 `before`：被改那句的原文由服务端从结论里取，前台传了也不认（未知字段直接忽略）。
 #[derive(Debug, serde::Deserialize)]
 pub struct VerdictBody {
-    /// agree | disagree | retract | edit | unedit | answer
+    /// agree | disagree | retract | edit | drop | unedit | answer
     pub kind: String,
-    /// 针对哪一条建议（agree / disagree / retract / edit / unedit；edit 还可以是 summary / verdict）
+    /// 针对哪一条建议（agree / disagree / retract / edit / drop / unedit；
+    /// edit 还可以是 summary / verdict，drop 不可以——那等于删掉结论本身）
     #[serde(default)]
     pub rec_id: Option<String>,
     /// 针对哪一个问题（answer）
@@ -1611,8 +1639,10 @@ pub struct VerdictBody {
     pub who: Option<String>,
 }
 
-/// POST /api/tasks/{run_id}/verdicts —— 快环：逐条认可 / 不认同、改写某句 / 撤销改写，或回答「助手不确定的」问题。
-/// 只记录，不改结论文件、不改规程——改写在批准时交给助手写进终稿，照没照改由 casebook 比对终稿得出。
+/// POST /api/tasks/{run_id}/verdicts —— 快环：逐条认可 / 不认同、改写某句 / 要求终稿删掉某条 /
+/// 撤销改写与删除，或回答「助手不确定的」问题。
+/// 只记录，不改结论文件、不改规程——改写与删除在批准时交给助手落到终稿，
+/// 照没照办由 casebook 比对终稿得出（改写看改后的写法在不在，删除看原句是不是没了）。
 pub async fn handle_api_task_verdict(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -1645,14 +1675,15 @@ pub async fn handle_api_task_verdict(
         .map(str::to_string);
     let valid = match kind {
         "agree" | "retract" | "unedit" => rec_id.is_some(),
-        "disagree" | "edit" => rec_id.is_some() && text.is_some(),
+        // drop 的理由必填：它要原样写进终稿的审核记录，说明这一条为什么被删
+        "disagree" | "edit" | "drop" => rec_id.is_some() && text.is_some(),
         "answer" => b.qid.is_some() && text.is_some(),
         _ => false,
     };
     if !valid {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"api":"frontdesk","error":"需要 kind=agree / retract 带 rec_id；disagree 带 rec_id 和一句理由；edit 带 rec_id 和改后的写法；unedit 带 rec_id；answer 带 qid 和回答"})),
+            Json(serde_json::json!({"api":"frontdesk","error":"需要 kind=agree / retract 带 rec_id；disagree 带 rec_id 和一句理由；edit 带 rec_id 和改后的写法；drop 带 rec_id 和一句理由；unedit 带 rec_id；answer 带 qid 和回答"})),
         )
             .into_response();
     }
@@ -1662,6 +1693,14 @@ pub async fn handle_api_task_verdict(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"api":"frontdesk","error":"rec_id 只能是 summary、verdict，或 32 字以内的字母数字加 - _"})),
+            )
+                .into_response();
+        }
+        // 「删掉这一条」只针对结论里的某条建议：一句话结论与判定是整份结论的骨架，删不得
+        if kind == "drop" && !super::casebook::droppable_rec_id(rec) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"api":"frontdesk","error":"只能要求删掉结论里的某一条建议；一句话结论与判定删不得，请改用改写或驳回"})),
             )
                 .into_response();
         }
@@ -1684,9 +1723,9 @@ pub async fn handle_api_task_verdict(
     // 幂等：同一条（同一建议 / 同一问题）的最新记录与这次完全一样，就不再追加——
     // 实测按钮多点几下，记录里就出现三条「认可 R1」、六条同样的回答。改了主意（换答案、认可改不认同）照常记。
     let existing = super::casebook::read_jsonl_for_run(&path, &run_id);
-    // 生效的修改条数有上限：每个编号占一个槽位，唤醒消息要把它们逐条交代给助手。
-    // 已经改过的那一条照常可以再改，只挡新开槽位。
-    if kind == "edit" {
+    // 生效的改动条数有上限：每个编号占一个槽位，唤醒消息要把它们逐条交代给助手。
+    // 已经提过要求的那一条照常可以改主意（改写换成删除），只挡新开槽位。
+    if matches!(kind, "edit" | "drop") {
         let effective = super::casebook::effective_edits(&existing);
         if effective.len() >= super::casebook::MAX_WAKE_EDITS
             && !effective
@@ -1695,7 +1734,7 @@ pub async fn handle_api_task_verdict(
         {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"api":"frontdesk","error":format!("本单生效的修改已有 {} 处，到上限了；请先撤销一些修改，或批准后在终稿上继续", effective.len())})),
+                Json(serde_json::json!({"api":"frontdesk","error":format!("本单生效的修改与删除已有 {} 条，到上限了；请先撤销一些，或批准后在终稿上继续", effective.len())})),
             )
                 .into_response();
         }
@@ -1709,8 +1748,9 @@ pub async fn handle_api_task_verdict(
     ) {
         return Json(serde_json::json!({"api":"frontdesk","api_version":1,"recorded":false,"duplicate":true,"entry":same})).into_response();
     }
-    // 「改之前」只取结论里真有的那句；取不到如实记 null
-    let before = (kind == "edit")
+    // 「改之前」只取结论里真有的那句；取不到如实记 null。
+    // 删除也要记原句：唤醒消息里要写「原句『…』」，终稿比对也靠它反着判
+    let before = matches!(kind, "edit" | "drop")
         .then(|| {
             rec_id
                 .as_deref()
@@ -1726,7 +1766,7 @@ pub async fn handle_api_task_verdict(
         "text": text,
         "who": b.who.as_deref().map(str::trim).filter(|w| !w.is_empty()),
     });
-    if kind == "edit" {
+    if matches!(kind, "edit" | "drop") {
         entry["before"] = before.into();
     }
     if let Err(e) = super::casebook::append_jsonl(&path, &entry) {
@@ -2809,6 +2849,65 @@ mod frontdesk_v6_tests {
             ),
         );
         assert!(got[0]["applied"].is_null(), "终稿读不出来时不下结论");
+    }
+
+    /// 「终稿里删掉这一条」的比对是反着来的：原句还在终稿里，就是助手没照办。
+    #[test]
+    fn dropped_items_are_confirmed_by_their_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let drop = |before: &str| {
+            vec![serde_json::json!({
+                "run_id": "r1",
+                "kind": "drop",
+                "rec_id": "R3",
+                "before": before,
+                "text": "这条没有出处",
+                "at": "2026-09-15T01:00:00Z",
+            })]
+        };
+        let final_path = dir.path().join("report_final.md");
+        std::fs::write(&final_path, "# 终稿\n\n建议每 6 个月复查一次颈部超声。\n").unwrap();
+        let delivered: Vec<casebook::ArtifactPath> =
+            vec![("case/report_final.md".to_string(), final_path)];
+
+        let got = edits_against_final(&delivered, None, &drop("必要时可考虑预防性手术"));
+        assert_eq!(got[0]["kind"], "drop");
+        assert!(got[0]["after"].is_null(), "删除没有「改后的写法」");
+        assert_eq!(got[0]["reason"], "这条没有出处");
+        assert_eq!(got[0]["applied"], true, "原句不在终稿里才算照办");
+
+        let got = edits_against_final(&delivered, None, &drop("建议每 6 个月复查一次颈部超声"));
+        assert_eq!(got[0]["applied"], false, "原句仍在终稿里——助手没删");
+        assert_eq!(got[0]["after_final"], false);
+    }
+
+    #[test]
+    fn the_audit_record_may_quote_what_was_dropped_without_flipping_the_verdict() {
+        // 规程要求助手在终稿的「审核记录」里写明删了哪几条。它若顺手抄上原句，
+        // 按「原句还在终稿里」判就会冤枉它没照做——审查时实测过这条自打脸的路径。
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("report_final.md");
+        std::fs::write(
+            &final_path,
+            "# 终稿\n\n建议每 6 个月复查一次颈部超声。\n\n## 审核记录\n- 审核人要求删掉 R3：必要时可考虑预防性手术（理由：这条没有出处）\n",
+        )
+        .unwrap();
+        let delivered: Vec<casebook::ArtifactPath> =
+            vec![("case/report_final.md".to_string(), final_path)];
+        let verdicts = vec![serde_json::json!({
+            "run_id": "r1",
+            "kind": "drop",
+            "rec_id": "R3",
+            "before": "必要时可考虑预防性手术",
+            "text": "这条没有出处",
+            "at": "2026-09-15T01:00:00Z",
+        })];
+
+        let got = edits_against_final(&delivered, None, &verdicts);
+        assert_eq!(
+            got[0]["applied"], true,
+            "正文里已经删掉，审核记录里的复述不算「还在」"
+        );
     }
 
     #[test]

@@ -2312,8 +2312,9 @@ async fn handle_sop_approve(
                 let recent = Arc::clone(&state.recent_sop_results);
                 let rid = run_id.clone();
                 let rule = approver_rule(approver.as_deref());
-                // 审核人在前台改过的句子：批准时一并交代，终稿必须逐字采用。
-                // 只读留存的逐条记录（服务端算出的生效修改），不经前台转述
+                // 审核人在前台改写、或要求终稿删掉的句子：批准时一并交代——
+                // 改写的要逐字采用，要求删掉的整条删掉且不重编号。
+                // 只读留存的逐条记录（服务端算出的生效改动），不经前台转述
                 let edits_note = {
                     let workspace = state.config.lock().workspace_dir.clone();
                     let verdicts =
